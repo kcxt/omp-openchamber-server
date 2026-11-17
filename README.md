@@ -22,10 +22,10 @@ Connect: OpenChamber → **Settings → Remote Instances → Add server** → `h
 ### systemd user service
 
 ```bash
-./install.sh && systemctl --user restart omp-server
+./install.sh && systemctl --user daemon-reload && systemctl --user enable --now openchamber.service
 ```
 
-`bin/omp-server` binds to the Tailscale IPv4 address when available (override with `OC_SIDECAR_HOST`). The unit is sandboxed (`ProtectSystem=strict`, `ProtectHome=tmpfs`, explicit `BindPaths=`); edit them for your layout. Provider keys go in `~/.config/omp-openchamber-server/env`. Update = `git pull && systemctl --user restart omp-server`.
+With the two units, `openchamber.service` is the network-facing web UI (Tailscale address, needs `OPENCHAMBER_UI_PASSWORD` in `~/.config/omp-openchamber-server/env`, otherwise it binds `127.0.0.1`) and `omp-server.service` is its loopback backend. Both are sandboxed (`ProtectSystem=strict`, `ProtectHome=tmpfs`, explicit `BindPaths=`); edit them for your layout. Update = `git pull && systemctl --user restart omp-server openchamber`.
 
 Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md).
 
@@ -56,8 +56,9 @@ Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md
 | Sessions: create (client-minted ids), list, rename, archive, fork, children, revert/unrevert, compact, abort, todo, diff, move, view | Real |
 | Prompts, `prompt_async`, shell, generate | Real |
 | Slash commands (`/command`): omp's own list incl. plugin commands such as `/pi-vcc`; run by sending `/name args` as the prompt | Real (falls back to file discovery if omp can't start) |
-| MCP servers (`/api/config/mcp`): read/write `~/.omp/agent/mcp.json` (user) and `<project>/.omp/mcp.json` (project); omp-only fields preserved | Real (picked up by new omp sessions; no live reconnect) |
-| Plugins (`/api/config/plugins`): `omp plugin list/install/uninstall/enable/disable`; spec edit and npm-registry lookup unsupported | Real |
+| MCP servers (`/api/config/mcp`): read/write `~/.omp/agent/mcp.json` (user) and `<project>/.omp/mcp.json` (project); omp-only fields preserved | Real **only when the UI talks to the sidecar directly** (Remote Instances). Behind `openchamber serve`, OpenChamber answers this route itself and writes `~/.config/opencode/opencode.json`, which omp also reads as an MCP source |
+| Plugins (`/api/config/plugins`): `omp plugin list/install/uninstall/enable/disable`; spec edit and npm-registry lookup unsupported | Real **only when the UI talks to the sidecar directly**. Behind `openchamber serve`, the Plugins page lists OpenCode plugin config, not omp plugins |
+| omp settings (`omp config`): searchable editor for all ~600 omp settings. JSON at `/api/omp/settings`, standalone page at `/api/omp/settings/ui` (OpenChamber blocks framing it, so it cannot be embedded), and a rail panel shipped as an OpenChamber extension in [`extensions/omp-settings`](./extensions/omp-settings) | Real. Install the panel in Settings → Extensions → add the folder `~/git/omp-openchamber-server/extensions/omp-settings`, then allow its local service. The service forwards to the sidecar on `127.0.0.1:4096` (fixed: services do not inherit the environment). Bridge vendored from [Kabmo](https://github.com/kabmo-labs/kabmo) (MIT, `src/vendor/kabmo`) |
 | Streaming (SSE + WebSocket events), tool parts, subagents, images | Real |
 | Permissions, questions, forms | Real |
 | Message queue / inbox (list, reorder, hold, take, delete) | Real; switching a queued item's delivery mode returns 409 |

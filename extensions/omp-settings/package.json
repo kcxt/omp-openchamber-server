@@ -1,0 +1,32 @@
+{
+  "name": "@omp-openchamber/omp-settings",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Edit oh-my-pi (omp) settings from OpenChamber: a rail panel over the omp sidecar's `omp config` bridge.",
+  "type": "module",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "omp-settings",
+        "name": "omp settings",
+        "icon": "settings-3-line",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      }
+    }
+  },
+  "scripts": {
+    "build": "bunx openchamber-guest-bundle panel/src/main.js panel/main.js && bunx openchamber-guest-bundle --node service/src/main.js service/main.js"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.7.2"
+  }
+}

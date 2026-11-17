@@ -6,6 +6,7 @@
  * pass through the omp normalizer (events.ts) before reaching the sink.
  */
 import { logger } from "../../shared/logger";
+import { readOmpConfigSmallModel } from "../../adapters/openchamber/small-model";
 import type {
   AgentBackend,
   BackendCapabilities,
@@ -72,9 +73,12 @@ const defaultOmpTransportFactory: OmpTransportFactory = async (cwd, sessionPath,
       // child started with instead of failing every prompt; the user can pick
       // another model, and the saved history is unaffected.
       if (!(error instanceof Error) || !error.message.includes("Could not restore model")) throw error;
+      // Prefer the cheap role (smol, then tiny) over the default, so a session
+      // that lost its model never silently continues on the most expensive one.
+      const role = readOmpConfigSmallModel();
       const state = (await conn.request("get_state")) as { model?: { provider?: unknown; id?: unknown } } | undefined;
-      const provider = state?.model?.provider;
-      const modelId = state?.model?.id;
+      const provider = role?.providerID ?? state?.model?.provider;
+      const modelId = role?.modelID ?? state?.model?.id;
       if (typeof provider !== "string" || typeof modelId !== "string") throw error;
       logger.warn({ sessionPath, provider, modelId }, `[omp] ${error.message}; opening the session on ${provider}/${modelId}`);
       await conn.request("switch_session", { sessionPath, provider, modelId });

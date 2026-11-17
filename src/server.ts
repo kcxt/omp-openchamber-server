@@ -59,6 +59,7 @@ import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
 import { describeSmallModel, generateSmallModelText, readOmpConfigSmallModel, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
 import { handleOmpConfigRoute, listOmpSlashCommands } from "./adapters/openchamber/omp-config";
+import { handleOmpSettingsRoute } from "./adapters/openchamber/omp-settings";
 import { createTerminalRuntime, TERMINAL_WS_PATH } from "./adapters/openchamber/terminal";
 import { createClientAuthRuntime } from "./adapters/openchamber/client-auth";
 import { handleGitRequest } from "./adapters/openchamber/git";
@@ -484,6 +485,8 @@ interface SidecarWebSocketData {
 
 const terminalRuntime = createTerminalRuntime();
 const webSocketCleanups = new WeakMap<object, () => void>();
+const unimplementedRoutesSeen = new Set<string>();
+const sessionInstructionEntries = new Map<string, Map<string, string>>();
 
 let cliOptions: SidecarCliOptions;
 try {
@@ -1386,6 +1389,14 @@ const MIME_TYPES: Record<string, string> = {
         return json([]);
       }
 
+      if (path === "/api/omp/settings" || path.startsWith("/api/omp/settings/")) {
+        const settingsResponse = await handleOmpSettingsRoute(req, path);
+        if (settingsResponse?.html !== undefined) {
+          return new Response(settingsResponse.html, { status: settingsResponse.status, headers: { ...cors, "content-type": "text/html; charset=utf-8" } });
+        }
+        if (settingsResponse) return json(settingsResponse.data, { status: settingsResponse.status });
+      }
+
       if (path.startsWith("/api/config/mcp") || path === "/api/config/plugins" || path.startsWith("/api/config/plugins/")) {
         const configResponse = await handleOmpConfigRoute(req, url, path, effectiveDir);
         if (configResponse) return json(configResponse.data, { status: configResponse.status });
@@ -1681,6 +1692,38 @@ const MIME_TYPES: Record<string, string> = {
       // loop treats an unanswered list as "could not look" and never audits.
       if (p === "/experimental/job" && req.method === "GET") return json({ data: [] });
       if (p === "/shell" && req.method === "GET") return json({ location: { directory: effectiveDir }, data: [] });
+
+      // OpenCode credential store and integration catalog. omp owns credentials
+      // (agent.db / env), so there are none to report; OpenChamber reads these
+      // to label provider sources and the quota list, and treats empty as
+      // "nothing stored here", where a 404 is logged as a failure.
+      if (p === "/credential" && req.method === "GET") return json({ data: [] });
+      if (p === "/integration" && req.method === "GET") return json({ location: { directory: effectiveDir }, data: [] });
+
+      // Per-session instruction entries (OpenChamber's session knowledge pins
+      // context here). The sidecar records them but omp does not read them, so
+      // they are not part of the agent's prompt.
+      const instructionMatch = p.match(/^\/experimental\/session\/([^/]+)\/instructions\/entries(?:\/([^/]+))?$/);
+      if (instructionMatch) {
+        const sessionKey = decodeURIComponent(instructionMatch[1]!);
+        const entryKey = instructionMatch[2] ? decodeURIComponent(instructionMatch[2]) : undefined;
+        const entries = sessionInstructionEntries.get(sessionKey) ?? new Map<string, string>();
+        if (!entryKey && req.method === "GET") {
+          return json({ data: [...entries].map(([key, value]) => ({ key, value })) });
+        }
+        if (entryKey && req.method === "PUT") {
+          const body = asRecord(await readJson(req));
+          if (typeof body?.value !== "string") return jsonError("value required", 400);
+          entries.set(entryKey, body.value);
+          sessionInstructionEntries.set(sessionKey, entries);
+          return noContent();
+        }
+        if (entryKey && req.method === "DELETE") {
+          entries.delete(entryKey);
+          if (entries.size === 0) sessionInstructionEntries.delete(sessionKey);
+          return noContent();
+        }
+      }
 
       // Session todos page state (OpenChamber /api/session-todos/:id). The
       // client accepts either `off` (no todo feature for this session) or
@@ -3102,6 +3145,15 @@ const MIME_TYPES: Record<string, string> = {
     // restores the per-request lines.
     if (res.status >= 500) {
       httpLogger.warn(logData, logMsg);
+    } else if (res.status === 404 && truncatedRes.includes("not implemented")) {
+      // Say once per route (not per poll) which backend routes the UI asked for
+      // that the sidecar does not serve.
+      const routeKey = `${req.method} ${path.replace(/\/(ses|msg|prt|pair|per|que)_[A-Za-z0-9_-]+/g, "/:id")}`;
+      if (!unimplementedRoutesSeen.has(routeKey)) {
+        unimplementedRoutesSeen.add(routeKey);
+        httpLogger.warn(`[sidecar] unimplemented route: ${routeKey}`);
+      }
+      httpLogger.debug(logData, logMsg);
     } else {
       httpLogger.debug(logData, logMsg);
     }
