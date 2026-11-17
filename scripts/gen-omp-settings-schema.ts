@@ -11,7 +11,7 @@
  * version differs from the running binary and files unknown keys under
  * "Advanced".
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -87,10 +87,19 @@ const roles = (MODEL_ROLE_IDS as string[])
     return { id, name: info.name, section: info.section };
   });
 
+// Built-in theme names for the two theme settings. getAvailableThemes also
+// returns the generating machine's own themes (~/.omp/agent/themes), which are
+// not part of omp; the sidecar lists the running machine's at request time.
+const { getAvailableThemes } = await import(join(root, "packages", "tui", "src", "theme", "index"));
+const customThemeDir = join(homedir(), ".omp", "agent", "themes");
+const customThemes = new Set(existsSync(customThemeDir) ? readdirSync(customThemeDir).map((file) => file.replace(/\.json$/, "")) : []);
+const themes = ((await getAvailableThemes()) as string[]).filter((name) => !customThemes.has(name));
+
 const out = {
   ompVersion: version,
   tabs: (SETTING_TABS as string[]).map((id) => ({ id, label: (TAB_METADATA as Record<string, { label: string }>)[id]!.label })),
   roles,
+  themes,
   settings,
 };
 const target = join(import.meta.dir, "..", "src", "adapters", "openchamber", "omp-settings-schema.json");

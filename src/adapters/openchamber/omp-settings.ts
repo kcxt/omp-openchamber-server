@@ -11,6 +11,8 @@
  * The layout (tabs, groups, labels, option lists) is a snapshot of omp's own
  * settings registry (omp-settings-schema.json, from scripts/gen-omp-settings-schema.ts).
  */
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { getOmpRuntimeInfo } from "../../providers/omp/binary";
 import { normalizeModelsResponse, withOmpRpc } from "../../providers/omp/rpc";
@@ -39,6 +41,18 @@ const fail = (error: unknown, status = 500): SettingsRouteResult => ({
   status,
   data: { error: error instanceof Error ? error.message : String(error) },
 });
+
+/** The running machine's own themes (~/.omp/agent/themes/*.json); omp's built-in names ship in the schema snapshot. */
+function listCustomThemes(): string[] {
+  try {
+    return readdirSync(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent"), "themes"))
+      .filter((file) => file.endsWith(".json"))
+      .map((file) => file.slice(0, -".json".length))
+      .sort();
+  } catch {
+    return [];
+  }
+}
 
 const MODELS_TTL_MS = 5 * 60_000;
 let modelsCache: { at: number; models: Array<{ selector: string; name: string }> } | undefined;
@@ -73,7 +87,7 @@ export async function handleOmpSettingsRoute(req: Request, path: string): Promis
       const [entries, set, models] = await Promise.all([listOmpConfig(), listOmpSetKeys(), listModelSelectors()]);
       return {
         status: 200,
-        data: { entries, set, models, schema, platform: process.platform, ompVersion: getOmpRuntimeInfo().version ?? null },
+        data: { entries, set, models, themes: listCustomThemes(), schema, platform: process.platform, ompVersion: getOmpRuntimeInfo().version ?? null },
       };
     } catch (error) {
       return fail(error);

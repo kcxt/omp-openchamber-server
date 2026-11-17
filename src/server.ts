@@ -3204,6 +3204,11 @@ logStartupBanner(server.port);
 messageQueueRuntime.start();
 const stopOmpUpdateChecker = startOmpUpdateChecker();
 
+// Parse every session header once, in the background, so OpenChamber's first
+// global session list (its goal recovery runs one on connect and gives up
+// after a few seconds) is a cache hit instead of a multi-second cold scan.
+void listSessionsAcrossBackends(null, { all: true }).catch(() => {});
+
 // Keepalive interval so Bun's event loop wakes up frequently to process POSIX signals
 // (SIGINT/SIGTERM) immediately even when Bun.serve has no pending I/O.
 const signalKeepalive = setInterval(() => {}, 100);

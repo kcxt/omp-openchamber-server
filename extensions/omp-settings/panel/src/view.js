@@ -11,7 +11,6 @@
 
 const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto'];
 const THINKING_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max|auto)$/;
-const MODEL_LIST_ID = 'omp-models';
 
 const STYLE = `
 :root { color-scheme: light dark; --bd: #8884; --mut: #888; --ok: #2a8a4a; --err: #c0392b; --acc: #3b82f6; }
@@ -41,8 +40,140 @@ body { font: 13px/1.4 system-ui, sans-serif; margin: 0; }
 .os-role { display: grid; grid-template-columns: minmax(70px, 120px) 1fr auto; gap: 6px 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--bd); }
 .os-role .os-msg { grid-column: 2 / 4; }
 .os-role input, .os-role select { min-width: 0; box-sizing: border-box; padding: 4px 6px; font: inherit; }
+.os-combo { position: relative; flex: 1; min-width: 0; display: flex; }
+.os-combo input { flex: 1; min-width: 0; box-sizing: border-box; padding: 4px 6px; font: inherit; border-right: 0; border-radius: 4px 0 0 4px; }
+.os-combo > button { padding: 0 8px; border-radius: 0 4px 4px 0; }
+.os-pop { position: absolute; z-index: 5; top: 100%; left: 0; right: 0; max-height: 260px; overflow: auto; background: Canvas; border: 1px solid var(--bd); border-radius: 4px; box-shadow: 0 6px 18px #0004; }
+.os-pop-group { position: sticky; top: 0; background: Canvas; font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--mut); padding: 5px 8px 2px; }
+.os-opt { padding: 4px 8px; cursor: pointer; font-size: 12.5px; }
+.os-opt.active { background: color-mix(in srgb, var(--acc) 22%, transparent); }
+.os-opt.current { font-weight: 600; }
+.os-opt-hint { color: var(--mut); font-size: 11px; }
 button { padding: 3px 8px; cursor: pointer; }
 `;
+
+// A searchable dropdown over a known set of values that still takes custom
+// text. Click (or the arrow) opens a grouped list, typing filters it, Enter
+// picks the highlighted row or, when the text matches nothing, uses it as
+// typed; Escape or leaving the field puts the previous value back. The first
+// row clears the value. `getValue()` returns the committed value.
+function combo({ options, value, placeholder = '', onCommit }) {
+  const wrap = document.createElement('div');
+  wrap.className = 'os-combo';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = placeholder;
+  input.value = value;
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-expanded', 'false');
+  const caret = document.createElement('button');
+  caret.type = 'button';
+  caret.tabIndex = -1;
+  caret.textContent = '▾';
+  caret.setAttribute('aria-label', 'Show options');
+  const pop = document.createElement('div');
+  pop.className = 'os-pop';
+  pop.hidden = true;
+  pop.onmousedown = (event) => event.preventDefault();
+  wrap.append(input, caret, pop);
+
+  let current = value;
+  let filtering = false;
+  let active = 0;
+  let rows = [];
+
+  function build() {
+    const text = input.value.trim();
+    const needle = filtering ? text.toLowerCase() : '';
+    rows = [{ value: '', label: '(unset)', clear: true }];
+    for (const option of options) {
+      const hay = `${option.value} ${option.label} ${option.hint ?? ''}`.toLowerCase();
+      if (!needle || hay.includes(needle)) rows.push(option);
+    }
+    if (filtering && text !== '' && !options.some((option) => option.value === text)) {
+      rows.push({ value: text, label: `Use “${text}”`, custom: true });
+    }
+    if (active >= rows.length) active = rows.length - 1;
+    pop.replaceChildren();
+    let group = null;
+    rows.forEach((row, index) => {
+      if (row.group && row.group !== group) {
+        const heading = document.createElement('div');
+        heading.className = 'os-pop-group';
+        heading.textContent = row.group;
+        pop.append(heading);
+      }
+      group = row.group ?? null;
+      const item = document.createElement('div');
+      item.className = `os-opt${index === active ? ' active' : ''}${row.value === current && !row.clear ? ' current' : ''}`;
+      item.textContent = row.label;
+      if (row.hint) {
+        const hint = document.createElement('span');
+        hint.className = 'os-opt-hint';
+        hint.textContent = ` ${row.hint}`;
+        item.append(hint);
+      }
+      item.onmousedown = (event) => { event.preventDefault(); choose(row.value); };
+      pop.append(item);
+    });
+    pop.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function open() {
+    if (!pop.hidden) return;
+    filtering = false;
+    active = Math.max(0, rows.findIndex((row) => row.value === current && !row.clear));
+    pop.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    build();
+    const selected = pop.querySelector('.current');
+    if (selected) selected.scrollIntoView({ block: 'nearest' });
+  }
+
+  function close() {
+    pop.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.value = current;
+  }
+
+  function choose(next) {
+    pop.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    if (next === current) { input.value = current; return; }
+    current = next;
+    input.value = next;
+    onCommit(next);
+  }
+
+  input.onfocus = open;
+  input.onclick = open;
+  input.onblur = close;
+  caret.onmousedown = (event) => {
+    event.preventDefault();
+    if (pop.hidden) { input.focus(); open(); } else close();
+  };
+  input.oninput = () => {
+    filtering = true;
+    pop.hidden = false;
+    active = 1;
+    build();
+  };
+  input.onkeydown = (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (pop.hidden) { open(); return; }
+      active = (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length;
+      build();
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!pop.hidden && rows[active]) choose(rows[active].value);
+    } else if (event.key === 'Escape') {
+      close();
+    }
+  };
+
+  return Object.assign(wrap, { getValue: () => current });
+}
 
 export function mountSettings({ call, root = document.body }) {
   const style = document.createElement('style');
@@ -66,11 +197,11 @@ export function mountSettings({ call, root = document.body }) {
   tabsNav.setAttribute('role', 'tablist');
   head.append(search, bar, note, tabsNav);
   const main = el('div', 'os-main');
-  const models = el('datalist');
-  models.id = MODEL_LIST_ID;
-  root.append(head, main, models);
+  root.append(head, main);
 
   let data = null;
+  let modelList = [];
+  let themeList = [];
   let byId = new Map();
   let setKeys = new Set();
   let tab = null;
@@ -108,7 +239,30 @@ export function mountSettings({ call, root = document.body }) {
     };
   }
 
-  const isModelSetting = (setting) => setting.type === 'string' && /model/i.test(setting.label);
+  // Free-form strings that have a known set of valid values get a searchable
+  // dropdown (still accepting custom text with Enter): models and role names
+  // for the model settings, installed theme names for the two theme settings.
+  const MODEL_LIKE_IDS = new Set(['prewalk.into', 'prewalk.autoTarget']);
+
+  function modelOptions(withRoles) {
+    const options = [];
+    if (withRoles) {
+      for (const role of data.schema.roles) {
+        options.push({ value: role.id, label: `${role.name} (role: ${role.id})`, group: 'Roles' });
+      }
+    }
+    for (const model of modelList) {
+      options.push({ value: model.selector, label: model.selector, hint: model.name, group: model.selector.split('/')[0] });
+    }
+    return options;
+  }
+
+  function comboOptions(setting) {
+    if (setting.type !== 'string') return null;
+    if (setting.id === 'theme.dark' || setting.id === 'theme.light') return themeList.map((name) => ({ value: name, label: name }));
+    if (/model/i.test(setting.label) || MODEL_LIKE_IDS.has(setting.id)) return modelOptions(true);
+    return null;
+  }
 
   const show = (node, text, isErr) => { node.textContent = text; node.className = `os-msg ${isErr ? 'err' : 'ok'}`; };
 
@@ -173,13 +327,13 @@ export function mountSettings({ call, root = document.body }) {
       node.onchange = () => {
         try { save(setting.id, JSON.parse(node.value), message); } catch { show(message, 'not valid JSON', true); }
       };
-    } else if (isModelSetting(setting)) {
-      node = el('input');
-      node.type = 'text';
-      node.setAttribute('list', MODEL_LIST_ID);
-      node.placeholder = 'provider/model (type to search)';
-      node.value = current ?? '';
-      node.onchange = () => (node.value.trim() === '' ? reset(setting.id, message) : save(setting.id, node.value.trim(), message));
+    } else if (comboOptions(setting)) {
+      node = combo({
+        options: comboOptions(setting),
+        value: current ?? '',
+        placeholder: 'unset',
+        onCommit: (value) => (value === '' ? reset(setting.id, message) : save(setting.id, value, message)),
+      });
     } else {
       node = el('input');
       node.type = setting.credential ? 'password' : 'text';
@@ -242,11 +396,7 @@ export function mountSettings({ call, root = document.body }) {
       const name = el('div');
       name.textContent = role.name;
       name.title = role.id;
-      const pick = el('input');
-      pick.type = 'text';
-      pick.setAttribute('list', MODEL_LIST_ID);
-      pick.placeholder = 'omp decides';
-      pick.value = selector;
+      const pick = combo({ options: modelOptions(false), value: selector, placeholder: 'omp decides', onCommit: () => commit() });
       const thinking = el('select');
       for (const option of ['', ...THINKING]) {
         const node = el('option');
@@ -258,13 +408,12 @@ export function mountSettings({ call, root = document.body }) {
       const message = el('div', 'os-msg');
       const commit = () => {
         const next = { ...current };
-        const chosen = pick.value.trim();
+        const chosen = pick.getValue().trim();
         if (chosen === '') delete next[role.id];
         else next[role.id] = thinking.value ? `${chosen}:${thinking.value}` : chosen;
         if (Object.keys(next).length === 0) reset('modelRoles', message);
         else save('modelRoles', next, message);
       };
-      pick.onchange = commit;
       thinking.onchange = commit;
       row.append(name, pick, thinking, message);
       section.append(row);
@@ -342,12 +491,8 @@ export function mountSettings({ call, root = document.body }) {
     data = payload;
     byId = new Map(data.schema.settings.map((setting) => [setting.id, setting]));
     setKeys = new Set(data.set);
-    models.replaceChildren(...data.models.map((model) => {
-      const node = el('option');
-      node.value = model.selector;
-      node.label = model.name;
-      return node;
-    }));
+    modelList = data.models;
+    themeList = [...new Set([...(data.schema.themes ?? []), ...(data.themes ?? [])])].sort();
     if (data.ompVersion && data.ompVersion !== data.schema.ompVersion) {
       note.textContent = `Layout is from omp ${data.schema.ompVersion}; running ${data.ompVersion}. Newer settings are under Advanced.`;
     }

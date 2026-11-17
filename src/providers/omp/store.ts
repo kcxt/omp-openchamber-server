@@ -201,7 +201,39 @@ export async function resolveOmpSubagentOpenCodeId(
   }
 }
 
-export async function readSessionHeader(
+/**
+ * Parsed headers by file, valid while the file's size and mtime are unchanged.
+ * A listing parses every session file (hundreds, each re-read and split), and
+ * OpenChamber polls the global list, so without this a list costs seconds on
+ * every call. Any append or rewrite changes size or mtime and drops the entry.
+ */
+const headerCache = new Map<string, { mtimeMs: number; size: number; header: Promise<SessionHeader | null> }>();
+
+export async function readSessionHeader(filePath: string): Promise<SessionHeader | null> {
+  let mtimeMs: number;
+  let size: number;
+  try {
+    const info = await stat(filePath);
+    mtimeMs = info.mtimeMs;
+    size = info.size;
+  } catch {
+    headerCache.delete(filePath);
+    return null;
+  }
+  const hit = headerCache.get(filePath);
+  if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
+    const cached = await hit.header;
+    return cached ? { ...cached } : null;
+  }
+  // Stored as a promise so concurrent first reads (the startup warm-up and an
+  // early request) share one parse instead of each paying for it.
+  const header = parseSessionHeader(filePath);
+  headerCache.set(filePath, { mtimeMs, size, header });
+  const parsed = await header;
+  return parsed ? { ...parsed } : null;
+}
+
+async function parseSessionHeader(
   filePath: string,
 ): Promise<SessionHeader | null> {
   try {
