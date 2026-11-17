@@ -1,0 +1,7 @@
+#!/bin/sh
+# Register this checkout's OpenChamber extensions (see scripts/register-extensions.ts).
+# Run by bin/openchamber-serve at every start and by install.sh; safe to repeat.
+repo=$(dirname "$(dirname "$(readlink -f "$0")")")
+bun=${BUN:-/usr/bin/bun}
+[ -x "$bun" ] || exit 0
+exec "$bun" "$repo/scripts/register-extensions.ts" "$@"

@@ -1394,6 +1394,9 @@ const MIME_TYPES: Record<string, string> = {
         if (settingsResponse?.html !== undefined) {
           return new Response(settingsResponse.html, { status: settingsResponse.status, headers: { ...cors, "content-type": "text/html; charset=utf-8" } });
         }
+        if (settingsResponse?.script !== undefined) {
+          return new Response(settingsResponse.script, { status: settingsResponse.status, headers: { ...cors, "content-type": "text/javascript; charset=utf-8" } });
+        }
         if (settingsResponse) return json(settingsResponse.data, { status: settingsResponse.status });
       }
 

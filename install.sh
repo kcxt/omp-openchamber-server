@@ -54,6 +54,10 @@ fi
 command -v openchamber >/dev/null 2>&1 ||
     echo "note: no openchamber on PATH; install @openchamber/web"
 
+# List the bundled OpenChamber extensions (omp settings panel). Writes to
+# OpenChamber's data dir only; a running OpenChamber notices within seconds.
+"$repo/bin/register-extensions" || true
+
 cat <<EOF
 Installed:
   ~/.config/systemd/user/{omp-server,openchamber}.service -> $repo
@@ -63,6 +67,9 @@ Reload:  systemctl --user daemon-reload
 Start:   systemctl --user enable --now openchamber.service
          (omp-server.service starts with it: openchamber Requires= it)
 Watch:   journalctl --user -fu omp-server -fu openchamber
+
+The omp settings panel is registered with OpenChamber; allow its local service
+once in Settings -> Extensions to use it.
 
 A checkout update needs only: systemctl --user restart omp-server openchamber
 Namespace options in a user unit need unprivileged user namespaces

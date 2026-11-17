@@ -24,7 +24,7 @@
     }
   },
   "scripts": {
-    "build": "bunx openchamber-guest-bundle panel/src/main.js panel/main.js && bunx openchamber-guest-bundle --node service/src/main.js service/main.js"
+    "build": "bunx openchamber-guest-bundle panel/src/main.js panel/main.js && bunx openchamber-guest-bundle --node service/src/main.js service/main.js && bunx openchamber-guest-bundle panel/src/standalone.js ../../src/adapters/openchamber/omp-settings-view.js"
   },
   "devDependencies": {
     "@openchamber/sdk": "2.7.2"

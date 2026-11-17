@@ -42,4 +42,8 @@ command -v openchamber >/dev/null 2>&1 || {
     exit 1
 }
 
+# Make sure this checkout's extensions (the omp settings panel) are listed in
+# Settings -> Extensions. Cheap, idempotent, and never blocks the server.
+"$repo/bin/register-extensions" || true
+
 exec openchamber serve --foreground --host "$host" --port "$port" "$@"
