@@ -1,0 +1,35 @@
+#!/bin/sh
+# Foreground entrypoint for the omp OpenChamber sidecar.
+#
+# ~/bin/omp-server is a symlink to this file (see install.sh) and the systemd
+# user unit execs that symlink, so a checkout update plus a service restart is
+# the whole release path: no path to this checkout is baked into the unit.
+
+repo=$(dirname "$(dirname "$(readlink -f "$0")")")
+bun=${BUN:-/usr/bin/bun}
+omp_bin=${OMP_BIN:-$HOME/bin/omp}
+
+# Bind to the tailnet network address when tailscale reports one, so OpenChamber
+# on another device can add the server directly instead of over an ssh tunnel.
+# Override with OC_SIDECAR_HOST (127.0.0.1 keeps it local-only).
+host=${OC_SIDECAR_HOST:-}
+if [ -z "$host" ] && command -v tailscale >/dev/null 2>&1; then
+    host=$(tailscale ip -4 2>/dev/null | head -n1)
+fi
+[ -n "$host" ] || host=127.0.0.1
+
+[ -x "$bun" ] || {
+    echo "omp-server: no bun executable at $bun (set BUN=)" >&2
+    exit 1
+}
+[ -d "$repo/node_modules" ] || {
+    echo "omp-server: dependencies missing, run 'bun install' in $repo" >&2
+    exit 1
+}
+[ -x "$omp_bin" ] || {
+    echo "omp-server: no omp executable at $omp_bin (set OMP_BIN=)" >&2
+    exit 1
+}
+
+cd "$repo" || exit 1
+exec "$bun" run src/main.ts --binary "$omp_bin" --host "$host" "$@"

@@ -62,7 +62,7 @@ export function toV2Session(session: OpenCodeSession) {
       updated: session.time.updated,
       idle: (session.time as typeof session.time & { idle?: number }).idle,
       archived: session.time.archived,
-      viewed: (session.time as typeof session.time & { viewed?: number }).viewed,
+      viewed: session.time.viewed,
     },
     title: session.title,
     location: { directory: session.directory || process.cwd() },

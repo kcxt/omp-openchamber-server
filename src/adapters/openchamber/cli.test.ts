@@ -25,6 +25,7 @@ describe("parseCliArgs", () => {
     expect(opts).toEqual({
       binary: undefined,
       port: undefined,
+      host: undefined,
       help: false,
     });
   });
@@ -92,6 +93,15 @@ describe("parseCliArgs", () => {
     expect(() => parseCliArgs(["--port", "not-a-number"])).toThrow("Invalid port");
     expect(() => parseCliArgs(["--port", "0"])).toThrow("Invalid port");
     expect(() => parseCliArgs(["--port", "70000"])).toThrow("Invalid port");
+  });
+
+  test("parses --host", () => {
+    expect(parseCliArgs(["--host", "185.176.36.123"]).host).toBe("185.176.36.123");
+    expect(parseCliArgs(["--host=0.0.0.0"]).host).toBe("0.0.0.0");
+  });
+
+  test("rejects host values that are not bare addresses", () => {
+    expect(() => parseCliArgs(["--host", "http://185.176.36.123:4096"])).toThrow("Invalid host");
   });
 
   test("parses --help and -h", () => {

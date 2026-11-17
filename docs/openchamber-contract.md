@@ -27,6 +27,14 @@ not the older `{ info, parts }` record. Important discriminators include
 `type: "user" | "assistant" | "synthetic" | "compaction" | "shell"`.
 Assistant content is an ordered array of text, reasoning, and tool items.
 
+OpenChamber mints session ids client-side (`ses_` + nanoid) and compares the
+created session's id with the one it asked for; a mismatch is reported as
+"Failed to create session" and the foreign session is deleted. Requested ids
+are therefore echoed verbatim through the transcript header's `openCodeId`.
+`GET /session/active` and the other SDK-unwrapped routes must wrap their value
+in `data`: the client reads `response.data`, and an unenveloped value reads as
+a failed call.
+
 Prompts use top-level fields such as `id`, `text`, `files`, `agents`, `skills`,
 `metadata`, and `delivery`. File inputs use `{ uri, name?, description?,
 mention? }`; the sidecar converts them to the v2 file-attachment shape for

@@ -23,13 +23,15 @@ Returns proxy health status.
 
 ### `GET /api/info`
 Returns OpenCode-compatible server identity information for clients that use
-this endpoint as their readiness probe. `version` is the detected OMP runtime
-version, or `"unknown"` when it is unavailable.
+this endpoint as their readiness probe. OpenChamber accepts only a `2.x`
+semver at or above 2.2.4 here, so `version` reports the OpenCode API level the
+sidecar implements; the OMP runtime behind it is reported as `ompVersion`.
 
 **Response `200 OK`**:
 ```json
 {
-  "version": "18.2.8",
+  "version": "2.2.4",
+  "ompVersion": "18.2.8",
   "pid": 12345,
   "urls": ["http://127.0.0.1:4096"],
   "paths": { "tmp": "/tmp" }
@@ -319,6 +321,12 @@ Creates a new session in the specified directory.
 ```
 - **Response `201 Created`**: Returns the newly created `Session` object.
 
+OpenChamber mints `ses_` ids client-side (`ses_` + nanoid) and rejects a
+session that comes back under a different id, so a requested id is echoed
+verbatim: it is stored as `openCodeId` in the transcript header while the OMP
+UUID stays the file name. Canonical `ses_<32hex>` ids keep decoding to the OMP
+UUID as before.
+
 ### `GET /session/:id`
 Retrieves metadata for a specific session.
 
@@ -355,7 +363,17 @@ Returns the execution status (`busy` / `idle`) for all active sessions.
 
 ### `GET /session/active`
 Returns the OpenCode v2 global active-session snapshot. Each entry has
-`{ "type": "running" }`; idle sessions are omitted.
+`{ "type": "running" }`; idle sessions are omitted. The OpenCode SDK unwraps
+`data`, so the map is enveloped.
+
+**Response `200 OK`**:
+```json
+{
+  "data": {
+    "ses_019f65f9fa217000892db00212c6d038": { "type": "running" }
+  }
+}
+```
 
 ---
 
@@ -544,3 +562,26 @@ data: {"payload":{"id":"evt_03","type":"session.status","properties":{"sessionID
 | `/mcp` | `GET` | Returns MCP server status map (`{}`). |
 | `/api/small-model` | `GET` | Reports resolved small model and callable providers allow-list for OpenChamber. |
 | `/api/small-model/generate` | `POST` | Executes one-shot text generation with the resolved small model (for live turn progress summaries, commit messages, etc.). |
+
+---
+
+## OpenChamber Web Client Routes
+
+These are the routes OpenChamber's browser client calls directly when it is
+pointed at the sidecar, or that its web server proxies to it. They answer in
+the shapes the client's schemas expect so it renders its unavailable state
+instead of failing on a missing route.
+
+| Endpoint | Method | Response |
+|---|---|---|
+| `/fs/directory-stats` | `POST` | `{ "results": [{ "path", "isDirectory", "reason"?, "realPath"? }] }` for a `{ "paths": [...] }` body. `reason` is `not-found`, `not-directory`, or `unavailable`; the client maps the first two to "missing". |
+| `/session-todos/:id` | `GET` | `{ "revision", "state": "off" }` when the backend has no todo support, else `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`. |
+| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items in the prompt-payload shape the client seeds as optimistic user messages. |
+| `/session/:id/inbox/:itemId` | `DELETE` | `204` — cancels a queued prompt. |
+| `/session/:id/inbox/:itemId` | `PATCH` | `409` — delivery mode is chosen by the prompt request, not by a queued item. |
+| `/session/:id/view` | `POST` | `204` — records `time.viewed` from the `idle` timestamp and emits `session.viewed`. |
+| `/sessions/:id/view` | `POST` | `{ "success": true, "sessionId", "viewed": true }` — OpenChamber's own web-server ack. |
+| `/api/git/projects` | `POST` | `{ "projects": [{ "directory", "isGitRepository" }] }` for a `{ "directories": [...] }` body; `400` when the array is missing. |
+| `/api/source-control/binding` | `GET` | `{ "repository": { "supported", "repositoryId", "configRevision", "bare", "remotes" }, "revision": 0, "binding": null }` for a repository; `422` with `code: "UNSUPPORTED_SOURCE_CONTROL_REPOSITORY"`, `reason: "not-a-git-repository"` otherwise. The sidecar has no hosted-forge integration, so `binding` is always `null`. |
+| `/api/openchamber/spaces/archives` | `GET` | `{ "archives": [] }` — Spaces is owned by OpenChamber's web server. |
+| `/api/openchamber/received-pages/config` | `GET` | `{ "available": false, "bases": [] }` — Received-pages is owned by OpenChamber's web server. |

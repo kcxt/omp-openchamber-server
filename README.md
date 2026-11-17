@@ -1,136 +1,86 @@
 # omp-openchamber-server
 
-Use [OpenChamber](https://github.com/OpenChamber/OpenChamber) as a UI for [oh-my-pi](https://github.com/can1357/oh-my-pi) coding sessions — without modifying either project.
+HTTP/SSE sidecar that lets [OpenChamber](https://github.com/OpenChamber/OpenChamber) drive [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) sessions. It speaks the OpenCode v2 API; neither project is modified.
 
-## Source layout
-
-- `src/main.ts` — stable process entrypoint.
-- `src/server.ts` — Bun HTTP/WebSocket composition and adapter mounting.
-- `src/adapters/openchamber/` — OpenCode/OpenChamber compatibility behavior,
-  tests, and extensions.
-- `src/adapters/jarvis/` — Jarvis session/turn and host-tool adapter.
-- `src/providers/omp/` — OMP RPC, session persistence, and model provider.
-- `src/shared/` — shared protocol types, event transport, logging, and utilities.
-
-## Quick Start
-
-### 1. Prerequisites
-
-- [OpenChamber](https://github.com/OpenChamber/OpenChamber) installed or running
-- [Bun](https://bun.sh) runtime
-- Network access on first startup so the pinned OMP release can be downloaded
-
-### 2. Start the Proxy Server
+## Run
 
 ```bash
 bun install
-bun run src/main.ts
-# → [sidecar] Listening on http://127.0.0.1:4096
+bun run src/main.ts                 # http://127.0.0.1:4096
+bun run src/main.ts --binary /path/to/omp --host 100.x.y.z --port 4096
 ```
 
-#### Custom OMP Binary
+| Option | Env | Default |
+|---|---|---|
+| `-b, --binary` (`--omp-bin`) | `OMP_BIN` | pinned release staged in `resources/omp` (`bun run prepare:omp`) |
+| `-p, --port` | `OC_SIDECAR_PORT` | `4096` |
+| `--host` | `OC_SIDECAR_HOST` | `127.0.0.1` |
+| — | `LOG_LEVEL` | `info` (`debug` = access log) |
 
-You can run the sidecar with a specific OMP binary by passing the `--binary` CLI argument:
+Connect: OpenChamber → **Settings → Remote Instances → Add server** → `http://127.0.0.1:4096`. Or `OPENCODE_HOST=http://127.0.0.1:4096 OPENCODE_SKIP_START=true openchamber serve --foreground`.
+
+### systemd user service
 
 ```bash
-bun run src/main.ts --binary /path/to/omp
-# or with bun run start:
-bun run start -- --binary /path/to/omp
+./install.sh && systemctl --user restart omp-server
 ```
 
-Aliases `--omp-bin`, `--omp-binary`, and `-b` are also supported. Alternatively, you can set the `OMP_BIN` environment variable:
+`bin/omp-server` binds to the Tailscale IPv4 address when available (override with `OC_SIDECAR_HOST`). The unit is sandboxed (`ProtectSystem=strict`, `ProtectHome=tmpfs`, explicit `BindPaths=`); edit them for your layout. Provider keys go in `~/.config/omp-openchamber-server/env`. Update = `git pull && systemctl --user restart omp-server`.
+
+Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md).
+
+## OpenChamber feature status
+
+**Real** = backed by omp, git, or the filesystem. **Sidecar** = implemented in the sidecar, omp unaware. **Stub** = fixed empty/disabled response; writes are accepted and discarded.
+
+### Settings: do they reach omp?
+
+| OpenChamber setting | Where it goes | Reaches omp? |
+|---|---|---|
+| Model / thinking variant picker (per prompt) | prompt body → omp RPC set-model | **Yes** |
+| Model / agent switch on a session (`/session/:id/model`, `/agent`) | stored in the omp session transcript | **Yes** (used next turn) |
+| Provider list / model catalog | read from omp's configured providers | **Yes** (read-only; add keys in omp) |
+| `AGENTS.md` editor (Behavior) | writes `<project>/AGENTS.md` | **Yes** (omp reads it) |
+| Small-model override (`smallModelOverride`, `smallModelUseDefault`) | `settings.json`; used for titles / commit & PR text | Sidecar only |
+| Permission auto-accept (global and per session) | sidecar approval policy | Sidecar only |
+| Session archive / viewed marker | appended to the omp session JSONL | Persisted with the session |
+| All other `PUT/PATCH /api/config/settings`, `/config`, `/global/config` | merged into `~/.config/openchamber/settings.json` and echoed back | **No** (stored only) |
+| Skills / snippets / plugins / MCP / themes / custom-command editors | fixed empty lists | **No** (stub) |
+| Magic prompts, agent memory | empty | **No** (stub) |
+
+### Features
+
+| Area | Status |
+|---|---|
+| Sessions: create (client-minted ids), list, rename, archive, fork, children, revert/unrevert, compact, abort, todo, diff, move, view | Real |
+| Prompts, `prompt_async`, shell, slash commands (`/command`, `/skill` from omp discovery), generate | Real |
+| Streaming (SSE + WebSocket events), tool parts, subagents, images | Real |
+| Permissions, questions, forms | Real |
+| Message queue / inbox (list, reorder, hold, take, delete) | Real; switching a queued item's delivery mode returns 409 |
+| Git panel (status, diff, commit, branch, worktree, stash, log, identity, PR text) | Real (local `git`) |
+| Source-control binding | Sidecar: always reports repo with no hosted-forge binding |
+| File browser / read / write / rename / delete / clone / stat / directory availability | Real |
+| Project context, session knowledge | Real |
+| Browser control (`openchamber_web` extension) | Real |
+| `/api/info`, `/api/version`, health | Sidecar (advertises OpenCode API 2.2.4, OpenChamber 2.0.14) |
+| Session folders, project icons, spaces archives, received pages | Stub (empty) |
+| GitHub / Linear auth | Stub (`not authenticated/connected`) |
+| Usage quota | Stub (`configured: false`) |
+| Terminal panel, dictation / TTS, dev servers, tunnels, walkthrough, scheduled tasks | Stub / disabled |
+| Update check / upgrade status | Stub (`no update`) |
+| MCP, LSP lists | Stub (empty) |
+| Auth (passkey, client tokens) | Stub (no auth; bind to a trusted interface) |
+
+Anything unlisted that falls through returns `404 not implemented`.
+
+## Develop
 
 ```bash
-OMP_BIN=/path/to/omp bun run src/main.ts
-```
-
-#### Caller-owned provider credentials (optional)
-
-The sidecar normally lets OMP resolve providers from its own configuration.
-For a host application that owns provider credentials, a prompt may instead
-send exactly one of `credentials` or `credentialRef`. Raw credentials are
-scoped to that OMP child and removed with its temporary configuration. An
-opaque `credentialRef` is resolved through either a process-local resolver or
-an HTTP broker configured with:
-
-```bash
-OC_CREDENTIAL_RESOLVER_URL=http://127.0.0.1:8787/resolve \
-OC_CREDENTIAL_RESOLVER_TOKEN=... \
-  bun run src/main.ts
-```
-
-`POST /config/providers` accepts the same opt-in envelope for model discovery;
-`GET /config/providers` and requests without either field retain the existing
-OMP-owned provider behavior. See [`docs/providers.md`](./docs/providers.md) for
-the request shape and resolver contract.
-
-#### CLI Options
-
-- `-b, --binary <path>`: Path to custom OMP binary (aliases: `--omp-bin`, `--omp-binary`).
-- `-p, --port <port>`: Port to listen on (default: `4096`, or `OC_SIDECAR_PORT`).
-- `-h, --help`: Display help and usage instructions.
-
-On startup, if no custom binary is specified, the sidecar checks the project-owned `resources/omp` directory and
-downloads the pinned OMP release there when it is missing. It always launches
-that staged binary; it never falls back to an unmanaged `omp` on `PATH`.
-`bun run prepare:omp` can be used to stage it manually, and `bun run
-verify:omp` verifies the staged release. Set `OMP_VERSION` when preparing a
-different release, or `OMP_TARGET` when staging one of the supported release
-targets explicitly.
-
-### 3. Connect to OpenChamber
-
-![How to add OMP Server to OpenChamber](./assets/openchamber-add-server.gif)
-
-#### Option A: Via OpenChamber UI (Recommended)
-
-1. **Open Remote Instances**:
-   - Go to **Settings** → **Remote Instances** (or click the instance menu in the top-right corner and choose **+ Add instance**).
-2. **Add Server**:
-   - Click **+ Add server** and configure:
-     - **Label (optional)**: `OMP Server`
-     - **URL**: `http://127.0.0.1:4096`
-     - **Connection token**: *(leave blank for local servers)*
-     - Click **Add server**.
-3. **Switch & Select Instance**:
-   - Click the server instance switcher in the **top-right corner** of OpenChamber (e.g. `OMP Server` or `Local`).
-   - Select **OMP Server** (`● Connected`) and star it as default.
-   - All your oh-my-pi sessions will appear in the sidebar, and your prompts will be driven by `omp`!
-
-#### Option B: Via CLI Environment Variables
-
-```bash
-OPENCODE_HOST=http://127.0.0.1:4096 \
-  OPENCODE_SKIP_START=true \
-  openchamber serve --foreground --port 3000
-```
-Open `http://127.0.0.1:3000/` in your browser.
-
-## Development & Testing
-
-```bash
-# Type-check
-bun run check
-
-# Run unit and contract test suite
-bun test
-
-# Optional: Run live end-to-end suite against real omp binary & active model
+bun run check    # type-check
+bun test         # unit + contract suites (unset OC_SIDECAR_HOST first)
 bun run test:live
 ```
 
-## Documentation
+Layout: `src/server.ts` (routing) · `src/adapters/openchamber/` (OpenChamber/OpenCode compat) · `src/adapters/jarvis/` · `src/providers/omp/` (RPC, session store) · `src/shared/`.
 
-Full architectural specifications, API schemas, and protocol references are in [`docs/`](./docs):
-
-- [`architecture.md`](./docs/architecture.md) — Subsystem architecture, process management, JSONL fast path, and core invariants.
-- [`api-reference.md`](./docs/api-reference.md) — Complete OpenCode HTTP and SSE endpoint reference with request/response schemas.
-- [`providers.md`](./docs/providers.md) — Multi-backend adapter contract: `AgentBackend`/`SessionStore` interfaces, session-id codec, model-picker routing, and capability gating.
-- [`omp-protocol.md`](./docs/omp-protocol.md) — oh-my-pi stdio NDJSON RPC protocol, commands, turn events, and disk schemas.
-- [`openchamber-contract.md`](./docs/openchamber-contract.md) — OpenChamber SSE stream lifecycle, message/part schemas, and UI reducer contracts.
-
-The sidecar's backend layer is pluggable (`src/providers/`): omp is the
-default backend, and additional agent backends plug in through the
-`AgentBackend` adapter contract without changing the OpenCode HTTP/SSE
-surface. A fake backend ships for tests — set `OC_FAKE_BACKEND=1` to register
-it (see [`docs/providers.md`](./docs/providers.md)).
+Docs: [`architecture`](./docs/architecture.md) · [`api-reference`](./docs/api-reference.md) · [`providers`](./docs/providers.md) · [`omp-protocol`](./docs/omp-protocol.md) · [`openchamber-contract`](./docs/openchamber-contract.md)

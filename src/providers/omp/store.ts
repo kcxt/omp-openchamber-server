@@ -36,12 +36,15 @@ interface SessionHeader {
   firstUserPrompt?: string;
   metadata?: Record<string, unknown>;
   archived?: number;
+  viewed?: number;
   parentSession?: string;
   agent?: string;
   model?: { providerID: string; modelID: string; variant?: string };
   tokens?: TokenBreakdown;
   cost?: number;
   revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] };
+  /** Client-minted OpenCode id (nanoid form) this omp session must answer to. */
+  openCodeId?: string;
 }
 
 export function encodeCwd(cwd: string): string {
@@ -82,6 +85,15 @@ function normalizeSessionAlias(value: string): string {
 
 function isCanonicalOpenCodeSessionId(openCodeId: string): boolean {
   return /^ses_[0-9a-f]{32}$/i.test(openCodeId);
+}
+
+/**
+ * OpenChamber mints session ids client-side (`ses_` + nanoid) and requires the
+ * server to echo the exact value, so non-UUID ids are carried verbatim in the
+ * omp header's `openCodeId` alongside the omp UUID used for file naming.
+ */
+function isExternalOpenCodeSessionId(openCodeId: string): boolean {
+  return /^ses_[A-Za-z0-9_-]{6,}$/.test(openCodeId);
 }
 
 const OMP_UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}";
@@ -201,6 +213,7 @@ export async function readSessionHeader(
     let firstUserPrompt: string | undefined;
     let latestMetadata: Record<string, unknown> | undefined;
     let latestArchived: number | undefined;
+    let latestViewed: number | undefined;
     let latestAgent: string | undefined;
     let latestRevert: SessionHeader["revert"] | null | undefined;
     let hasRevertUpdate = false;
@@ -238,6 +251,7 @@ export async function readSessionHeader(
               modelID: entry.modelId,
               variant: typeof entry.variant === "string" ? entry.variant : "default",
             } : undefined,
+            openCodeId: typeof entry.openCodeId === "string" ? entry.openCodeId : undefined,
           };
           if (header.metadata) {
             latestMetadata = { ...(latestMetadata || {}), ...header.metadata };
@@ -268,6 +282,8 @@ export async function readSessionHeader(
           latestMetadata = { ...(latestMetadata || {}), ...entry.metadata };
         } else if (entry.type === "archive") {
           latestArchived = typeof entry.archived === "number" ? entry.archived : (entry.archived ? Date.now() : 0);
+        } else if (entry.type === "viewed") {
+          latestViewed = typeof entry.viewed === "number" ? entry.viewed : Date.now();
         } else if (entry.type === "agent_change" && typeof entry.agent === "string") {
           latestAgent = entry.agent;
         } else if (entry.type === "revert_change") {
@@ -343,6 +359,7 @@ export async function readSessionHeader(
     if (firstUserPrompt !== undefined) header.firstUserPrompt = firstUserPrompt;
     if (latestMetadata !== undefined) header.metadata = latestMetadata;
     if (latestArchived !== undefined) header.archived = latestArchived;
+    if (latestViewed !== undefined) header.viewed = latestViewed;
     if (latestAgent !== undefined) header.agent = latestAgent;
     if (hasRevertUpdate) {
       if (latestRevert) header.revert = latestRevert;
@@ -361,7 +378,7 @@ async function buildOpenCodeSession(
   filePath: string,
   artifactParentReference?: string,
 ): Promise<OpenCodeSession> {
-  const openCodeId = toOpenCodeSessionId(header.id);
+  const openCodeId = header.openCodeId ?? toOpenCodeSessionId(header.id);
   const parentID = normalizeParentSessionId(header.parentSession, artifactParentReference);
   const compactId = header.id.replace(/-/g, "");
   const first8 = compactId.slice(0, 8);
@@ -404,6 +421,7 @@ async function buildOpenCodeSession(
       created,
       updated,
       ...(header.archived !== undefined ? { archived: header.archived } : {}),
+      ...(header.viewed !== undefined ? { viewed: header.viewed } : {}),
     },
     cost: header.cost ?? 0,
     tokens: header.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -412,15 +430,31 @@ async function buildOpenCodeSession(
   };
 }
 
+/**
+ * Resolve a parent reference to the omp UUID stored in the transcript header.
+ * Client-minted OpenCode ids are not UUIDs, so a fork/continuation of one has
+ * to be looked up rather than decoded.
+ */
+async function resolveOmpParentId(parentID?: string): Promise<string | undefined> {
+  if (!parentID) return undefined;
+  if (isCanonicalOpenCodeSessionId(parentID)) return fromOpenCodeSessionId(parentID);
+  const parent = await getOmpSessionByOpenCodeId(parentID);
+  return parent ? fromOpenCodeSessionId(parent.id) : fromOpenCodeSessionId(parentID);
+}
+
 export async function createOmpSession(
   directory?: string | null,
   options?: { id?: string; title?: string; parentID?: string; agent?: string; model?: { providerID: string; modelID: string; variant: string }; metadata?: Record<string, unknown> },
 ): Promise<OpenCodeSession> {
   const cwd = directory || process.cwd();
-  const requestedID = options?.id && isCanonicalOpenCodeSessionId(options.id)
+  const canonicalID = options?.id && isCanonicalOpenCodeSessionId(options.id)
     ? fromOpenCodeSessionId(options.id)
     : undefined;
-  const uuid = requestedID ?? randomUUID();
+  const externalID = canonicalID === undefined && options?.id && isExternalOpenCodeSessionId(options.id)
+    ? options.id
+    : undefined;
+  const uuid = canonicalID ?? randomUUID();
+  const parentOmpID = await resolveOmpParentId(options?.parentID);
   const timestamp = new Date().toISOString();
   const fileTimestamp = timestamp.replace(/[:.]/g, "-");
   const fileName = `${fileTimestamp}_${uuid}.jsonl`;
@@ -449,7 +483,8 @@ export async function createOmpSession(
     metadata: options?.metadata,
     thinkingLevel: "off",
     version: 3,
-    parentSession: options?.parentID ? fromOpenCodeSessionId(options.parentID) : undefined,
+    openCodeId: externalID,
+    parentSession: parentOmpID,
   };
 
   await Bun.write(filePath, titleSlot + JSON.stringify(headerRecord) + "\n");
@@ -466,7 +501,8 @@ export async function createOmpSession(
       agent: options?.agent ?? "omp",
       model: options?.model ?? { providerID: "omp", modelID: "omp", variant: "default" },
       metadata: options?.metadata,
-      parentSession: options?.parentID ? fromOpenCodeSessionId(options.parentID) : undefined,
+      openCodeId: externalID,
+      parentSession: parentOmpID,
     },
     filePath,
   );
@@ -577,7 +613,7 @@ export async function updateOmpSession(
     agent?: string;
     model?: { providerID: string; modelID: string; variant: string };
     revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
-    time?: { archived?: number | null };
+    time?: { archived?: number | null; viewed?: number };
   },
   directory?: string | null,
 ): Promise<OpenCodeSession | null> {
@@ -665,6 +701,24 @@ export async function updateOmpSession(
       session.time = { ...session.time, archived: archivedVal };
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
+    } catch {
+      // ignore
+    }
+  }
+
+  // Viewing is a read marker, not a change: it deliberately leaves
+  // time.updated alone so the session list keeps its order.
+  if (updates.time?.viewed !== undefined) {
+    try {
+      const viewed = updates.time.viewed;
+      const viewedEntry = JSON.stringify({
+        type: "viewed",
+        viewed,
+        timestamp: new Date().toISOString(),
+      }) + "\n";
+      await appendFile(session.path, viewedEntry);
+      session.time = { ...session.time, viewed };
+      emitOpenCodeV2Event("session.viewed", { sessionID: openCodeId, idle: viewed }, session.directory);
     } catch {
       // ignore
     }
@@ -823,6 +877,7 @@ export async function getOmpSessionByOpenCodeId(
         if (
           header.id === ompId ||
           toOpenCodeSessionId(header.id) === openCodeId ||
+          (header.openCodeId && header.openCodeId === openCodeId) ||
           (requestedAlias !== undefined && normalizeSessionAlias(header.title ?? "") === requestedAlias)
         ) {
           if (directory && header.cwd !== directory) continue;
@@ -848,6 +903,7 @@ export async function getOmpSessionByOpenCodeId(
           if (
             subHeader.id === ompId ||
             toOpenCodeSessionId(subHeader.id) === openCodeId ||
+            (subHeader.openCodeId && subHeader.openCodeId === openCodeId) ||
             (requestedAlias !== undefined && (
               childAlias === requestedAlias ||
               normalizeSessionAlias(subHeader.title ?? "") === requestedAlias

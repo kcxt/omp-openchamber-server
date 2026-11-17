@@ -4,6 +4,7 @@ import { validateOmpBinary } from "../../providers/omp/binary";
 export interface SidecarCliOptions {
   binary?: string;
   port?: number;
+  host?: string;
   help?: boolean;
 }
 
@@ -12,6 +13,7 @@ export interface SidecarCliOptions {
  * Supports:
  *   -b, --binary <path>      Path to custom OMP binary (aliases: --omp-bin, --omp-binary)
  *   -p, --port <port>        Port to listen on
+ *       --host <host>        Address to bind (default 127.0.0.1)
  *   -h, --help               Show help message
  */
 export function parseCliArgs(argv: string[] = process.argv.slice(2)): SidecarCliOptions {
@@ -25,6 +27,7 @@ export function parseCliArgs(argv: string[] = process.argv.slice(2)): SidecarCli
       "omp-bin": { type: "string" },
       "omp-binary": { type: "string" },
       port: { type: "string", short: "p" },
+      host: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     strict: false,
@@ -46,9 +49,18 @@ export function parseCliArgs(argv: string[] = process.argv.slice(2)): SidecarCli
     port = parsedPort;
   }
 
+  let host: string | undefined;
+  if (typeof values.host === "string" && values.host.trim()) {
+    host = values.host.trim();
+    if (/\s/.test(host) || host.startsWith("http")) {
+      throw new Error(`Invalid host: ${values.host}. Use a bare address such as 185.176.36.123 or myhost.mytailnet.example.`);
+    }
+  }
+
   return {
     binary,
     port,
+    host,
     help: Boolean(values.help),
   };
 }
@@ -61,12 +73,18 @@ Usage:
   bun run start -- [options]
 
 Options:
-  -b, --binary <path>       Path to custom OMP binary (aliases: --omp-bin, --omp-binary)
-  -p, --port <port>         Port to listen on (default: 4096, or OC_SIDECAR_PORT)
-  -h, --help                Show this help message
+  -b, --binary <path>     Path to custom OMP binary (aliases: --omp-bin, --omp-binary)
+  -p, --port <port>       Port to listen on (default: 4096, or OC_SIDECAR_PORT)
+      --host <host>       Address to bind (default: 127.0.0.1, or OC_SIDECAR_HOST)
+  -h, --help              Show this help message
 
 Environment Variables:
   OMP_BIN                   Path to custom OMP binary
   OC_SIDECAR_PORT           Port to listen on
+  OC_SIDECAR_HOST           Address to bind; bind to the Tailscale network address
+                            (tailscale ip -4) to reach the sidecar from other
+                            devices on the tailnet without a tunnel
+  LOG_LEVEL                   pino level (default: info; debug enables the per-request
+                            access log)
 `);
 }

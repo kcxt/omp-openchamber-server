@@ -390,5 +390,147 @@ describe("OpenChamber End-to-End Compatibility & Model Picker Verification", () 
       rmSync(testHtmlFile, { force: true });
     }
   });
+
+  test("OpenChamber 2.7 session, directory, and Git routes answer the client shapes", async () => {
+    // /api/info is OpenChamber's readiness gate: it only accepts a 2.x
+    // semver, and a non-parsing version parks the backend behind 503s.
+    const info = await (await fetch(`${BASE}api/info`)).json() as { version?: string; ompVersion?: string };
+    expect(info.version).toMatch(/^2\.\d+\.\d+$/);
+    expect(typeof info.ompVersion).toBe("string");
+
+    // The SDK unwraps `data` from /session/active; a bare map reads as failure.
+    const active = await (await fetch(`${BASE}api/session/active?directory=${encodeURIComponent(testDir)}`)).json() as
+      { data?: Record<string, { type?: string }> };
+    expect(typeof active.data).toBe("object");
+
+    // Directory availability probe: the client maps `reason` to missing/unknown.
+    const missingDir = join(testDir, "directory-stats-missing-12345");
+    const stats = await (await fetch(`${BASE}api/fs/directory-stats`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paths: [testDir, missingDir] }),
+    })).json() as { results?: Array<{ path: string; isDirectory?: boolean; reason?: string; realPath?: string }> };
+    expect(stats.results?.length).toBe(2);
+    expect(stats.results?.[0]?.isDirectory).toBe(true);
+    expect(typeof stats.results?.[0]?.realPath).toBe("string");
+    expect(stats.results?.[1]?.isDirectory).toBe(false);
+    expect(stats.results?.[1]?.reason).toBe("not-found");
+
+    // OpenChamber mints `ses_` ids client-side and refuses a session created
+    // under a different one, so the id has to survive the round trip.
+    const mintedId = `ses_${"0".repeat(6)}ClientMintedId0001`;
+    const created = await (await fetch(`${BASE}api/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: mintedId, title: "client minted", agent: "omp", location: { directory: testDir } }),
+    })).json() as { data?: { id?: string } };
+    expect(created.data?.id).toBe(mintedId);
+
+    const readBack = await fetch(`${BASE}api/session/${mintedId}?directory=${encodeURIComponent(testDir)}`);
+    expect(readBack.status).toBe(200);
+
+    // Session todos page envelope.
+    const todos = await (await fetch(`${BASE}api/session-todos/${mintedId}?directory=${encodeURIComponent(testDir)}`)).json() as
+      { revision?: number; state?: string; todos?: Array<{ content?: string; status?: string }> };
+    expect(typeof todos.revision).toBe("number");
+    expect(["off", "ready"]).toContain(todos.state ?? "");
+    if (todos.state === "ready") {
+      expect(Array.isArray(todos.todos)).toBe(true);
+      for (const todo of todos.todos ?? []) {
+        expect(typeof todo.content).toBe("string");
+        expect(["pending", "in_progress", "completed", "cancelled"]).toContain(todo.status ?? "");
+      }
+    }
+
+    // Mark-viewed acknowledgement (OpenChamber's own web-server route).
+    const viewedResp = await fetch(`${BASE}api/sessions/${mintedId}/view`, { method: "POST" });
+    expect(viewedResp.status).toBe(200);
+    const viewed = await viewedResp.json() as { success?: boolean; sessionId?: string; viewed?: boolean };
+    expect(viewed).toEqual({ success: true, sessionId: mintedId, viewed: true });
+
+    // OpenCode v2 SDK route: 204, and the read lands on the session payload.
+    const idleAt = 1_700_000_000_000;
+    const sdkViewResp = await fetch(`${BASE}api/session/${mintedId}/view?directory=${encodeURIComponent(testDir)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idle: idleAt }),
+    });
+    expect(sdkViewResp.status).toBe(204);
+    const viewedSession = await (await fetch(`${BASE}api/session/${mintedId}?directory=${encodeURIComponent(testDir)}`)).json() as
+      { data?: { time?: { viewed?: number } } };
+    expect(viewedSession.data?.time?.viewed).toBe(idleAt);
+
+    // Inbox view of the pending-prompt queue. The hold keeps the item queued so
+    // the inbox read sees it before dispatch drains it.
+    const holdResp = await fetch(`${BASE}api/message-queue/sessions/${mintedId}/hold`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ held: true, ttlMs: 60_000 }),
+    });
+    expect(holdResp.status).toBe(200);
+    const enqueued = await (await fetch(`${BASE}api/message-queue/sessions/${mintedId}/items`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ directory: testDir, item: { text: "queued for inbox", sendConfig: { providerID: "omp", modelID: "omp" } } }),
+    })).json() as { itemId?: string };
+    expect(typeof enqueued.itemId).toBe("string");
+
+    const inbox = await (await fetch(`${BASE}api/session/${mintedId}/inbox?directory=${encodeURIComponent(testDir)}`)).json() as
+      { data?: Array<{ id?: string; sessionID?: string; type?: string; time?: { created?: number }; payload?: { text?: string } }> };
+    expect(Array.isArray(inbox.data)).toBe(true);
+    const inboxItem = inbox.data?.find((entry) => entry.id === enqueued.itemId);
+    expect(inboxItem?.sessionID).toBe(mintedId);
+    expect(inboxItem?.type).toBe("user");
+    expect(inboxItem?.payload?.text).toBe("queued for inbox");
+    expect(typeof inboxItem?.time?.created).toBe("number");
+
+    const cancelResp = await fetch(`${BASE}api/session/${mintedId}/inbox/${enqueued.itemId}`, { method: "DELETE" });
+    expect(cancelResp.status).toBe(204);
+    const drainedInbox = await (await fetch(`${BASE}api/session/${mintedId}/inbox?directory=${encodeURIComponent(testDir)}`)).json() as { data?: unknown[] };
+    expect(drainedInbox.data).toEqual([]);
+
+    // Git project probe over a repository and a plain directory.
+    const projectsResp = await fetch(`${BASE}api/git/projects?directory=${encodeURIComponent(testDir)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ directories: [testDir, FAKE_HOME] }),
+    });
+    expect(projectsResp.status).toBe(200);
+    const projects = await projectsResp.json() as { projects?: Array<{ directory?: string; isGitRepository?: boolean }> };
+    expect(projects.projects?.[0]?.directory).toBe(testDir);
+    expect(projects.projects?.[0]?.isGitRepository).toBe(true);
+    expect(projects.projects?.[1]?.isGitRepository).toBe(false);
+
+    const noDirsResp = await fetch(`${BASE}api/git/projects?directory=${encodeURIComponent(testDir)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(noDirsResp.status).toBe(400);
+
+    // Source-control binding: reported unbound for a repository, rejected for a
+    // directory that is not one.
+    const bindingResp = await fetch(`${BASE}api/source-control/binding?directory=${encodeURIComponent(testDir)}`);
+    expect(bindingResp.status).toBe(200);
+    const binding = await bindingResp.json() as
+      { repository?: { supported?: boolean; repositoryId?: string; bare?: boolean; remotes?: unknown[] }; revision?: number; binding?: unknown };
+    expect(binding.repository?.supported).toBe(true);
+    expect(binding.repository?.repositoryId).toMatch(/^repo_[A-Za-z0-9_-]{43}$/);
+    expect(Array.isArray(binding.repository?.remotes)).toBe(true);
+    expect(binding.binding).toBeNull();
+
+    const noBindingResp = await fetch(`${BASE}api/source-control/binding?directory=${encodeURIComponent(FAKE_HOME)}`);
+    expect(noBindingResp.status).toBe(422);
+    const noBinding = await noBindingResp.json() as { code?: string; reason?: string };
+    expect(noBinding.code).toBe("UNSUPPORTED_SOURCE_CONTROL_REPOSITORY");
+    expect(noBinding.reason).toBe("not-a-git-repository");
+
+    // OpenChamber-server-owned features the sidecar reports as empty/disabled.
+    const archives = await (await fetch(`${BASE}api/openchamber/spaces/archives`)).json() as { archives?: unknown };
+    expect(archives.archives).toEqual([]);
+    const receivedPages = await (await fetch(`${BASE}api/openchamber/received-pages/config`)).json() as { available?: boolean; bases?: unknown };
+    expect(receivedPages.available).toBe(false);
+    expect(receivedPages.bases).toEqual([]);
+  });
 });
 

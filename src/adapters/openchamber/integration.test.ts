@@ -168,7 +168,7 @@ describe("sidecar HTTP contract (Tier B, mock OMP)", () => {
     expect(h.compatibility).toBeDefined();
 
     const version = await (await fetch(BASE + "api/version")).json();
-    expect(version).toMatchObject({ status: "ok", openchamberVersion: "1.20.0" });
+    expect(version).toMatchObject({ status: "ok", openchamberVersion: "2.0.14" });
     expect(version.compatibility?.capabilities).toContain("api.runtime-url.v1");
 
     const authSession = await (await fetch(BASE + "auth/session")).json();

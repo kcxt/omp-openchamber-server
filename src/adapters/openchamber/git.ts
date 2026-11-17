@@ -2050,6 +2050,53 @@ async function generatePullRequestDescription(directory: string, body: GitRecord
   };
 }
 
+/** OpenChamber treats these ids as opaque; base64url(sha256(...)) matches its own form. */
+function digestId(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+/**
+ * OpenChamber's source-control binding. The sidecar has no hosted-forge
+ * integration, so a repository is always reported as unbound; the repository
+ * block still has to be accurate so the UI can tell "no binding" from
+ * "not a Git directory".
+ */
+async function sourceControlBinding(directory: string): Promise<GitRouteResult> {
+  if (!(await isGitRepository(directory))) {
+    return route({
+      error: "Directory is not a supported Git repository",
+      code: "UNSUPPORTED_SOURCE_CONTROL_REPOSITORY",
+      reason: "not-a-git-repository",
+    }, 422);
+  }
+
+  const root = await resolveTopLevel(directory);
+  const topLevel = root.root;
+  const remoteNames = (await runGit(topLevel, ["remote"])).stdout.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean).sort();
+  const remotes = await Promise.all(remoteNames.map(async (name) => {
+    const result = await runGit(topLevel, ["remote", "get-url", name]);
+    const displayUrl = sanitizeRemoteUrl(result.stdout);
+    const fingerprint = digestId(displayUrl || name);
+    return { name, fetch: { displayUrl, fingerprint }, push: { displayUrl, fingerprint } };
+  }));
+  const bare = (await runGit(topLevel, ["rev-parse", "--is-bare-repository"])).stdout.trim() === "true";
+  // Repository identity must survive restarts and agree across clones, so it
+  // is derived from the remote set, falling back to the checkout path when the
+  // repository has no remotes.
+  const repositoryId = `repo_${digestId(remotes.map((remote) => remote.fetch.displayUrl).sort().join("\n") || topLevel)}`;
+  return route({
+    repository: {
+      supported: true,
+      repositoryId,
+      configRevision: digestId(`${repositoryId}\n${remotes.map((remote) => `${remote.name}\u0000${remote.fetch.displayUrl}`).sort().join("\n")}`),
+      bare,
+      remotes,
+    },
+    revision: 0,
+    binding: null,
+  });
+}
+
 /**
  * Handle the OpenChamber Git HTTP contract without importing the web package.
  * The main sidecar keeps ownership of CORS and response logging; this module
@@ -2057,7 +2104,7 @@ async function generatePullRequestDescription(directory: string, body: GitRecord
  */
 export async function handleGitRequest(req: Request, url: URL, effectiveDir: string): Promise<GitRouteResult | null> {
   const path = url.pathname;
-  if (path !== "/api/git" && !path.startsWith("/api/git/")) return null;
+  if (path !== "/api/git" && !path.startsWith("/api/git/") && !path.startsWith("/api/source-control/")) return null;
 
   let cachedBody: Promise<GitRecord> | null = null;
   const body = (): Promise<GitRecord> => {
@@ -2089,6 +2136,19 @@ export async function handleGitRequest(req: Request, url: URL, effectiveDir: str
     if (path === "/api/git/discover-credentials") return method === "GET" ? route(await discoverCredentials()) : methodError();
 
     if (path === "/api/git/check") return method === "GET" ? route({ isGitRepository: await isGitRepository(directory) }) : methodError();
+    if (path === "/api/git/projects") {
+      if (method !== "POST") return methodError();
+      const requested = (await body()).directories;
+      const directories = (Array.isArray(requested) ? requested.filter(isGitString) : []).slice(0, 200);
+      if (directories.length === 0) return route({ error: "directories array is required" }, 400);
+      return route({
+        projects: await Promise.all(directories.map(async (entry) => {
+          const target = resolveDirectory(entry, effectiveDir);
+          return { directory: target, isGitRepository: await isGitRepository(target) };
+        })),
+      });
+    }
+    if (path === "/api/source-control/binding") return method === "GET" ? await sourceControlBinding(directory) : methodError();
     if (path === "/api/git/status") return method === "GET" ? route(await getStatus(directory, url.searchParams.get("mode") === "light")) : methodError();
     if (path === "/api/git/primary-root") return method === "GET" ? route(await resolvePrimaryRoot(directory)) : methodError();
     if (path === "/api/git/toplevel") return method === "GET" ? route(await resolveTopLevel(directory)) : methodError();

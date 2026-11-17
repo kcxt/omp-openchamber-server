@@ -206,8 +206,11 @@ const ompStore: SessionStore = {
         agent: updates.agent,
         model: updates.model,
         revert: updates.revert,
-        time: updates.time?.archived !== undefined
-          ? { archived: updates.time.archived }
+        time: updates.time?.archived !== undefined || updates.time?.viewed !== undefined
+          ? {
+              ...(updates.time.archived !== undefined ? { archived: updates.time.archived } : {}),
+              ...(updates.time.viewed !== undefined ? { viewed: updates.time.viewed } : {}),
+            }
           : undefined,
       },
       directory,

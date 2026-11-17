@@ -53,7 +53,7 @@ import { CredentialInputError } from "./providers/omp/credentials";
 import { logger, httpLogger } from "./shared/logger";
 import { join, isAbsolute, basename, extname } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { readdir, mkdir, stat, unlink, rename } from "node:fs/promises";
+import { readdir, mkdir, stat, unlink, rename, rm, realpath } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
@@ -313,6 +313,20 @@ function writeOmpConfig(updates: Record<string, unknown>): Record<string, unknow
   return merged;
 }
 
+// OpenChamber's host probe (packages/electron/electron-host-probe.mjs) reads
+// /api/version and marks a server `incompatible` when the reported major is
+// below 2. This adapter speaks the OpenCode v2 surface, so it advertises the
+// `@opencode/client` generation it was checked against, not a 1.x release.
+const OPENCHAMBER_API_VERSION = "2.0.14";
+
+// OpenChamber's readiness gate (server/lib/opencode/compatibility.js) parses
+// GET /api/info as an OpenCode version and accepts only 2.x at or above 2.2.4;
+// anything else leaves the backend parked and every proxied route answers 503
+// "OpenCode is restarting". The sidecar speaks the OpenCode v2 HTTP contract,
+// so it advertises that contract level here and reports the OMP runtime
+// separately as `ompVersion`.
+const OPENCODE_API_COMPAT_VERSION = "2.2.4";
+
 const COMPATIBILITY = {
   apiVersion: 1,
   minClientApiVersion: 1,
@@ -487,9 +501,19 @@ if (cliOptions.port !== undefined) {
   process.env.OC_SIDECAR_PORT = String(cliOptions.port);
 }
 
+if (cliOptions.host) {
+  process.env.OC_SIDECAR_HOST = cliOptions.host;
+}
+
 await ensureOmpBinary();
 
+// Bun defaults to 127.0.0.1; OC_SIDECAR_HOST widens that to a tailnet address
+// (`tailscale ip -4`) so OpenChamber on another device can add the server
+// without an ssh tunnel.
+const sidecarHost = process.env.OC_SIDECAR_HOST || "127.0.0.1";
+
 const server = Bun.serve<SidecarWebSocketData>({
+  hostname: sidecarHost,
   port: Number(process.env.OC_SIDECAR_PORT ?? 4096),
   idleTimeout: 0,
   websocket: {
@@ -581,12 +605,13 @@ const server = Bun.serve<SidecarWebSocketData>({
         });
       }
 
-      // OpenCode 2.0.8+ uses /api/info as its readiness probe. Keep the
-      // response shape compatible while identifying the OMP runtime behind
-      // this sidecar.
+      // OpenCode 2.0.8+ uses /api/info as its readiness probe. `version` is the
+      // OpenCode API level this sidecar implements; the OMP runtime behind it is
+      // reported alongside it.
       if (path === "/api/info" && req.method === "GET") {
         return json({
-          version: getOmpRuntimeInfo().version ?? "unknown",
+          version: OPENCODE_API_COMPAT_VERSION,
+          ompVersion: getOmpRuntimeInfo().version ?? "unknown",
           pid: process.pid,
           urls: [url.origin],
           paths: { tmp: tmpdir() },
@@ -597,7 +622,7 @@ const server = Bun.serve<SidecarWebSocketData>({
       if (path === "/api/version") {
         return json({
           status: "ok",
-          openchamberVersion: "1.20.0",
+          openchamberVersion: OPENCHAMBER_API_VERSION,
           runtime: "omp-sidecar",
           startedAt: startTime,
           compatibility: COMPATIBILITY,
@@ -1112,6 +1137,36 @@ const MIME_TYPES: Record<string, string> = {
         }
       }
 
+      // Directory availability batch (OpenChamber getDirectoryAvailability /
+      // getDirectoryRealPaths). `reason` is what the client keys on to decide
+      // between "missing" and "unknown", so it has to name the failure mode.
+      if ((path === "/fs/directory-stats" || path === "/api/fs/directory-stats") && req.method === "POST") {
+        const body = (await readJson(req)) as { paths?: unknown } | undefined;
+        const requested = (Array.isArray(body?.paths) ? body.paths : [])
+          .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+          .slice(0, 500);
+        const results = await Promise.all(requested.map(async (target) => {
+          const resolved = resolveFsPath(target, effectiveDir);
+          try {
+            const info = await stat(resolved);
+            return {
+              path: target,
+              isDirectory: info.isDirectory(),
+              ...(info.isDirectory() ? {} : { reason: "not-directory" }),
+              realPath: await realpath(resolved),
+            };
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            return {
+              path: target,
+              isDirectory: false,
+              reason: code === "ENOENT" ? "not-found" : code === "ENOTDIR" ? "not-directory" : "unavailable",
+            };
+          }
+        }));
+        return json({ results });
+      }
+
       // Filesystem write
       if ((path === "/fs/write" || path === "/api/fs/write") && req.method === "POST") {
         const body = (await readJson(req)) as { path?: string; content?: string } | undefined;
@@ -1133,7 +1188,9 @@ const MIME_TYPES: Record<string, string> = {
         if (!target) return jsonError("Path is required", 400);
         const resolved = resolveFsPath(target, effectiveDir);
         try {
-          await unlink(resolved);
+          // OpenChamber deletes whole session folders, and retries the same
+          // path, so an already-absent target counts as deleted.
+          await rm(resolved, { recursive: true, force: true, maxRetries: 3 });
           return json({ success: true });
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "delete failed", 500);
@@ -1247,6 +1304,17 @@ const MIME_TYPES: Record<string, string> = {
         return json({ hasUpdate: false });
       }
 
+      // Spaces archives and Received-pages live in OpenChamber's web server.
+      // Through the sidecar they are empty/disabled, and reporting that keeps
+      // the client on its unavailable path instead of a 404.
+      if (path === "/api/openchamber/spaces/archives" || path === "/openchamber/spaces/archives") {
+        return json({ archives: [] });
+      }
+
+      if (path === "/api/openchamber/received-pages/config" || path === "/openchamber/received-pages/config") {
+        return json({ available: false, bases: [] });
+      }
+
       if (path === "/api/openchamber/models-metadata") {
         try {
           const resp = await fetch("https://models.dev/api.json", {
@@ -1265,8 +1333,8 @@ const MIME_TYPES: Record<string, string> = {
       if (path === "/api/opencode/upgrade-status") {
         return json({
           available: false,
-          currentVersion: "1.20.0",
-          latestVersion: "1.20.0",
+          currentVersion: OPENCHAMBER_API_VERSION,
+          latestVersion: OPENCHAMBER_API_VERSION,
           upgrade: {
             supported: false,
             manager: null,
@@ -1288,7 +1356,7 @@ const MIME_TYPES: Record<string, string> = {
       }
 
       if (path.startsWith("/api/config/mcp")) {
-        return json({});
+        return json([]);
       }
 
       if (path.startsWith("/api/config/plugins")) {
@@ -1416,6 +1484,59 @@ const MIME_TYPES: Record<string, string> = {
         }
       }
 
+      // OpenCode v2 inbox view of the same pending prompts the message-queue
+      // routes expose. Items use the prompt payload shape the client maps into
+      // optimistic user messages.
+      const inboxMatch = p.match(/^\/session\/([^/]+)\/inbox$/);
+      if (inboxMatch && req.method === "GET") {
+        const sessionId = decodeURIComponent(inboxMatch[1]!);
+        try {
+          await messageQueueRuntime.load();
+        } catch (error) {
+          return queueError(error, "failed to load message queue");
+        }
+        const entry = messageQueueRuntime.snapshot().sessions.find((session) => session.sessionId === sessionId);
+        const items = (entry?.items ?? []).map((item) => {
+          const files = item.attachments.flatMap((attachment) => {
+            const uri = attachment.serverPath;
+            if (!uri) return [];
+            return [toV2FileAttachment({ uri, mime: attachment.mimeType, name: attachment.filename })];
+          });
+          return {
+            id: item.id,
+            sessionID: sessionId,
+            type: "user",
+            time: { created: item.createdAt },
+            delivery: "queue",
+            payload: {
+              text: item.text,
+              ...(files.length > 0 ? { files } : {}),
+              ...(item.agentMention ? { agents: [item.agentMention] } : {}),
+            },
+          };
+        });
+        return json({ data: items });
+      }
+
+      const inboxItemMatch = p.match(/^\/session\/([^/]+)\/inbox\/([^/]+)$/);
+      if (inboxItemMatch) {
+        const sessionId = decodeURIComponent(inboxItemMatch[1]!);
+        const itemId = decodeURIComponent(inboxItemMatch[2]!);
+        if (req.method === "DELETE") {
+          try {
+            await messageQueueRuntime.remove(sessionId, itemId);
+            return noContent();
+          } catch (error) {
+            return queueError(error, "failed to cancel queued message");
+          }
+        }
+        if (req.method === "PATCH") {
+          // Delivery is chosen by the prompt request; a queued item cannot be
+          // re-tagged, so the sidecar rejects instead of faking a switch.
+          return jsonError("queued message delivery mode cannot be changed", 409);
+        }
+      }
+
       if (p === "/notifications/stream" && req.method === "GET") {
         return new Response(createOpenChamberNotificationStream(), {
           headers: {
@@ -1517,11 +1638,54 @@ const MIME_TYPES: Record<string, string> = {
       }
 
       // OpenCode v2 reports the global set of sessions with an active agent
-      // loop and uses "running" as its status value.
+      // loop and uses "running" as its status value. The SDK unwraps `data`,
+      // so an unenveloped map reads as a failed call on the client.
       if (p === "/session/active" && req.method === "GET") {
         await reconcileSessionStatuses();
         const statuses = getSessionStatusMap();
-        return json(Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])));
+        return json({
+          data: Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])),
+        });
+      }
+
+      // Session todos page state (OpenChamber /api/session-todos/:id). The
+      // client accepts either `off` (no todo feature for this session) or
+      // `ready` with the item list, plus a revision it uses to drop stale reads.
+      const sessionTodosMatch = p.match(/^\/session-todos\/([^/]+)$/);
+      if (sessionTodosMatch && req.method === "GET") {
+        try {
+          const { backend, session } = await resolveSessionRoute(decodeURIComponent(sessionTodosMatch[1]!), dir);
+          if (!session) return jsonError("session not found", 404);
+          const revision = Date.now();
+          if (!backend.capabilities.todo) return json({ revision, state: "off" });
+          const todos = await withOmpRpc(session.directory, async (conn) => {
+            const raw = (await conn.request("get_state", {})) as Record<string, unknown>;
+            return extractTodosFromOmpDetails({ todoPhases: raw?.todoPhases }) ?? [];
+          }).catch(() => []);
+          return json({
+            revision,
+            state: "ready",
+            todos: todos.map((todo) => ({ content: todo.content, status: todo.status })),
+          });
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "session todos failed", 500);
+        }
+      }
+
+      // Mark-viewed. OpenChamber's web-server route (`/sessions/:id/view`)
+      // wants a JSON ack; the OpenCode v2 SDK route (`/session/:id/view`)
+      // wants 204 and carries the read as `time.viewed` on the session.
+      const sessionViewMatch = p.match(/^\/sessions?\/([^/]+)\/view$/);
+      if (sessionViewMatch && req.method === "POST") {
+        const sessionId = decodeURIComponent(sessionViewMatch[1]!);
+        const { backend, session } = await resolveSessionRoute(sessionId, dir);
+        if (!session) return jsonError("session not found", 404);
+        const body = asRecord(await readJson(req));
+        const idle = typeof body?.idle === "number" && Number.isFinite(body.idle) ? body.idle : Date.now();
+        await backend.store.update(sessionId, { time: { viewed: idle } }, session.directory);
+        return p.startsWith("/sessions/")
+          ? json({ success: true, sessionId, viewed: true })
+          : noContent();
       }
 
       const sessionMoveMatch = p.match(/^\/session\/([^/]+)\/move$/);
@@ -2653,7 +2817,7 @@ const MIME_TYPES: Record<string, string> = {
     // System info (About dialog)
     if (path === "/api/system/info" || path === "/system/info") {
       return json({
-        version: "1.20.0",
+        version: OPENCHAMBER_API_VERSION,
         platform: process.platform,
         arch: process.arch,
         runtime: "omp-sidecar",
@@ -2844,7 +3008,7 @@ const MIME_TYPES: Record<string, string> = {
     }
 
     if ((p.startsWith("/config/mcp") || p.startsWith("/api/config/mcp")) && req.method === "GET") {
-      return json({});
+      return json([]);
     }
 
     if ((p.startsWith("/quota/") || p.startsWith("/api/quota/")) && req.method === "GET") {
@@ -2896,12 +3060,13 @@ const MIME_TYPES: Record<string, string> = {
     };
     const logMsg = `${req.method} ${path}${url.search || ""} -> ${res.status} (${durationMs}ms) response=${truncatedRes}`;
 
-    if (res.status < 200 || res.status >= 400) {
-      httpLogger.error(logData, logMsg);
-    } else if (res.status < 300) {
-      httpLogger.trace(logData, logMsg);
+    // OpenChamber polls many routes, most of which 404 here; keep the whole
+    // access log at debug and surface only real server faults. LOG_LEVEL=debug
+    // restores the per-request lines.
+    if (res.status >= 500) {
+      httpLogger.warn(logData, logMsg);
     } else {
-      httpLogger.info(logData, logMsg);
+      httpLogger.debug(logData, logMsg);
     }
     return res;
   },
@@ -2924,7 +3089,7 @@ function logStartupBanner(port?: number): void {
   }
 
   logger.info(`[sidecar] 🚀 OMP Sidecar started successfully`);
-  logger.info(`[sidecar] Listening on http://127.0.0.1:${effectivePort}`);
+  logger.info(`[sidecar] Listening on http://${sidecarHost}:${effectivePort}`);
   logger.info(`[sidecar] Configuration:`);
   logger.info(`  • Working directory : ${process.cwd()}`);
   logger.info(`  • Active adapters   : ${backendList}`);

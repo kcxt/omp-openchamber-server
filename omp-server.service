@@ -1,0 +1,61 @@
+# systemd user unit for the omp OpenChamber sidecar.
+#
+# install.sh symlinks this file into ~/.config/systemd/user and links
+# ~/bin/omp-server to bin/omp-server in this checkout. ExecStart runs that
+# link, so `git pull` in the checkout + `systemctl --user restart omp-server`
+# is the whole update path: nothing in this unit points at a checkout path.
+#
+# Sandboxing mirrors harness-sandbox.sh (bwrap) with systemd directives:
+#   bwrap                              systemd
+#   --tmpfs / + --ro-bind /usr /opt     ProtectSystem=strict (whole tree ro)
+#   /home not mounted                   ProtectHome=tmpfs (hidden, re-opened by binds)
+#   --bind <dir>                        BindPaths= (writable)
+#   --ro-bind <dir>                     BindReadOnlyPaths=
+#   --tmpfs /tmp                        PrivateTmp=yes
+#   --cap-drop ALL                      user units already run capability-less,
+#                                       plus NoNewPrivileges=
+#   (network was kept for resolver access) network stays enabled: omp needs
+#   HTTPS to model providers, so PrivateNetwork= must stay off
+#
+# In per-user service managers these namespace options imply PrivateUsers=,
+# which needs unprivileged user namespaces enabled in the kernel
+# (sysctl kernel.unprivileged_userns_clone=1 on Arch: unpriv_userns=1).
+
+[Unit]
+Description=omp OpenChamber sidecar
+Documentation=https://github.com/alvins82/omp-openchamber-server
+
+[Service]
+Type=simple
+ExecStart=%h/bin/omp-server
+Environment=OMP_BIN=%h/bin/omp
+# bin/omp-server listens on the Tailscale network address (tailscale ip -4) when
+# tailscale reports one, so other devices can add the server without a tunnel;
+# network is left enabled because omp needs HTTPS to model providers. Force
+# local-only with:
+# Environment=OC_SIDECAR_HOST=127.0.0.1
+# Per-request access log, off by default:
+# Environment=LOG_LEVEL=debug
+# Optional secrets (EXA_API_KEY, NVIDIA_API_KEY, ...); missing file is ignored.
+EnvironmentFile=-%h/.config/omp-openchamber-server/env
+Restart=on-failure
+RestartSec=2s
+
+# --- sandbox ---
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Writable: OpenChamber's own state (chats live under ~/.config/openchamber),
+# this checkout (repo + omp sources + session workdirs), omp state, toolchain
+# caches.
+BindPaths=%h/.config/openchamber %h/git %h/.omp %h/.pi %h/.paseo %h/.kabmo %h/.cache %h/.cargo %h/.rustup
+
+# Read-only: the omp binary link itself, bun cache, dotfiles agents read.
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc
+
+# Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
+# lines in harness-sandbox.sh), e.g.:
+# BindPaths=/hdd/brute/projects
+# BindPaths=%t

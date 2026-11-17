@@ -186,7 +186,7 @@ export interface OpenCodeSession {
   agent: string;
   model: SessionModelRef;
   version: string;
-  time: { created: number; updated: number; archived?: number };
+  time: { created: number; updated: number; archived?: number; viewed?: number };
   revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] };
   cost: number;
   tokens: {
@@ -381,7 +381,7 @@ export interface SessionUpdateInput {
   agent?: string;
   model?: ModelRef;
   revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
-  time?: { created?: number; updated?: number; archived?: number | null };
+  time?: { created?: number; updated?: number; archived?: number | null; viewed?: number };
 }
 
 /** Persistent session storage owned by a backend. */
