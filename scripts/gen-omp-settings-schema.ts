@@ -91,7 +91,7 @@ const roles = (MODEL_ROLE_IDS as string[])
 // returns the generating machine's own themes (~/.omp/agent/themes), which are
 // not part of omp; the sidecar lists the running machine's at request time.
 const { getAvailableThemes } = await import(join(root, "packages", "tui", "src", "theme", "index"));
-const customThemeDir = join(homedir(), ".omp", "agent", "themes");
+const customThemeDir = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent"), "themes");
 const customThemes = new Set(existsSync(customThemeDir) ? readdirSync(customThemeDir).map((file) => file.replace(/\.json$/, "")) : []);
 const themes = ((await getAvailableThemes()) as string[]).filter((name) => !customThemes.has(name));
 

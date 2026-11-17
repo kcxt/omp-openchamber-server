@@ -45,7 +45,11 @@ command -v openchamber >/dev/null 2>&1 || {
 # OpenChamber's own dependencies call util._extend, which node flags once at
 # every start (DEP0060). It is not ours to fix and says nothing actionable, so
 # silence that one warning; every other warning still prints.
-export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--disable-warning=DEP0060"
+# Only where this node knows the flag: an older node rejects unknown NODE_OPTIONS
+# and would refuse to start at all.
+if node --disable-warning=DEP0060 -e 0 >/dev/null 2>&1; then
+    export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--disable-warning=DEP0060"
+fi
 
 # Make sure this checkout's extensions (the omp settings panel) are listed in
 # Settings -> Extensions. Cheap, idempotent, and never blocks the server.

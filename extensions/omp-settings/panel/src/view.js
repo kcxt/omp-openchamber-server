@@ -122,7 +122,10 @@ function combo({ options, value, placeholder = '', onCommit }) {
   function open() {
     if (!pop.hidden) return;
     filtering = false;
-    active = Math.max(0, rows.findIndex((row) => row.value === current && !row.clear));
+    // No row is highlighted unless the current value is one of the options, so
+    // tabbing in and pressing Enter can never pick "(unset)" or a stranger.
+    build();
+    active = rows.findIndex((row) => row.value === current && !row.clear);
     pop.hidden = false;
     input.setAttribute('aria-expanded', 'true');
     build();
