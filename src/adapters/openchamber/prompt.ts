@@ -1016,7 +1016,10 @@ async function getOrCreateSessionState(
     // Reuse a persistent child when the caller repeats the same envelope. A
     // changed direct credential, provider selection, or opaque ref replaces
     // the child so its isolated models.yml matches the new request.
-    const mustReplace = auth !== undefined && existing.credentialFingerprint !== requestedCredentialFingerprint;
+    // A child that died (crash, OOM kill) is never reusable: respawn instead of
+    // sending the next prompt into a closed pipe.
+    const dead = existing.conn.isAlive?.() === false;
+    const mustReplace = dead || (auth !== undefined && existing.credentialFingerprint !== requestedCredentialFingerprint);
     if (!mustReplace) return existing;
 
     existing.unsubscribe();

@@ -235,6 +235,28 @@ describe("OmpRpcConnection (in-process transport)", () => {
     await expect(conn.request("get_state")).rejects.toThrow("RPC get_state: connection dead");
   });
 
+  test("an unrequested exit is announced to listeners and flips isAlive; kill() stays silent", async () => {
+    const crashed = makeStdout();
+    const crashedConn = open(crashed);
+    const seen: string[] = [];
+    crashedConn.onEvent((event) => seen.push(event.type));
+    expect(crashedConn.isAlive()).toBe(true);
+    crashed.close();
+    await settle();
+    expect(seen).toEqual(["rpc_process_closed"]);
+    expect(crashedConn.isAlive()).toBe(false);
+
+    const killed = makeStdout();
+    const killedConn = open(killed);
+    const killedSeen: string[] = [];
+    killedConn.onEvent((event) => killedSeen.push(event.type));
+    killedConn.kill();
+    killed.close();
+    await settle();
+    expect(killedSeen).toEqual([]);
+    expect(killedConn.isAlive()).toBe(false);
+  });
+
   test("reaps pending requests with the read error message when stdout errors", async () => {
     const s = makeStdout();
     const conn = open(s);

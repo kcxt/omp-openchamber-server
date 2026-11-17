@@ -603,6 +603,15 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       return;
     }
 
+    // The omp child exited without being asked to: nothing will ever end this turn.
+    if (type === "rpc_process_closed") {
+      clearTimer();
+      promptLogger.error({ sessionID: openCodeId }, "[prompt] omp process exited mid-turn");
+      emit({ kind: "turn_end", error: "The omp process exited unexpectedly; send another message to restart the session.", stopReason: "error" });
+      pendingTurnError = undefined;
+      return;
+    }
+
     // 5. Terminal turn: agent ended definitively (or no agent was invoked).
     if (
       (type === "agent_end" && (event.isTerminal === undefined || event.isTerminal === true)) ||

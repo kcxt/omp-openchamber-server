@@ -371,6 +371,8 @@ export interface BackendTurnConnection {
   getInitialModel?(): Promise<ModelRef | undefined>;
   /** Current subagent snapshot, used to recover missed lifecycle events. */
   getSubagentStatuses?(): Promise<BackendSubagentSnapshot[]>;
+  /** False once the backend child has exited; absent when the backend cannot tell. */
+  isAlive?(): boolean;
   abort(): Promise<unknown>;
   kill(): void;
 }

@@ -211,6 +211,16 @@ describe("terminal turn_end", () => {
     expect(kinds(h.events)).toEqual(["turn_end"]);
   });
 
+  test("a child that exits mid-turn ends the turn with an error instead of leaving it running", () => {
+    const h = createHarness();
+    h.feed({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" } as unknown as OmpRpcEvent);
+    h.feed({ type: "rpc_process_closed" } as unknown as OmpRpcEvent);
+    const last = h.events[h.events.length - 1]!;
+    expect(last.kind).toBe("turn_end");
+    if (last.kind !== "turn_end") return;
+    expect(last.error).toContain("exited unexpectedly");
+  });
+
   test("provider error surfaces as turn_end error", () => {
     const h = createHarness();
     h.feed({

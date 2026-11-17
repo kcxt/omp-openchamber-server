@@ -154,6 +154,9 @@ export function createOmpTurnConnection(transport: OmpRpcTransport, ctx: OmpTurn
         return undefined;
       }
     },
+    isAlive() {
+      return transport.isAlive?.() ?? true;
+    },
     async getSubagentStatuses() {
       return parseSubagentSnapshots(await transport.request("get_subagents"), ctx.openCodeId, ctx.cwd);
     },

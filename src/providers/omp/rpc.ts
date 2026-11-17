@@ -81,6 +81,8 @@ export interface OmpRpcTransport {
   request(method: string, params?: unknown): Promise<unknown>;
   onEvent(handler: (event: OmpRpcEvent) => void): () => void;
   switchSession(sessionPath: string): Promise<unknown>;
+  /** False once the child has exited; absent on transports that cannot tell. */
+  isAlive?(): boolean;
   kill(): void;
   sendFrame?(frame: unknown): void;
 }
@@ -309,8 +311,12 @@ export class OmpRpcConnection {
         const message = err instanceof Error ? err.message : String(err);
         this.#fail(new Error(`RPC stdout read error: ${message}`));
       } finally {
+        // A close nobody asked for (crash, OOM kill) must reach the turn
+        // listeners, or the session stays "busy" with its last tool running.
+        const unexpected = !this.#dead;
         this.#dead = true;
         this.#fail(new Error("RPC process closed"));
+        if (unexpected) this.#handleFrame({ type: "rpc_process_closed" });
         this.#cleanupOnce();
       }
     })();
@@ -398,6 +404,10 @@ export class OmpRpcConnection {
       this.#pending.delete(id);
       pending.reject(err);
     }
+  }
+
+  isAlive(): boolean {
+    return !this.#dead;
   }
 
   ensureReady(): Promise<void> {
