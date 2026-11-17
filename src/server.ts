@@ -52,13 +52,15 @@ import type { BackendCredentialInput, OpenCodeProvidersResponse } from "./provid
 import { CredentialInputError } from "./providers/omp/credentials";
 import { logger, httpLogger } from "./shared/logger";
 import { join, isAbsolute, basename, extname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { readdir, mkdir, stat, unlink, rename, rm, realpath } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
 import { describeSmallModel, generateSmallModelText, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
 import { handleOmpConfigRoute, listOmpSlashCommands } from "./adapters/openchamber/omp-config";
+import { createTerminalRuntime, TERMINAL_WS_PATH } from "./adapters/openchamber/terminal";
+import { createClientAuthRuntime } from "./adapters/openchamber/client-auth";
 import { handleGitRequest } from "./adapters/openchamber/git";
 import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/message-queue";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
@@ -476,9 +478,11 @@ function toV2ConfigEntries(directory: string): Array<{ type: "document"; path: s
 // OC_SIDECAR_PORT overrides the default 4096 so the route-level test suite can
 // run a second instance without colliding with the live sidecar.
 interface SidecarWebSocketData {
+  kind: "events" | "terminal";
   directory?: string;
 }
 
+const terminalRuntime = createTerminalRuntime();
 const webSocketCleanups = new WeakMap<object, () => void>();
 
 let cliOptions: SidecarCliOptions;
@@ -513,18 +517,28 @@ await ensureOmpBinary();
 // without an ssh tunnel.
 const sidecarHost = process.env.OC_SIDECAR_HOST || "127.0.0.1";
 
+const clientAuthRuntime = createClientAuthRuntime({
+  dataDir: join(openChamberDataDir, "omp-sidecar"),
+  serverLabel: hostname() || "OMP Sidecar",
+  port: Number(process.env.OC_SIDECAR_PORT ?? 4096),
+  bindHost: sidecarHost,
+});
+
 const server = Bun.serve<SidecarWebSocketData>({
   hostname: sidecarHost,
   port: Number(process.env.OC_SIDECAR_PORT ?? 4096),
   idleTimeout: 0,
   websocket: {
     open(ws) {
+      if (ws.data.kind === "terminal") return terminalRuntime.ws.open(ws);
       webSocketCleanups.set(ws, attachOpenCodeEventWebSocket(ws, ws.data.directory));
     },
-    message() {
+    message(ws, message) {
       // The global event stream is server-to-client only.
+      if (ws.data.kind === "terminal") terminalRuntime.ws.message(ws, message);
     },
     close(ws) {
+      if (ws.data.kind === "terminal") return terminalRuntime.ws.close(ws);
       const cleanup = webSocketCleanups.get(ws);
       cleanup?.();
       webSocketCleanups.delete(ws);
@@ -556,8 +570,13 @@ const server = Bun.serve<SidecarWebSocketData>({
     const dir = url.searchParams.get("directory") ?? resolveOpenCodeDirectoryHeader(req);
     const effectiveDir = dir ?? process.cwd();
 
+    if (path === TERMINAL_WS_PATH && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      if (requestServer.upgrade(req, { data: { kind: "terminal" } })) return;
+      return jsonError("websocket upgrade failed", 400);
+    }
+
     if (path === "/api/global/event/ws" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      const upgraded = requestServer.upgrade(req, { data: { directory: dir } });
+      const upgraded = requestServer.upgrade(req, { data: { kind: "events", directory: dir } });
       if (upgraded) return;
       return jsonError("websocket upgrade failed", 400);
     }
@@ -688,8 +707,10 @@ const server = Bun.serve<SidecarWebSocketData>({
         });
       }
 
-      if (path === "/api/client-auth/clients") {
-        return json({ token: "omp-local-token" });
+      // OpenChamber "Add device": pairing sessions, device list, revoke.
+      if (path.startsWith("/api/client-auth/")) {
+        const authResponse = await clientAuthRuntime.handle(req, url, path, requestServer.requestIP(req)?.address ?? "unknown");
+        if (authResponse) return json(authResponse.data, { status: authResponse.status, headers: authResponse.headers });
       }
 
       // OpenChamber project setup is optional for the OMP sidecar. Return the
@@ -2964,18 +2985,10 @@ const MIME_TYPES: Record<string, string> = {
       return json({ active: false, providers: [], status: "stopped" });
     }
 
-    // Terminal shells & lifecycle
-    if (path.startsWith("/api/terminal")) {
-      if (path === "/api/terminal/shells") {
-        return json({ shells: ["/bin/zsh", "/bin/bash"], defaultShell: Bun.env.SHELL || "/bin/zsh" });
-      }
-      if (path === "/api/terminal/sessions") {
-        return json({ sessions: [] });
-      }
-      if (path === "/api/terminal/touch") {
-        return json({ touched: 0 });
-      }
-      return json({ sessionId: "term_1", success: true });
+    // Terminal shells & lifecycle (WebSocket data plane is upgraded earlier).
+    {
+      const terminalResponse = await terminalRuntime.handleHttp(req, url, path);
+      if (terminalResponse) return json(terminalResponse.data, { status: terminalResponse.status });
     }
 
     // Markdown image grants
@@ -3145,6 +3158,7 @@ function handleShutdownSignal(signal: string) {
   try {
     browserControlBroker.rejectAll("Server shutting down");
     messageQueueRuntime.stop();
+    void terminalRuntime.shutdown();
     shutdownAll();
   } catch {
     // ignore

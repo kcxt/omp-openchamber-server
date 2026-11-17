@@ -70,10 +70,12 @@ Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md
 | Session folders, project icons, spaces archives, received pages | Stub (empty) |
 | GitHub / Linear auth | Stub (`not authenticated/connected`) |
 | Usage quota | Stub (`configured: false`) |
-| Terminal panel, dictation / TTS, dev servers, tunnels, walkthrough, scheduled tasks | Stub / disabled |
+| Integrated terminal (`/api/terminal/*` + WebSocket): your own shells on a PTY, command mode, resize, restart, reattach after reload | Real (sessions are sidecar-owned, not omp; idle sessions reaped after 30 min) |
+| Add device / pairing (`/api/client-auth/*`): QR link, redeem, device list, revoke | Real, but tokens are **not enforced** elsewhere; the listen address is the access control. No relay (direct URLs only) |
+| Dictation / TTS, dev servers, tunnels, walkthrough, scheduled tasks | Stub / disabled |
 | Update check / upgrade status | Stub (`no update`) |
 | LSP list | Stub (empty) |
-| Auth (passkey, client tokens) | Stub (no auth; bind to a trusted interface) |
+| Auth (passkey, UI password) | Stub (no auth; bind to a trusted interface) |
 
 Anything unlisted that falls through returns `404 not implemented`.
 
