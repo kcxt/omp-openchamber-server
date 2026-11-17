@@ -42,7 +42,7 @@ import {
   shutdownAll,
 } from "./adapters/openchamber/prompt";
 import { page, toV2FileAttachment, toV2Message, toV2Session } from "./adapters/openchamber/v2";
-import { extractTodosFromOmpDetails } from "./providers/omp/todo";
+import { readSessionTodos } from "./providers/omp/todo";
 import { invalidateMessageCache } from "./providers/omp/messages";
 import { getSidecarExtensionPaths, MissingWorkingDirectoryError, withOmpRpc } from "./providers/omp/rpc";
 import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBinary } from "./providers/omp/binary";
@@ -58,6 +58,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
 import { describeSmallModel, generateSmallModelText, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
+import { handleOmpConfigRoute, listOmpSlashCommands } from "./adapters/openchamber/omp-config";
 import { handleGitRequest } from "./adapters/openchamber/git";
 import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/message-queue";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
@@ -1355,12 +1356,9 @@ const MIME_TYPES: Record<string, string> = {
         return json([]);
       }
 
-      if (path.startsWith("/api/config/mcp")) {
-        return json([]);
-      }
-
-      if (path.startsWith("/api/config/plugins")) {
-        return json([]);
+      if (path.startsWith("/api/config/mcp") || path === "/api/config/plugins" || path.startsWith("/api/config/plugins/")) {
+        const configResponse = await handleOmpConfigRoute(req, url, path, effectiveDir);
+        if (configResponse) return json(configResponse.data, { status: configResponse.status });
       }
 
       // Normalize /api/ prefix for all OpenCode core routes
@@ -1658,10 +1656,7 @@ const MIME_TYPES: Record<string, string> = {
           if (!session) return jsonError("session not found", 404);
           const revision = Date.now();
           if (!backend.capabilities.todo) return json({ revision, state: "off" });
-          const todos = await withOmpRpc(session.directory, async (conn) => {
-            const raw = (await conn.request("get_state", {})) as Record<string, unknown>;
-            return extractTodosFromOmpDetails({ todoPhases: raw?.todoPhases }) ?? [];
-          }).catch(() => []);
+          const todos = await readSessionTodos(session.path);
           return json({
             revision,
             state: "ready",
@@ -1936,10 +1931,7 @@ const MIME_TYPES: Record<string, string> = {
         const { backend, session } = await resolveSessionRoute(todoMatch[1], dir);
         if (!session) return jsonError("session not found", 404);
         if (!backend.capabilities.todo) return json([]);
-        const todos = await withOmpRpc(session.directory, async (conn) => {
-          const raw = (await conn.request("get_state", {})) as Record<string, unknown>;
-          return extractTodosFromOmpDetails({ todoPhases: raw?.todoPhases }) ?? [];
-        }).catch(() => []);
+        const todos = await readSessionTodos(session.path);
         return json(todos);
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "todo failed", 500);
@@ -2680,7 +2672,7 @@ const MIME_TYPES: Record<string, string> = {
 
     // Commands
     if (p === "/command" && req.method === "GET") {
-      const cmds = await listAvailableCommands(dir);
+      const cmds = await listOmpSlashCommands(effectiveDir);
       return json({
         location: { directory: effectiveDir },
         data: cmds.map(({ name, description }) => ({ name, ...(description ? { description } : {}) })),

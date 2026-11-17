@@ -86,3 +86,31 @@ export function extractTodosFromOmpDetails(
 
   return undefined;
 }
+
+/**
+ * Current todo list of a session, read from its transcript: the newest todo
+ * tool result carries the full phase state. Reading the file keeps session
+ * switches from spawning an omp child just to ask for state it already wrote.
+ */
+export async function readSessionTodos(sessionPath: string): Promise<OpenCodeTodo[]> {
+  let text: string;
+  try {
+    text = await Bun.file(sessionPath).text();
+  } catch {
+    return [];
+  }
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes('"toolResult"') || !/"toolName":"todo/i.test(line)) continue;
+    try {
+      const message = (JSON.parse(line) as { message?: { toolName?: string; details?: unknown } }).message;
+      if (!isTodoTool(message?.toolName)) continue;
+      const todos = extractTodosFromOmpDetails(message?.details);
+      if (todos) return todos;
+    } catch {
+      /* partial line */
+    }
+  }
+  return [];
+}

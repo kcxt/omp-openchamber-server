@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { getExplicitOmpBinary } from "../../providers/omp/binary";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -96,7 +97,7 @@ export function ensureLegacyOmpConfigMigrated(settingsFile: string): void {
 }
 
 /** Reads OpenChamber settings.json to check for user smallModelOverride. */
-export function readOpenChamberSettingsSmallModel(): { providerID: string; modelID: string } | null {
+export function readOpenChamberSettingsSmallModel(): { providerID: string; modelID: string; variant?: string } | null {
   try {
     const dataDir = Bun.env.OPENCHAMBER_DATA_DIR || process.env.OPENCHAMBER_DATA_DIR || join(homedir(), ".config", "openchamber");
     const settingsFile = join(dataDir, "settings.json");
@@ -108,7 +109,9 @@ export function readOpenChamberSettingsSmallModel(): { providerID: string; model
     if (!settings || typeof settings !== "object") return null;
     if (settings.smallModelUseDefault !== false) return null;
     if (typeof settings.smallModelOverride === "string" && settings.smallModelOverride.trim()) {
-      return parseModelRef(settings.smallModelOverride.trim());
+      const ref = parseModelRef(settings.smallModelOverride.trim());
+      const variant = typeof settings.smallModelVariant === "string" && settings.smallModelVariant.trim() ? settings.smallModelVariant.trim() : undefined;
+      return ref && variant ? { ...ref, variant } : ref;
     }
   } catch {
     // ignore
@@ -116,17 +119,22 @@ export function readOpenChamberSettingsSmallModel(): { providerID: string; model
   return null;
 }
 
-/** Reads OMP config.yml to check for modelRoles.smol. */
-export function readOmpConfigSmallModel(): { providerID: string; modelID: string } | null {
+const THINKING_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max|auto)$/;
+
+/** Reads OMP config.yml modelRoles: `smol` (fast), then `tiny`; a `:level` suffix is omp's thinking level. */
+export function readOmpConfigSmallModel(): { providerID: string; modelID: string; variant?: string } | null {
   try {
     const ompConfigYml = join(homedir(), ".omp", "agent", "config.yml");
     if (existsSync(ompConfigYml)) {
       const raw = readFileSync(ompConfigYml, "utf8");
       const parsed = Bun.YAML.parse(raw) as Record<string, unknown> | null;
-      const smol = (parsed?.modelRoles as Record<string, unknown> | undefined)?.smol;
-      if (typeof smol === "string" && smol.trim()) {
-        const ref = parseModelRef(smol.trim());
-        if (ref) return ref;
+      const roles = parsed?.modelRoles as Record<string, unknown> | undefined;
+      for (const role of ["smol", "tiny"]) {
+        const value = roles?.[role];
+        if (typeof value !== "string" || !value.trim()) continue;
+        const level = THINKING_SUFFIX.exec(value.trim())?.[1];
+        const ref = parseModelRef(value.trim().replace(THINKING_SUFFIX, ""));
+        if (ref) return level ? { ...ref, variant: level } : ref;
       }
     }
   } catch {
@@ -306,7 +314,7 @@ export function resolveSmallModel(options?: {
   preferredProviderID?: string;
   preferredModelID?: string;
   directory?: string;
-}): { providerID: string; modelID: string; source: ResolvedSmallModel["source"] } | null {
+}): { providerID: string; modelID: string; variant?: string; source: ResolvedSmallModel["source"] } | null {
   // 1. Explicit request model
   const explicit = parseModelRef(options?.model);
   if (explicit) {
@@ -331,16 +339,13 @@ export function resolveSmallModel(options?: {
     return { ...opencodeSmol, source: "config" };
   }
 
-  // 5. Preferred provider/model from request
+  // 5. The session's own model: omp can run anything it is logged in to.
   if (options?.preferredProviderID && options?.preferredModelID) {
-    const conn = resolveProviderConnection(options.preferredProviderID, options.directory);
-    if (conn) {
-      return {
-        providerID: options.preferredProviderID,
-        modelID: options.preferredModelID,
-        source: "preferred",
-      };
-    }
+    return {
+      providerID: options.preferredProviderID,
+      modelID: options.preferredModelID,
+      source: "preferred",
+    };
   }
 
   return null;
@@ -356,8 +361,8 @@ export async function describeSmallModel(options?: {
   const resolved = resolveSmallModel(options);
   if (!resolved) return null;
 
-  const conn = resolveProviderConnection(resolved.providerID, options?.directory);
-  const hasLogin = Boolean(conn);
+  // omp resolves credentials when the model runs; an unknown model surfaces as a generation error.
+  const hasLogin = true;
 
   const contextTokens = DEFAULT_CONTEXT_TOKENS;
   const inputCharBudget = (contextTokens - OUTPUT_RESERVE_TOKENS) * 4;
@@ -551,20 +556,33 @@ export async function generateSmallModelText(params: {
     throw err;
   }
 
-  const conn = resolveProviderConnection(resolved.providerID, params.directory);
-  if (!conn) {
-    const err = new Error(`No credentials or endpoint found for provider "${resolved.providerID}"`);
-    (err as unknown as { statusCode: number }).statusCode = 401;
-    throw err;
-  }
-
+  const prompt = params.prompt.trim();
   const tokens = Number(params.maxOutputTokens) > 0 ? Number(params.maxOutputTokens) : 400;
 
-  let text = "";
-  if (conn.protocol === "anthropic") {
-    text = await callAnthropic(conn, resolved.modelID, params.prompt, params.system, tokens, params.signal);
-  } else {
-    text = await callOpenaiCompatible(conn, resolved.modelID, params.prompt, params.system, tokens, params.signal);
+  // omp owns provider credentials (including OAuth logins no config file
+  // exposes), so the model runs through it; direct HTTP is the fallback for a
+  // provider that only has an endpoint in models.yml / opencode.json.
+  let text: string;
+  try {
+    text = await runOmpPrint({
+      providerID: resolved.providerID,
+      modelID: resolved.modelID,
+      variant: resolved.variant,
+      prompt,
+      system: params.system,
+      directory: params.directory,
+      signal: params.signal,
+    });
+  } catch (ompError) {
+    const conn = resolveProviderConnection(resolved.providerID, params.directory);
+    if (!conn) {
+      const err = new Error(ompError instanceof Error ? ompError.message : `Small model ${resolved.providerID}/${resolved.modelID} failed`);
+      (err as unknown as { statusCode: number }).statusCode = 502;
+      throw err;
+    }
+    text = conn.protocol === "anthropic"
+      ? await callAnthropic(conn, resolved.modelID, prompt, params.system, tokens, params.signal)
+      : await callOpenaiCompatible(conn, resolved.modelID, prompt, params.system, tokens, params.signal);
   }
 
   return {
@@ -573,4 +591,45 @@ export async function generateSmallModelText(params: {
     modelID: resolved.modelID,
     source: resolved.source,
   };
+}
+
+const OMP_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]);
+
+/** One tool-less, session-less omp print-mode turn on an explicit model. */
+async function runOmpPrint(input: {
+  providerID: string;
+  modelID: string;
+  variant?: string;
+  prompt: string;
+  system?: string;
+  directory?: string;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const binary = getExplicitOmpBinary() ?? process.env.OMP_BIN ?? "omp";
+  const thinking = input.variant && OMP_THINKING_LEVELS.has(input.variant) ? input.variant : "off";
+  const cwd = input.directory && existsSync(input.directory) ? input.directory : homedir();
+  const proc = Bun.spawn(
+    [
+      binary, "-p", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-lsp", "--no-title",
+      "--model", `${input.providerID}/${input.modelID}`,
+      "--thinking", thinking,
+      "--system-prompt", input.system?.trim() || "You are a concise assistant. Reply with only what the user asks for.",
+      "--", input.prompt,
+    ],
+    {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      // A broken MCP server must not hold a one-shot print turn for the default 30s barrier.
+      env: { ...process.env, PI_SKIP_VERSION_CHECK: "1", OMP_MCP_TIMEOUT_MS: "2000" },
+      signal: input.signal,
+    },
+  );
+  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  const text = stdout.trim();
+  if (code !== 0 || !text) {
+    throw new Error(`omp small-model run failed (${code}): ${(stderr || stdout).trim().split("\n").slice(-2).join(" ").slice(0, 300)}`);
+  }
+  return text;
 }

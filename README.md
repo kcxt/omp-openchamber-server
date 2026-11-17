@@ -41,11 +41,12 @@ Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md
 | Model / agent switch on a session (`/session/:id/model`, `/agent`) | stored in the omp session transcript | **Yes** (used next turn) |
 | Provider list / model catalog | read from omp's configured providers | **Yes** (read-only; add keys in omp) |
 | `AGENTS.md` editor (Behavior) | writes `<project>/AGENTS.md` | **Yes** (omp reads it) |
-| Small-model override (`smallModelOverride`, `smallModelUseDefault`) | `settings.json`; used for titles / commit & PR text | Sidecar only |
+| Small model (`smallModelOverride`, `smallModelVariant`, `smallModelUseDefault`) — used by **Goals** progress checks, titles, commit/PR text | `settings.json` picks the model; generation runs through `omp -p` on it. Default: omp `modelRoles.smol`, then `tiny`, then the session's model | **Yes** (model runs in omp; the setting itself lives in `settings.json`) |
 | Permission auto-accept (global and per session) | sidecar approval policy | Sidecar only |
 | Session archive / viewed marker | appended to the omp session JSONL | Persisted with the session |
 | All other `PUT/PATCH /api/config/settings`, `/config`, `/global/config` | merged into `~/.config/openchamber/settings.json` and echoed back | **No** (stored only) |
-| Skills / snippets / plugins / MCP / themes / custom-command editors | fixed empty lists | **No** (stub) |
+| Skills / snippets / themes / custom-command editors | fixed empty lists | **No** (stub) |
+| MCP server and plugin editors | `mcp.json` / `omp plugin` | **Yes** |
 | Magic prompts, agent memory | empty | **No** (stub) |
 
 ### Features
@@ -53,7 +54,10 @@ Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md
 | Area | Status |
 |---|---|
 | Sessions: create (client-minted ids), list, rename, archive, fork, children, revert/unrevert, compact, abort, todo, diff, move, view | Real |
-| Prompts, `prompt_async`, shell, slash commands (`/command`, `/skill` from omp discovery), generate | Real |
+| Prompts, `prompt_async`, shell, generate | Real |
+| Slash commands (`/command`): omp's own list incl. plugin commands such as `/pi-vcc`; run by sending `/name args` as the prompt | Real (falls back to file discovery if omp can't start) |
+| MCP servers (`/api/config/mcp`): read/write `~/.omp/agent/mcp.json` (user) and `<project>/.omp/mcp.json` (project); omp-only fields preserved | Real (picked up by new omp sessions; no live reconnect) |
+| Plugins (`/api/config/plugins`): `omp plugin list/install/uninstall/enable/disable`; spec edit and npm-registry lookup unsupported | Real |
 | Streaming (SSE + WebSocket events), tool parts, subagents, images | Real |
 | Permissions, questions, forms | Real |
 | Message queue / inbox (list, reorder, hold, take, delete) | Real; switching a queued item's delivery mode returns 409 |
@@ -68,7 +72,7 @@ Caller-owned provider credentials: see [`docs/providers.md`](./docs/providers.md
 | Usage quota | Stub (`configured: false`) |
 | Terminal panel, dictation / TTS, dev servers, tunnels, walkthrough, scheduled tasks | Stub / disabled |
 | Update check / upgrade status | Stub (`no update`) |
-| MCP, LSP lists | Stub (empty) |
+| LSP list | Stub (empty) |
 | Auth (passkey, client tokens) | Stub (no auth; bind to a trusted interface) |
 
 Anything unlisted that falls through returns `404 not implemented`.
