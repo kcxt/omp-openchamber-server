@@ -1,0 +1,45 @@
+#!/bin/sh
+# Foreground entrypoint for OpenChamber's web server, backed by the omp sidecar
+# (bin/omp-server) instead of an OpenCode process.
+#
+# ~/bin/openchamber-serve is a symlink to this file (see install.sh); the
+# openchamber.service user unit execs it.
+
+repo=$(dirname "$(dirname "$(readlink -f "$0")")")
+port=${OPENCHAMBER_PORT:-3000}
+sidecar_port=${OC_SIDECAR_PORT:-4096}
+
+# OpenChamber is the only thing exposed to the network. Bind it to the tailnet
+# address when tailscale reports one so other devices (a phone) reach it without
+# a tunnel. Override with OPENCHAMBER_HOST (127.0.0.1 keeps it local-only).
+host=${OPENCHAMBER_HOST:-}
+if [ -z "$host" ] && command -v tailscale >/dev/null 2>&1; then
+    host=$(tailscale ip -4 2>/dev/null | head -n1)
+fi
+[ -n "$host" ] || host=127.0.0.1
+
+# openchamber refuses a network-exposed bind without a UI password and the unit
+# would then restart forever. Fall back to loopback and say why instead.
+case "$host" in
+127.* | localhost | ::1) ;;
+*)
+    if [ -z "${OPENCHAMBER_UI_PASSWORD:-}" ] && [ "${OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN:-}" != true ]; then
+        echo "openchamber-serve: no OPENCHAMBER_UI_PASSWORD set, binding 127.0.0.1 instead of $host" >&2
+        echo "openchamber-serve: put OPENCHAMBER_UI_PASSWORD=... in ~/.config/omp-openchamber-server/env to serve on $host" >&2
+        host=127.0.0.1
+    fi
+    ;;
+esac
+
+# The sidecar plays OpenCode. `openchamber serve` still insists on an executable
+# `opencode` before it will skip starting one, so hand it the placeholder.
+export OPENCODE_HOST=${OPENCODE_HOST:-http://127.0.0.1:$sidecar_port}
+export OPENCODE_SKIP_START=true
+export OPENCODE_BINARY=${OPENCODE_BINARY:-$repo/bin/opencode-unused}
+
+command -v openchamber >/dev/null 2>&1 || {
+    echo "openchamber-serve: no openchamber on PATH (install @openchamber/web)" >&2
+    exit 1
+}
+
+exec openchamber serve --foreground --host "$host" --port "$port" "$@"

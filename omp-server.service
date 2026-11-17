@@ -1,4 +1,5 @@
-# systemd user unit for the omp OpenChamber sidecar.
+# systemd user unit for the omp sidecar: the OpenCode-compatible backend that
+# openchamber.service (the web UI) talks to. It listens on loopback only.
 #
 # install.sh symlinks this file into ~/.config/systemd/user and links
 # ~/bin/omp-server to bin/omp-server in this checkout. ExecStart runs that
@@ -22,18 +23,17 @@
 # (sysctl kernel.unprivileged_userns_clone=1 on Arch: unpriv_userns=1).
 
 [Unit]
-Description=omp OpenChamber sidecar
+Description=omp OpenChamber sidecar (OpenCode API backend)
 Documentation=https://github.com/alvins82/omp-openchamber-server
 
 [Service]
 Type=simple
 ExecStart=%h/bin/omp-server
 Environment=OMP_BIN=%h/bin/omp
-# bin/omp-server listens on the Tailscale network address (tailscale ip -4) when
-# tailscale reports one, so other devices can add the server without a tunnel;
-# network is left enabled because omp needs HTTPS to model providers. Force
-# local-only with:
-# Environment=OC_SIDECAR_HOST=127.0.0.1
+# Loopback only (bin/omp-server default): OpenChamber is the network-facing
+# part. To expose the sidecar itself for OpenChamber's Remote Instances, set
+# OC_SIDECAR_HOST to a tailnet address; it has no auth of its own.
+# Environment=OC_SIDECAR_HOST=100.x.y.z
 # Per-request access log, off by default:
 # Environment=LOG_LEVEL=debug
 # Optional secrets (EXA_API_KEY, NVIDIA_API_KEY, ...); missing file is ignored.
@@ -52,11 +52,8 @@ NoNewPrivileges=yes
 # caches.
 BindPaths=%h/.config/openchamber %h/git %h/.omp %h/.pi %h/.paseo %h/.kabmo %h/.cache %h/.cargo %h/.rustup
 
-# Read-only: the omp binary link itself, bun cache, dotfiles agents and the
-# integrated terminal's zsh read (.zshrc sources the p10k config and fzf).
-# History and atuin are deliberately not mounted: the sandbox stays isolated,
-# so .zshrc must tolerate their absence. A leading "-" skips missing entries.
-BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc -%h/.p10k.zsh -%h/.zshenv -%h/.zprofile -%h/.zlogin -%h/.fzf.zsh -%h/.fzf
+# Read-only: the omp binary link itself, bun cache, dotfiles agents read.
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc
 
 # Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
 # lines in harness-sandbox.sh), e.g.:

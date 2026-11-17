@@ -9,14 +9,10 @@ repo=$(dirname "$(dirname "$(readlink -f "$0")")")
 bun=${BUN:-/usr/bin/bun}
 omp_bin=${OMP_BIN:-$HOME/bin/omp}
 
-# Bind to the tailnet network address when tailscale reports one, so OpenChamber
-# on another device can add the server directly instead of over an ssh tunnel.
-# Override with OC_SIDECAR_HOST (127.0.0.1 keeps it local-only).
-host=${OC_SIDECAR_HOST:-}
-if [ -z "$host" ] && command -v tailscale >/dev/null 2>&1; then
-    host=$(tailscale ip -4 2>/dev/null | head -n1)
-fi
-[ -n "$host" ] || host=127.0.0.1
+# The sidecar is the backend for `openchamber serve` (bin/openchamber-serve), so
+# it stays on loopback: it has no auth of its own. Set OC_SIDECAR_HOST to expose
+# it directly (for OpenChamber's Remote Instances without the web server).
+host=${OC_SIDECAR_HOST:-127.0.0.1}
 
 [ -x "$bun" ] || {
     echo "omp-server: no bun executable at $bun (set BUN=)" >&2

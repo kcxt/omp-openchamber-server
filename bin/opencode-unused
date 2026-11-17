@@ -1,0 +1,7 @@
+#!/bin/sh
+# Placeholder for OpenChamber's startup check: `openchamber serve` refuses to
+# start unless an executable `opencode` exists, even when OPENCODE_HOST points
+# it at another server and it never launches one. The omp sidecar is that
+# server; this stub exists only to satisfy the check.
+echo "opencode is not used here: the omp sidecar provides the OpenCode API" >&2
+exit 1

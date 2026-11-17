@@ -1,0 +1,49 @@
+# systemd user unit for OpenChamber's web UI, running against the omp sidecar
+# (omp-server.service) instead of an OpenCode process.
+#
+# install.sh symlinks this file into ~/.config/systemd/user and links
+# ~/bin/openchamber-serve to bin/openchamber-serve in this checkout.
+#
+# This is the network-facing half. The UI, its terminal panel, device pairing,
+# goals and extensions all run in this process; the sidecar only supplies the
+# OpenCode API on loopback. The terminal runs the user's own shells, so this
+# unit is sandboxed the same way as the sidecar (see omp-server.service for the
+# bwrap-to-systemd mapping and the user-namespace requirement).
+
+[Unit]
+Description=OpenChamber web UI (omp sidecar backend)
+Documentation=https://github.com/alvins82/omp-openchamber-server
+Requires=omp-server.service
+After=omp-server.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/openchamber-serve
+# bin/openchamber-serve binds the Tailscale address (tailscale ip -4) when
+# tailscale reports one, so a phone can reach the UI directly. openchamber
+# refuses a network-exposed bind without a UI password, so put
+#   OPENCHAMBER_UI_PASSWORD=...
+# in the env file below; without it the launcher binds 127.0.0.1 and logs why.
+# Force local-only with:
+# Environment=OPENCHAMBER_HOST=127.0.0.1
+# Environment=OPENCHAMBER_PORT=3000
+EnvironmentFile=-%h/.config/omp-openchamber-server/env
+Restart=on-failure
+RestartSec=2s
+
+# --- sandbox ---
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Writable: OpenChamber's state and logs (~/.config/openchamber), project
+# checkouts, toolchain caches that terminal commands use. ~/.config/opencode is
+# where OpenChamber writes its OpenCode-style settings (compaction, agents,
+# commands); the sidecar does not read it, but the UI needs the writes to land.
+BindPaths=%h/.config/openchamber %h/.config/opencode %h/git %h/.cache %h/.cargo %h/.rustup
+
+# Read-only: launcher link, dotfiles the terminal's zsh reads (.zshrc sources
+# the p10k config and fzf). History and atuin are deliberately not mounted, so
+# .zshrc must tolerate their absence. A leading "-" skips missing entries.
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc -%h/.p10k.zsh -%h/.zshenv -%h/.zprofile -%h/.zlogin -%h/.fzf.zsh -%h/.fzf
