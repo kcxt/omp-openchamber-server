@@ -2090,7 +2090,19 @@ const MIME_TYPES: Record<string, string> = {
         const target = session.revert?.messageID;
         if (!target) return jsonError("no staged revert", 409);
         const committed = await backend.store.commitRevert(sessionID, target, session.directory);
-        if (!committed) return jsonError("revert boundary not found", 404);
+        if (!committed) {
+          // A staged revert whose boundary message is no longer in the
+          // transcript can never be committed, and the client commits it before
+          // every new prompt (goals included), so it would wedge the session.
+          // Nothing is left to truncate: drop the stale marker instead.
+          const transcript = await backend.store.transcript?.(sessionID, session.directory).catch(() => null);
+          if (!transcript || transcript.some((message) => message.info.id === target)) {
+            return jsonError("revert boundary not found", 404);
+          }
+          await backend.store.update(sessionID, { revert: null }, session.directory);
+          emitOpenCodeV2Event("session.revert.cleared", { sessionID }, session.directory);
+          return noContent();
+        }
         emitOpenCodeV2Event("session.revert.committed", { sessionID, to: target }, session.directory);
         const updated = await backend.store.get(sessionID, session.directory);
         if (updated) {
