@@ -50,12 +50,13 @@ NoNewPrivileges=yes
 # Writable: OpenChamber's own state (chats live under ~/.config/openchamber),
 # this checkout (repo + omp sources + session workdirs), omp state, toolchain
 # caches.
-BindPaths=%h/.config/openchamber %h/git %h/.omp %h/.pi %h/.paseo %h/.kabmo %h/.cache %h/.cargo %h/.rustup -%h/.zsh_history -%h/.local/share/atuin
+BindPaths=%h/.config/openchamber %h/git %h/.omp %h/.pi %h/.paseo %h/.kabmo %h/.cache %h/.cargo %h/.rustup
 
 # Read-only: the omp binary link itself, bun cache, dotfiles agents and the
-# integrated terminal's zsh read (.zshrc sources the p10k config, fzf, atuin).
-# A leading "-" skips entries that do not exist on this machine.
-BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc -%h/.p10k.zsh -%h/.zshenv -%h/.zprofile -%h/.zlogin -%h/.fzf.zsh -%h/.fzf -%h/.atuin -%h/.config/atuin
+# integrated terminal's zsh read (.zshrc sources the p10k config and fzf).
+# History and atuin are deliberately not mounted: the sandbox stays isolated,
+# so .zshrc must tolerate their absence. A leading "-" skips missing entries.
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc -%h/.p10k.zsh -%h/.zshenv -%h/.zprofile -%h/.zlogin -%h/.fzf.zsh -%h/.fzf
 
 # Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
 # lines in harness-sandbox.sh), e.g.:
