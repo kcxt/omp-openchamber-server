@@ -16,9 +16,8 @@ export function getSidecarExtensionPaths(): string[] {
 
 // The embedded RPC instance must start deterministically. Project-level MCP
 // servers discovered from the target cwd (e.g. a flaky LSP server) otherwise
-// gate OMP's `ready` frame and can stall startup for minutes; the sidecar
-// exposes no MCP surface of its own (/mcp returns []), so they are pure
-// overhead for the embedded instance.
+// gate OMP's `ready` frame and can stall startup for minutes. User-level MCP
+// servers (~/.omp/agent/mcp.json, managed through /api/config/mcp) still load.
 export function embeddedOmpConfigOverlay(): string {
   const dir = join(tmpdir(), "oc-omp-embedded");
   mkdirSync(dir, { recursive: true });
@@ -30,7 +29,12 @@ export function embeddedOmpConfigOverlay(): string {
       : "";
   writeFileSync(
     file,
-    `mcp:
+    `# The sidecar always selects the session itself (switch_session). A user's
+# autoResume would otherwise reopen the newest session in the cwd at startup,
+# and omp exits before the sidecar can steer it when that session's model
+# cannot be restored (e.g. a local llama.cpp server that is not running).
+autoResume: false
+mcp:
   enableProjectConfig: false
 edit:
   autoRepair:

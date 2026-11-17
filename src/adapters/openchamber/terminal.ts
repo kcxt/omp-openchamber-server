@@ -137,7 +137,15 @@ function listShells(): Array<{ id: string; name: string; supportsLogin: boolean 
     const id = entry ? shellIdOf(entry) : null;
     if (id && !seen.has(id) && isExecutable(entry)) seen.set(id, entry);
   }
-  return [...seen].map(([id, executable]) => ({ id, name: id, supportsLogin: loginArgs(executable) !== null }));
+  const shells = [...seen].map(([id, executable]) => ({ id, name: id, supportsLogin: loginArgs(executable) !== null }));
+  // "auto" resolves to the environment's shell; the picker lists it first.
+  let autoSupportsLogin = false;
+  try {
+    autoSupportsLogin = loginArgs(resolveShell("auto").executable) !== null;
+  } catch {
+    /* no shell at all: list the rest */
+  }
+  return [{ id: "auto", name: "Auto", supportsLogin: autoSupportsLogin }, ...shells];
 }
 
 function launchArgs(executable: string, mode: "interactive" | "command", command: string | null, login: boolean): string[] {

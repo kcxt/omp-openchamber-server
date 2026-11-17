@@ -5,6 +5,7 @@
  * BackendTurnConnection surface. Event frames flowing out of the transport
  * pass through the omp normalizer (events.ts) before reaching the sink.
  */
+import { logger } from "../../shared/logger";
 import type {
   AgentBackend,
   BackendCapabilities,
@@ -63,7 +64,21 @@ const defaultOmpTransportFactory: OmpTransportFactory = async (cwd, sessionPath,
     ? await OmpRpcConnection.spawn(cwd, 3, { credential })
     : await OmpRpcConnection.spawn(cwd);
   try {
-    await conn.switchSession(sessionPath);
+    try {
+      await conn.switchSession(sessionPath);
+    } catch (error) {
+      // The session's last model can no longer be restored (typically a local
+      // llama.cpp provider whose server is down). Open it on the model this
+      // child started with instead of failing every prompt; the user can pick
+      // another model, and the saved history is unaffected.
+      if (!(error instanceof Error) || !error.message.includes("Could not restore model")) throw error;
+      const state = (await conn.request("get_state")) as { model?: { provider?: unknown; id?: unknown } } | undefined;
+      const provider = state?.model?.provider;
+      const modelId = state?.model?.id;
+      if (typeof provider !== "string" || typeof modelId !== "string") throw error;
+      logger.warn({ sessionPath, provider, modelId }, `[omp] ${error.message}; opening the session on ${provider}/${modelId}`);
+      await conn.request("switch_session", { sessionPath, provider, modelId });
+    }
     await conn.request("set_subagent_subscription", { level: "events" }).catch(() => {});
     return conn;
   } catch (error) {

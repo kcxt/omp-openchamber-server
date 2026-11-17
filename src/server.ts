@@ -57,7 +57,7 @@ import { readdir, mkdir, stat, unlink, rename, rm, realpath } from "node:fs/prom
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
-import { describeSmallModel, generateSmallModelText, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
+import { describeSmallModel, generateSmallModelText, readOmpConfigSmallModel, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
 import { handleOmpConfigRoute, listOmpSlashCommands } from "./adapters/openchamber/omp-config";
 import { createTerminalRuntime, TERMINAL_WS_PATH } from "./adapters/openchamber/terminal";
 import { createClientAuthRuntime } from "./adapters/openchamber/client-auth";
@@ -1265,7 +1265,16 @@ const MIME_TYPES: Record<string, string> = {
         });
       }
 
-      // Command metadata
+      // Command metadata. omp owns its commands and exposes no file path for
+      // them, so every entry reads as "defined by the backend" (`source:
+      // none`), which is what OpenChamber shows for commands it did not write.
+      const noCommandSource = { source: "none", scope: null, path: null, legacy: false, config: {} };
+      if (path === "/api/config/command-configs" && req.method === "GET") {
+        const names = url.searchParams.getAll("name").filter((name) => name.length > 0);
+        return json({ commands: names.map((name) => ({ name, entry: noCommandSource })) });
+      }
+      const commandConfigMatch = path.match(/^\/api\/config\/commands\/([^/]+)\/config$/);
+      if (commandConfigMatch && req.method === "GET") return json(noCommandSource);
       if (path.startsWith("/api/config/commands/")) {
         const cmdName = decodeURIComponent(path.slice("/api/config/commands/".length));
         return json({
@@ -1666,6 +1675,12 @@ const MIME_TYPES: Record<string, string> = {
           data: Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])),
         });
       }
+
+      // Background work the sidecar can report. omp's own background jobs are
+      // not surfaced, so both lists are empty, but they must answer: the goal
+      // loop treats an unanswered list as "could not look" and never audits.
+      if (p === "/experimental/job" && req.method === "GET") return json({ data: [] });
+      if (p === "/shell" && req.method === "GET") return json({ location: { directory: effectiveDir }, data: [] });
 
       // Session todos page state (OpenChamber /api/session-todos/:id). The
       // client accepts either `off` (no todo feature for this session) or
@@ -2305,19 +2320,23 @@ const MIME_TYPES: Record<string, string> = {
       }
     }
 
-    if (p === "/generate/text" && req.method === "POST") {
+    // `/experimental/generate/text` is what OpenChamber's own small-model
+    // service (goal progress checks, titles, commit text) calls on its backend.
+    // The named model runs exactly as asked, through omp.
+    if ((p === "/generate/text" || p === "/experimental/generate/text") && req.method === "POST") {
       try {
         const body = asRecord(await readJson(req));
         if (typeof body?.prompt !== "string" || !body.prompt.trim()) return jsonError("prompt required", 400);
         const model = asRecord(body.model);
         const selection = splitProviderPrefix(typeof model?.providerID === "string" ? model.providerID : "");
+        const modelId = typeof model?.id === "string" ? model.id : undefined;
         const generated = await generateSmallModelText({
           prompt: body.prompt,
           directory: dir ?? process.cwd(),
-          preferredProviderID: selection.native || undefined,
-          preferredModelID: typeof model?.id === "string" ? model.id : undefined,
+          ...(selection.native && modelId ? { model: `${selection.native}/${modelId}` } : {}),
+          ...(typeof model?.variant === "string" ? { variant: model.variant } : {}),
         });
-        return json({ data: { text: generated.text } });
+        return json({ data: { text: generated.text }, text: generated.text });
       } catch (err) {
         const status = typeof (err as { statusCode?: unknown })?.statusCode === "number"
           ? (err as { statusCode: number }).statusCode
@@ -2626,6 +2645,19 @@ const MIME_TYPES: Record<string, string> = {
     // Agent catalog
     if (p === "/agent" && req.method === "GET") {
       return json({ location: { directory: dir ?? process.cwd() }, data: [toV2Agent()] });
+    }
+
+    // OpenChamber's small-model service asks for the hidden `title` agent to
+    // learn which model the backend uses for side work. omp's answer is its
+    // `smol` role, then `tiny`; no role configured is a plain 404, which the
+    // client reads as "nothing configured".
+    if (p === "/agent/title" && req.method === "GET") {
+      const role = readOmpConfigSmallModel();
+      if (!role) return jsonError("title agent not configured", 404);
+      return json({
+        location: { directory: dir ?? process.cwd() },
+        data: { ...toV2Agent(), name: "title", hidden: true, model: { providerID: role.providerID, id: role.modelID, ...(role.variant ? { variant: role.variant } : {}) } },
+      });
     }
 
     // Config

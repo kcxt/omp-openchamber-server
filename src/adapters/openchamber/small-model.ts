@@ -311,6 +311,7 @@ export function resolveProviderConnection(providerID: string, directory?: string
 /** Resolves which model to use according to the priority order. */
 export function resolveSmallModel(options?: {
   model?: string;
+  variant?: string;
   preferredProviderID?: string;
   preferredModelID?: string;
   directory?: string;
@@ -318,7 +319,7 @@ export function resolveSmallModel(options?: {
   // 1. Explicit request model
   const explicit = parseModelRef(options?.model);
   if (explicit) {
-    return { ...explicit, source: "request" };
+    return { ...explicit, ...(options?.variant ? { variant: options.variant } : {}), source: "request" };
   }
 
   // 2. OpenChamber settings override
@@ -532,6 +533,8 @@ export async function generateSmallModelText(params: {
   system?: string;
   maxOutputTokens?: number;
   model?: string;
+  /** Thinking level for an explicit `model`. */
+  variant?: string;
   directory?: string;
   preferredProviderID?: string;
   preferredModelID?: string;
@@ -545,6 +548,7 @@ export async function generateSmallModelText(params: {
 
   const resolved = resolveSmallModel({
     model: params.model,
+    variant: params.variant,
     preferredProviderID: params.preferredProviderID,
     preferredModelID: params.preferredModelID,
     directory: params.directory,
