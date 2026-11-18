@@ -370,7 +370,7 @@ function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown
         const callID = part.callID ?? part.id;
         const tool = typeof part.tool === "string" ? part.tool : "tool";
         if (state.status === "completed") return eventWithLocation("session.tool.success", {
-          ...common, id: callID, content: [{ type: "text", text: state.output ?? "" }], metadata: {}, executed: true,
+          ...common, id: callID, name: tool, content: [{ type: "text", text: state.output ?? "" }], metadata: asRecord(state.metadata), executed: true,
         });
         if (state.status === "error") {
           const error = asRecord(state.error);
@@ -390,7 +390,7 @@ function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown
           });
         }
         if (state.status === "running") return eventWithLocation("session.tool.called", {
-          ...common, id: callID, name: tool, input: state.input ?? {}, executed: true,
+          ...common, id: callID, name: tool, input: state.input ?? {}, metadata: asRecord(state.metadata), executed: true,
         });
         return eventWithLocation("session.tool.input.started", { ...common, id: callID, name: tool });
       }
@@ -771,6 +771,33 @@ export function emitMessagePartDelta(
 
 export function emitSessionIdle(sessionID: string, directory?: string, aborted = false): void {
   emitOpenCodeEvent("session.idle", { sessionID, ...(aborted ? { aborted: true } : {}) }, directory);
+}
+
+/** OpenChamber drops a todo read or push whose revision is not newer than the one it has. */
+let sessionTodosRevision = Date.now();
+
+export function nextSessionTodosRevision(): number {
+  sessionTodosRevision += 1;
+  return sessionTodosRevision;
+}
+
+/**
+ * OpenChamber's todo panel keeps one list per session: it reads
+ * `GET /session-todos/:id` and then follows `openchamber:session-todos` pushes
+ * on `/api/openchamber/events`. omp's todo list changes mid-turn, so the sidecar
+ * pushes it whenever a todo call lands.
+ */
+export function emitOpenChamberSessionTodos(
+  sessionID: string,
+  directory: string,
+  todos: Array<{ content: string; status: string }>,
+): void {
+  emitOpenCodeEvent("openchamber:session-todos", {
+    revision: nextSessionTodosRevision(),
+    sessionId: sessionID,
+    directory,
+    todos,
+  }, directory);
 }
 
 export function emitTodoUpdated(sessionID: string, todos: unknown[], directory?: string): void {

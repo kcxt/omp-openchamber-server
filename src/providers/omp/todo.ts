@@ -6,6 +6,31 @@ export function isTodoTool(toolName: string | undefined): boolean {
   return t === "todo" || t === "todowrite" || t === "todoread" || t === "todos";
 }
 
+/** OpenChamber's todo panel is keyed on OpenCode's tool name. */
+export const OPENCHAMBER_TODO_TOOL = "todowrite";
+
+/** omp names the tool `todo`; OpenCode - and so OpenChamber - calls it `todowrite`. */
+export function openCodeToolName(toolName: string | undefined): string | undefined {
+  if (!toolName) return toolName;
+  const t = toolName.toLowerCase().trim();
+  return t === "todo" || t === "todos" ? OPENCHAMBER_TODO_TOOL : toolName;
+}
+
+/**
+ * omp's `todo` tool takes an op (`{op, task, phase}`), never the list, so the
+ * list a call produced lives in its result. OpenChamber reads the list off the
+ * call's `input.todos` (mid-call) and `metadata.todos` (on success), so both
+ * carry the resolved list.
+ */
+export function attachTodosToState<T extends {
+  input?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}>(state: T, todos: OpenCodeTodo[]): T {
+  state.input = { ...(state.input ?? {}), todos };
+  state.metadata = { ...(state.metadata ?? {}), todos };
+  return state;
+}
+
 export function normalizeOmpTodoStatus(status: string | undefined): "pending" | "in_progress" | "completed" | "cancelled" {
   if (!status) return "pending";
   const s = status.toLowerCase().trim();

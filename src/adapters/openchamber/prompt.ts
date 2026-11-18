@@ -25,6 +25,7 @@ import {
   emitSessionStatus,
   emitSessionError,
   emitTodoUpdated,
+  emitOpenChamberSessionTodos,
   emitPermissionAsked,
   emitQuestionAsked,
   emitPermissionReplied,
@@ -878,6 +879,11 @@ export function createEventHandler(
       }
       case "todo": {
         emitTodoUpdated(openCodeId, event.todos, cwd);
+        emitOpenChamberSessionTodos(
+          openCodeId,
+          cwd,
+          event.todos.map((todo) => ({ content: todo.content, status: todo.status })),
+        );
         return;
       }
       case "subagent_started": {

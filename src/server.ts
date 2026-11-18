@@ -13,6 +13,7 @@ import {
   emitBrowserControlRequest,
   emitSessionCompacted,
   emitOpenCodeV2Event,
+  nextSessionTodosRevision,
 } from "./shared/sse";
 import { BrowserControlBroker, BrowserControlError } from "./adapters/openchamber/browser-control";
 import {
@@ -473,7 +474,14 @@ function toV2ConfigEntries(directory: string): Array<{ type: "document"; path: s
   return [{
     type: "document",
     path: "omp-sidecar",
-    info: { default_agent: defaultAgent, ...(model !== undefined ? { model } : {}) },
+    info: {
+      default_agent: defaultAgent,
+      ...(model !== undefined ? { model } : {}),
+      // OpenChamber gates its todo panel on OpenCode's `experimental.todo` flag
+      // and turns it off when the config says nothing. omp always has its todo
+      // tool, so the sidecar says so explicitly instead of leaving it unset.
+      experimental: { todo: defaultBackend().capabilities.todo },
+    },
   }];
 }
 
@@ -1741,7 +1749,7 @@ const MIME_TYPES: Record<string, string> = {
         try {
           const { backend, session } = await resolveSessionRoute(decodeURIComponent(sessionTodosMatch[1]!), dir);
           if (!session) return jsonError("session not found", 404);
-          const revision = Date.now();
+          const revision = nextSessionTodosRevision();
           if (!backend.capabilities.todo) return json({ revision, state: "off" });
           const todos = await readSessionTodos(session.path);
           return json({

@@ -41,7 +41,7 @@ NoNewPrivileges=yes
 # checkouts, toolchain caches that terminal commands use. ~/.config/opencode is
 # where OpenChamber writes its OpenCode-style settings (compaction, agents,
 # commands); the sidecar does not read it, but the UI needs the writes to land.
-BindPaths=%h/.config/openchamber %h/.config/opencode %h/git %h/.cache %h/.cargo %h/.rustup
+BindPaths=%h/.config/openchamber %h/.config/opencode /hdd/brute/projects -%h/git %h/.cache %h/.cargo %h/.rustup
 
 # Read-only: launcher link, dotfiles the terminal's zsh reads (.zshrc sources
 # the p10k config and fzf). History and atuin are deliberately not mounted, so

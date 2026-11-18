@@ -1,4 +1,5 @@
 import type { OpenCodeMessageRecord, OpenCodeSession, OpenCodePart } from "../../providers/types";
+import { openCodeToolName } from "../../providers/omp/todo";
 import { backendForSession, isMultiBackend } from "../../providers/registry";
 
 export interface V2Location {
@@ -106,13 +107,13 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: part.tool,
+      name: openCodeToolName(part.tool) ?? part.tool,
       executed: true,
       state: {
         status: "completed" as const,
         input,
         content: [{ type: "text" as const, text: state.output ?? "" }],
-        metadata: {},
+        metadata: state.metadata ?? {},
       },
       time: { created: time.start, ran: time.start, completed: time.end ?? time.start },
     };
@@ -121,14 +122,14 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: part.tool,
+      name: openCodeToolName(part.tool) ?? part.tool,
       executed: true,
       state: {
         status: "error" as const,
         input,
         error: { type: "Error", message: state.error ?? state.output ?? "tool failed" },
         ...(state.output ? { content: [{ type: "text" as const, text: state.output }] } : {}),
-        metadata: {},
+        metadata: state.metadata ?? {},
       },
       time: { created: time.start, ran: time.start, completed: time.end ?? time.start },
     };
@@ -137,16 +138,16 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: part.tool,
+      name: openCodeToolName(part.tool) ?? part.tool,
       executed: true,
-      state: { status: "running" as const, input, metadata: {} },
+      state: { status: "running" as const, input, metadata: state.metadata ?? {} },
       time: { created: time.start, ran: time.start },
     };
   }
   return {
     type: "tool" as const,
     id: part.callID,
-    name: part.tool,
+    name: openCodeToolName(part.tool) ?? part.tool,
     executed: false,
     state: { status: "streaming" as const, input: JSON.stringify(input) },
     time: { created: time.start },

@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { subscribeOpenCodeEvents, type OpenCodeEvent } from "../../shared/sse";
+import { createOpenCodeEventStream, subscribeOpenCodeEvents, type OpenCodeEvent } from "../../shared/sse";
 import { createEventHandler } from "./prompt";
+import { toV2Message } from "./v2";
 import { isTodoTool, normalizeOmpTodoStatus, extractTodosFromOmpDetails } from "../../providers/omp/todo";
+import { mapRpcMessagesToOpenCodeRecords, type AgentMessage } from "../../providers/omp/messages";
 import type { OmpRpcEvent } from "../../providers/omp/rpc";
 import { createOmpTurnConnection } from "../../providers/omp/backend";
 
@@ -252,5 +254,149 @@ describe("todo.updated SSE event emission during live turns", () => {
 
     const todoEvents = events.filter((e) => e.type === "todo.updated");
     expect(todoEvents).toHaveLength(0);
+  });
+});
+
+describe("omp's todo tool as OpenChamber's todo panel", () => {
+  const phases = [
+    {
+      name: "Build",
+      tasks: [
+        { id: "task_1", content: "Write HTML", status: "in_progress" },
+        { id: "task_2", content: "Check JS", status: "pending" },
+      ],
+    },
+  ];
+  const todoList = [
+    { id: "task_1", content: "Write HTML", status: "in_progress", priority: "normal" },
+    { id: "task_2", content: "Check JS", status: "pending", priority: "normal" },
+  ];
+
+  /** OpenChamber's own gate: a completed `todowrite` content item carrying `input.todos`. */
+  const matchesOpenChamberTodoCall = (item: Record<string, any>) =>
+    item?.type === "tool"
+    && item?.name === "todowrite"
+    && item?.state?.status === "completed"
+    && Array.isArray(item?.state?.input?.todos);
+
+  it("names every live todo part todowrite and carries the produced list on it", () => {
+    const events: OpenCodeEvent[] = [];
+    const unsub = subscribeOpenCodeEvents((e) => events.push(e));
+    const transport = wireHandler(() => {});
+
+    transport.feed({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "toolcall_start",
+        toolCallId: "call_present",
+        tool: "todo",
+        arguments: { op: "init", list: [{ phase: "Build", items: ["Write HTML", "Check JS"] }] },
+      },
+    } as unknown as OmpRpcEvent);
+    transport.feed({
+      type: "tool_execution_start",
+      payload: { toolCallId: "call_present", tool: "todo" },
+    } as unknown as OmpRpcEvent);
+    transport.feed({
+      type: "tool_execution_end",
+      payload: { toolCallId: "call_present", tool: "todo", output: "2 tasks", details: { op: "init", phases } },
+    } as unknown as OmpRpcEvent);
+    unsub();
+
+    const toolParts = events
+      .filter((e) => e.type === "message.part.updated")
+      .map((e) => (e.properties as { part?: Record<string, any> }).part)
+      .filter((part) => part?.type === "tool");
+    expect(toolParts.length).toBeGreaterThanOrEqual(3);
+    expect(toolParts.every((part) => part.tool === "todowrite")).toBe(true);
+
+    const completed = toolParts.at(-1)!;
+    expect(completed.state.status).toBe("completed");
+    expect(completed.state.input.op).toBe("init");
+    expect(completed.state.input.todos).toEqual(todoList);
+    expect(completed.state.metadata.todos).toEqual(todoList);
+  });
+
+  it("streams todowrite through OpenChamber's wire events, list included", async () => {
+    const stream = createOpenCodeEventStream(CWD, { isOpenChamber: true });
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    const transport = wireHandler(() => {});
+
+    transport.feed({
+      type: "message_update",
+      assistantMessageEvent: { type: "toolcall_start", toolCallId: "call_wire", tool: "todo", arguments: { op: "view" } },
+    } as unknown as OmpRpcEvent);
+    transport.feed({
+      type: "tool_execution_start",
+      payload: { toolCallId: "call_wire", tool: "todo" },
+    } as unknown as OmpRpcEvent);
+    transport.feed({
+      type: "tool_execution_end",
+      payload: { toolCallId: "call_wire", tool: "todo", output: "2 tasks", details: { op: "view", phases } },
+    } as unknown as OmpRpcEvent);
+
+    const frames: Array<Record<string, any>> = [];
+    for (let i = 0; i < 20 && !frames.some((f) => f.type === "session.tool.success"); i++) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      for (const frame of decoder.decode(chunk.value).split("\n\n")) {
+        if (frame.startsWith("data: ")) frames.push(JSON.parse(frame.slice(6)));
+      }
+    }
+    await reader.cancel();
+
+    const started = frames.find((f) => f.type === "session.tool.input.started");
+    const called = frames.find((f) => f.type === "session.tool.called");
+    const success = frames.find((f) => f.type === "session.tool.success");
+    expect(started?.data?.name).toBe("todowrite");
+    expect(called?.data?.name).toBe("todowrite");
+    expect(success?.data?.name).toBe("todowrite");
+    expect(success?.data?.metadata?.todos).toEqual(todoList);
+    expect(success?.location?.directory).toBe(CWD);
+  });
+
+  it("serves the transcript's todo call as a completed todowrite item OpenChamber can read", () => {
+    const rawMessages: AgentMessage[] = [
+      { id: "u1", role: "user", content: "track this work" },
+      {
+        id: "a1",
+        role: "assistant",
+        provider: "anthropic",
+        model: "claude-sonnet-5-5",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_page",
+            name: "todo",
+            arguments: { op: "init", list: [{ phase: "Build", items: ["Write HTML", "Check JS"] }] },
+          },
+        ],
+      },
+      {
+        id: "t1",
+        role: "toolResult",
+        toolCallId: "call_page",
+        toolName: "todo",
+        content: "2 tasks in 1 phase",
+        details: { op: "init", phases },
+        isError: false,
+      },
+    ];
+
+    const records = mapRpcMessagesToOpenCodeRecords(rawMessages, "ses_todo_page_test");
+    const assistant = records.find((record) => record.info.role === "assistant");
+    expect(assistant).toBeDefined();
+    const part = assistant!.parts.find((candidate): candidate is Extract<typeof candidate, { type: "tool" }> => candidate.type === "tool");
+    expect(part?.state.status).toBe("completed");
+    // omp's own op input stays intact; the list the call produced rides with it.
+    expect((part?.state.input as Record<string, unknown>).op).toBe("init");
+    expect((part?.state.input as Record<string, unknown>).todos).toEqual(todoList);
+
+    const wire = toV2Message(assistant!) as { content?: Array<Record<string, any>> };
+    const item = wire.content?.find((entry) => entry.type === "tool");
+    expect(item).toBeDefined();
+    expect(matchesOpenChamberTodoCall(item!)).toBe(true);
+    expect(item!.state.input.todos).toEqual(todoList);
   });
 });

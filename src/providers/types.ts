@@ -157,6 +157,8 @@ export interface ToolPartState {
   input?: Record<string, unknown>;
   output?: string;
   error?: string;
+  /** Backend-side facts about the call that the client contract carries alongside the output. */
+  metadata?: Record<string, unknown>;
   time?: { start: number; end?: number };
 }
 
@@ -234,6 +236,8 @@ export interface OpenCodeToolPart {
     input?: Record<string, unknown>;
     output?: string;
     error?: string;
+    /** Backend facts the client contract carries alongside the output (e.g. the todo list a call produced). */
+    metadata?: Record<string, unknown>;
     time: { start: number; end?: number };
   };
   metadata?: { toolCallId?: string };

@@ -11,6 +11,7 @@ import {
   recordPersistedMessageId,
 } from "./title-db";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
+import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import { resolveImageDataUrl, isBlobRef } from "../../shared/blobs";
 import type {
   OpenCodeFilePart,
@@ -609,6 +610,12 @@ function mergeToolResultIntoAssistant(
     target.state.error = content;
   } else {
     target.state.output = normalizeToolOutput(target.tool, content, msg.details ?? raw.details);
+  }
+  // OpenChamber reads a todo list off the call's input; omp's `todo` tool takes
+  // an op, so the list the call produced comes from its recorded details.
+  if (!isError && isTodoTool(target.tool)) {
+    const todos = extractTodosFromOmpDetails(msg.details ?? raw.details);
+    if (todos) attachTodosToState(target.state, todos);
   }
   target.state.time.end = resultTime;
   return true;

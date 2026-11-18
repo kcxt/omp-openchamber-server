@@ -13,7 +13,7 @@ import { isAbsolute, resolve } from "node:path";
 import type { ModelRef, NormalizedTurnEvent, ToolPartState, TokenBreakdown, TurnTelemetry } from "../types";
 import { invalidateMessageCache, mapOmpUsageToTokens, extractUserMessageText } from "./messages";
 import { readSessionHeader, readSessionIdSync, toOpenCodeSessionId } from "./store";
-import { extractTodosFromOmpDetails, isTodoTool } from "./todo";
+import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "./todo";
 import type { OmpRpcEvent, OmpRpcTransport } from "./rpc";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { promptLogger } from "../../shared/logger";
@@ -783,8 +783,12 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
         const existing = toolParts.get(toolCallId);
         const resolvedTool = tool ?? existing?.tool;
         const state = reduceToolPartState(existing?.state, { type: customType, ...payload }, Date.now(), resolvedTool);
+        if (isTodoTool(resolvedTool) && state.status === "completed") {
+          const todos = extractTodosFromOmpDetails(payload.details, payload.result ?? payload.output);
+          if (todos) attachTodosToState(state, todos);
+        }
         toolParts.set(toolCallId, { tool: resolvedTool ?? "tool", state });
-        emit({ kind: "tool", callID: toolCallId, tool: resolvedTool, state });
+        emit({ kind: "tool", callID: toolCallId, tool: openCodeToolName(resolvedTool), state });
         return;
       }
     }
@@ -857,12 +861,20 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       const existing = toolParts.get(toolCallId);
       const resolvedTool = tool ?? existing?.tool;
       const state = reduceToolPartState(existing?.state, payload, Date.now(), resolvedTool);
+      const isTodoEnd = isTodoTool(resolvedTool) && (state.status === "completed" || type === "tool_execution_end");
+      const todos = isTodoEnd
+        ? extractTodosFromOmpDetails(
+            payload.details
+              ?? (typeof payload.data === "object" && payload.data != null ? (payload.data as Record<string, unknown>).details : undefined)
+              ?? event.details,
+            payload.result ?? payload.output,
+          )
+        : undefined;
+      if (todos) attachTodosToState(state, todos);
       toolParts.set(toolCallId, { tool: resolvedTool ?? "tool", state });
-      emit({ kind: "tool", callID: toolCallId, tool: resolvedTool, state });
+      emit({ kind: "tool", callID: toolCallId, tool: openCodeToolName(resolvedTool), state });
 
-      if (isTodoTool(resolvedTool) && (state.status === "completed" || type === "tool_execution_end")) {
-        const rawDetails = payload.details ?? (typeof payload.data === "object" && payload.data != null ? (payload.data as Record<string, unknown>).details : undefined) ?? event.details;
-        const todos = extractTodosFromOmpDetails(rawDetails, payload.result ?? payload.output);
+      if (isTodoEnd) {
         if (todos) {
           emit({ kind: "todo", todos });
         } else {
@@ -922,18 +934,28 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
         emit({
           kind: "tool_input_delta",
           callID: known,
-          ...(resolvedTool ? { tool: resolvedTool } : {}),
+          ...(resolvedTool ? { tool: openCodeToolName(resolvedTool) } : {}),
           delta,
         });
         return;
       }
       const state = reduceToolPartState(existing?.state, assistantMessageEvent, Date.now(), resolvedTool);
+      const isTodoEnd = isTodoTool(resolvedTool)
+        && (state.status === "completed" || eventType === "toolcall_end" || eventType === "tool_execution_end");
+      const todos = isTodoEnd
+        ? extractTodosFromOmpDetails(
+            assistantMessageEvent.details
+              ?? (typeof assistantMessageEvent.data === "object" && assistantMessageEvent.data != null
+                ? (assistantMessageEvent.data as Record<string, unknown>).details
+                : undefined),
+            assistantMessageEvent.result ?? assistantMessageEvent.output,
+          )
+        : undefined;
+      if (todos) attachTodosToState(state, todos);
       toolParts.set(toolCallId, { tool: resolvedTool ?? "tool", state });
-      emit({ kind: "tool", callID: toolCallId, tool: resolvedTool, state });
+      emit({ kind: "tool", callID: toolCallId, tool: openCodeToolName(resolvedTool), state });
 
-      if (isTodoTool(resolvedTool) && (state.status === "completed" || eventType === "toolcall_end" || eventType === "tool_execution_end")) {
-        const rawDetails = assistantMessageEvent.details ?? (typeof assistantMessageEvent.data === "object" && assistantMessageEvent.data != null ? (assistantMessageEvent.data as Record<string, unknown>).details : undefined);
-        const todos = extractTodosFromOmpDetails(rawDetails, assistantMessageEvent.result ?? assistantMessageEvent.output);
+      if (isTodoEnd) {
         if (todos) {
           emit({ kind: "todo", todos });
         } else {
