@@ -1175,6 +1175,10 @@ export async function promptSessionAsync(
             await state.conn.setModel(nativeProviderID(modelRef.providerID), modelRef.modelID);
           } catch (err) {
             promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} set_model failed`);
+            // Never run the turn on whatever model the child already holds
+            // (its default role): the user picked this one.
+            const reason = err instanceof Error ? err.message : String(err);
+            throw new Error(`could not switch to ${modelRef.providerID}/${modelRef.modelID}: ${reason}`);
           }
         }
 
