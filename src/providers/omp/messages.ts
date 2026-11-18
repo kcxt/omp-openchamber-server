@@ -881,7 +881,7 @@ function getRecordedUserMessages(openCodeId: string, dbPath?: string): RecordedU
   return [];
 }
 
-function extractUserMessageText(msg: AgentMessage): string {
+export function extractUserMessageText(msg: AgentMessage): string {
   if (typeof msg.content === "string") return msg.content.trim();
   if (Array.isArray(msg.content)) {
     for (const block of msg.content) {

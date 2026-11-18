@@ -96,6 +96,12 @@ interface SessionState {
   currentModel: ModelRef;
   /** Hash of the explicit credential input that created this child, if any. */
   credentialFingerprint?: string;
+  /**
+   * Inbox items announced to OpenChamber (`session.inbox.enqueued`) in send
+   * order, waiting for omp to append the message to its transcript. omp
+   * appends in the same order it accepted them, so a FIFO pop is the match.
+   */
+  pendingInbox: string[];
 }
 
 function sessionKey(openCodeId: string, cwd: string): string {
@@ -564,6 +570,8 @@ function recordAndEmitUserPrompt(
   if (!parentMessageID) return;
 
   const { openCodeId, cwd, currentModel } = state;
+  state.pendingInbox.push(parentMessageID);
+  if (state.pendingInbox.length > 64) state.pendingInbox.shift();
   backendForSession(openCodeId).store.recordUserMessage?.(
     openCodeId,
     promptText,
@@ -690,8 +698,10 @@ export function createEventHandler(
   model: ModelRef,
   onComplete: () => void,
   cwd?: string,
+  pendingInbox?: string[],
 ): (event: NormalizedTurnEvent) => void {
   const subagentScope = cwd === undefined ? undefined : { key: sessionKey(openCodeId, cwd), directory: cwd };
+  let currentParentID = parentMessageID;
   let assistantMessageID: string | undefined;
   let assistantStartTime: number | undefined;
   let currentPartType: "text" | "reasoning" | undefined;
@@ -710,9 +720,9 @@ export function createEventHandler(
     assistantStartTime = Date.now();
     assistantMessageID = makeMessageId(
       openCodeId,
-      parentMessageID ? `asst_${parentMessageID}` : `assistant_${assistantStartTime}`,
+      currentParentID ? `asst_${currentParentID}` : `assistant_${assistantStartTime}`,
     );
-    emitAssistantInfo(openCodeId, assistantMessageID, parentMessageID, model, undefined, cwd, assistantStartTime);
+    emitAssistantInfo(openCodeId, assistantMessageID, currentParentID, model, undefined, cwd, assistantStartTime);
   };
 
   const finalizeCurrentPart = () => {
@@ -777,7 +787,7 @@ export function createEventHandler(
     emitAssistantInfo(
       openCodeId,
       assistantMessageID,
-      parentMessageID,
+      currentParentID,
       model,
       undefined,
       cwd,
@@ -954,6 +964,43 @@ export function createEventHandler(
         }
         return;
       }
+      case "user_message": {
+        // omp appended one of the inbox items this sidecar announced. Without
+        // the delivery ACK OpenChamber keeps it as a pending inbox entry,
+        // pinned after the streaming assistant message instead of becoming a
+        // turn boundary in the history.
+        const inboxID = pendingInbox?.shift();
+        if (!inboxID) return;
+        emitOpenCodeV2Event("session.inbox.delivered", { sessionID: openCodeId, inboxID }, cwd);
+        if (!hasStarted || !assistantMessageID) {
+          currentParentID = inboxID;
+          return;
+        }
+        // omp interrupted the running assistant message to apply the steer, and
+        // records the interruption (`stopReason: aborted`) followed by a new
+        // assistant message. Mirror that boundary instead of gluing both
+        // halves into one OpenChamber step.
+        finalizeCurrentPart();
+        emitAssistantInfo(
+          openCodeId,
+          assistantMessageID,
+          currentParentID,
+          model,
+          "aborted",
+          cwd,
+          assistantStartTime,
+          latestTokens,
+          latestCost,
+          undefined,
+          turnTelemetry,
+        );
+        hasStarted = false;
+        assistantMessageID = undefined;
+        assistantStartTime = undefined;
+        partIndex = 0;
+        currentParentID = inboxID;
+        return;
+      }
       case "turn_end": {
         finalizeCurrentPart();
         const isError = event.stopReason === "error" || Boolean(event.error) || (typeof event.error === "string" && event.error.length > 0);
@@ -979,7 +1026,7 @@ export function createEventHandler(
             emitAssistantInfo(
               openCodeId,
               assistantMessageID,
-              parentMessageID,
+              currentParentID,
               model,
               "error",
               cwd,
@@ -993,7 +1040,7 @@ export function createEventHandler(
           emitSessionError(openCodeId, { message: rawError || "Turn ended with error" }, cwd);
         } else {
           if (assistantMessageID) {
-            emitAssistantInfo(openCodeId, assistantMessageID, parentMessageID, model, "stop", cwd, assistantStartTime, latestTokens, latestCost, undefined, turnTelemetry);
+            emitAssistantInfo(openCodeId, assistantMessageID, currentParentID, model, "stop", cwd, assistantStartTime, latestTokens, latestCost, undefined, turnTelemetry);
           }
         }
         onComplete();
@@ -1047,6 +1094,7 @@ async function getOrCreateSessionState(
       modelID: modelFromRpc?.modelID ?? "omp",
       variant: modelFromRpc?.variant ?? "default",
     }),
+    pendingInbox: [],
   };
 
   sessionStates.set(key, state);
@@ -1175,7 +1223,7 @@ export async function promptSessionAsync(
       try {
         state.unsubscribe();
         state.unsubscribe = state.conn.onEvent(
-          createEventHandler(openCodeId, parentMessageID, state.currentModel, complete, cwd),
+          createEventHandler(openCodeId, parentMessageID, state.currentModel, complete, cwd, state.pendingInbox),
         );
 
         if (modelRef) {

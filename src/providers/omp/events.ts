@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import type { ModelRef, NormalizedTurnEvent, ToolPartState, TokenBreakdown, TurnTelemetry } from "../types";
-import { invalidateMessageCache, mapOmpUsageToTokens } from "./messages";
+import { invalidateMessageCache, mapOmpUsageToTokens, extractUserMessageText } from "./messages";
 import { readSessionHeader, readSessionIdSync, toOpenCodeSessionId } from "./store";
 import { extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import type { OmpRpcEvent, OmpRpcTransport } from "./rpc";
@@ -869,6 +869,21 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
           fetchTodosFallback();
         }
       }
+      return;
+    }
+
+    // 11c. A user message omp appended mid-turn — the steer or follow-up it
+    // queued after the sidecar announced it as an inbox item. The frame carries
+    // the message, which is the only signal that the announcement landed.
+    if (type === "message_start") {
+      const message = event.message as Record<string, unknown> | undefined;
+      if (!message || message.role !== "user") return;
+      if (message.synthetic === true || message.attribution === "assistant") return;
+      emit({
+        kind: "user_message",
+        text: extractUserMessageText(message as never),
+        ...(typeof message.id === "string" && message.id.length > 0 ? { ompMessageId: message.id } : {}),
+      });
       return;
     }
 

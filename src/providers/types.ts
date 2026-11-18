@@ -337,6 +337,11 @@ export type NormalizedTurnEvent =
   | { kind: "todo"; todos: OpenCodeTodo[] }
   | { kind: "compaction_start"; reason?: string; action?: string }
   | { kind: "compaction_end"; aborted?: boolean; willRetry?: boolean }
+  /**
+   * A user message omp appended to the transcript mid-turn: the steer or
+   * follow-up it queued after the sidecar announced it as an inbox item.
+   */
+  | { kind: "user_message"; text: string; ompMessageId?: string }
   | { kind: "turn_end"; error?: string; stopReason?: string };
 
 // ---------------------------------------------------------------------------

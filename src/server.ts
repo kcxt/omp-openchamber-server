@@ -1567,6 +1567,9 @@ const MIME_TYPES: Record<string, string> = {
         if (req.method === "DELETE") {
           try {
             await messageQueueRuntime.remove(sessionId, itemId);
+            // The client added the item optimistically; without the removal
+            // event it stays in the transcript as a message that never ran.
+            emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: sessionId, inboxID: itemId }, dir);
             return noContent();
           } catch (error) {
             return queueError(error, "failed to cancel queued message");
