@@ -1135,6 +1135,14 @@ export async function promptSessionAsync(
       const parentMessageID = body.id ?? body.messageID ?? makeMessageId(openCodeId);
       syntheticContext.delete(contextKey);
       recordAndEmitUserPrompt(state, parentMessageID, userPromptText, userPromptTextParts, body);
+      if (modelRef) {
+        state.currentModel = defaultModelRef(modelRef);
+        // The turn already running keeps its model; omp applies this to the
+        // turns that follow. A failure here must not drop the steered message.
+        await state.conn.setModel(modelRef.providerID, modelRef.modelID).catch((err) => {
+          promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} set_model failed for queued prompt`);
+        });
+      }
       void state.conn.prompt(buildPromptPayload(promptText, images, delivery === "steer" ? "steer" : "followUp")).catch((err) => {
         emitSessionError(openCodeId, err, cwd);
         promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} steering acknowledgement failed`);
