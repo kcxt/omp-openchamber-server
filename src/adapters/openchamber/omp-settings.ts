@@ -14,10 +14,9 @@
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getOmpRuntimeInfo } from "../../providers/omp/binary";
 import { normalizeModelsResponse, withOmpRpc } from "../../providers/omp/rpc";
 import { listOmpConfig, listOmpSetKeys, resetOmpConfigKey, setOmpConfigValue } from "../../vendor/kabmo/config-cli";
-import schema from "./omp-settings-schema.json";
+import { loadSettingsSchema, refreshSettingsSchema, runningOmpVersion, schemaRefreshStatus } from "./omp-settings-schema";
 
 export interface SettingsRouteResult {
   status: number;
@@ -84,11 +83,36 @@ export async function handleOmpSettingsRoute(req: Request, path: string): Promis
 
   if (path === "/api/omp/settings" && req.method === "GET") {
     try {
-      const [entries, set, models] = await Promise.all([listOmpConfig(), listOmpSetKeys(), listModelSelectors()]);
+      const [entries, set, models, layout, ompVersion] = await Promise.all([
+        listOmpConfig(),
+        listOmpSetKeys(),
+        listModelSelectors(),
+        loadSettingsSchema(),
+        runningOmpVersion(),
+      ]);
+      const refresh = schemaRefreshStatus();
       return {
         status: 200,
-        data: { entries, set, models, themes: listCustomThemes(), schema, platform: process.platform, ompVersion: getOmpRuntimeInfo().version ?? null },
+        data: {
+          entries,
+          set,
+          models,
+          themes: listCustomThemes(),
+          schema: layout,
+          platform: process.platform,
+          ompVersion,
+          schemaRefresh: refresh.inFlight ? "in-flight" : refresh.error ? { error: refresh.error } : null,
+        },
       };
+    } catch (error) {
+      return fail(error);
+    }
+  }
+
+  if (path === "/api/omp/settings/schema/refresh" && req.method === "POST") {
+    try {
+      const [{ schema, refreshed, error }, ompVersion] = await Promise.all([refreshSettingsSchema(), runningOmpVersion()]);
+      return { status: refreshed ? 200 : 503, data: { refreshed, schema, ompVersion, ...(error ? { error } : {}) } };
     } catch (error) {
       return fail(error);
     }

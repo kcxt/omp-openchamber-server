@@ -6,7 +6,9 @@
  *
  *   bun scripts/gen-omp-settings-schema.ts [path/to/oh-my-pi]
  *
- * Writes src/adapters/openchamber/omp-settings-schema.json. Re-run it after
+ * Writes src/adapters/openchamber/omp-settings-schema.json (override the
+ * destination with --out <file>; the sidecar uses that to refresh its own
+ * snapshot when the running omp's version no longer matches). Re-run it after
  * bumping the omp release; the editor shows a notice when the snapshot's omp
  * version differs from the running binary and files unknown keys under
  * "Advanced".
@@ -102,6 +104,9 @@ const out = {
   themes,
   settings,
 };
-const target = join(import.meta.dir, "..", "src", "adapters", "openchamber", "omp-settings-schema.json");
+const outIndex = process.argv.indexOf("--out");
+const target = outIndex > -1 && process.argv[outIndex + 1]
+  ? resolve(process.argv[outIndex + 1]!)
+  : join(import.meta.dir, "..", "src", "adapters", "openchamber", "omp-settings-schema.json");
 writeFileSync(target, JSON.stringify(out, null, 1) + "\n");
 console.log(`${settings.length} settings in ${out.tabs.length} tabs (omp ${version}) -> ${target}`);

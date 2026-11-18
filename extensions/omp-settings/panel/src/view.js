@@ -6,7 +6,7 @@
 // "Advanced" with its raw key.
 //
 // `call(method, path, body)` is the only transport: GET /settings returns
-// { entries, set, models, schema, platform, ompVersion }; PUT /settings writes
+// { entries, set, models, schema, platform, ompVersion, schemaRefresh }; PUT /settings writes
 // one key; POST /settings/reset restores its default.
 
 const THINKING = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto'];
@@ -497,7 +497,14 @@ export function mountSettings({ call, root = document.body }) {
     modelList = data.models;
     themeList = [...new Set([...(data.schema.themes ?? []), ...(data.themes ?? [])])].sort();
     if (data.ompVersion && data.ompVersion !== data.schema.ompVersion) {
-      note.textContent = `Layout is from omp ${data.schema.ompVersion}; running ${data.ompVersion}. Newer settings are under Advanced.`;
+      const mismatch = `layout is from omp ${data.schema.ompVersion}, running ${data.ompVersion}`;
+      if (data.schemaRefresh === 'in-flight') {
+        note.textContent = `${mismatch}; rebuilding the layout from the omp checkout, reload shortly.`;
+      } else if (data.schemaRefresh && data.schemaRefresh.error) {
+        note.textContent = `${mismatch}; rebuild failed: ${data.schemaRefresh.error}. Newer settings are under Advanced.`;
+      } else {
+        note.textContent = `${mismatch}. Newer settings are under Advanced.`;
+      }
     }
     render();
   }).catch((e) => { status.textContent = e.message; });
