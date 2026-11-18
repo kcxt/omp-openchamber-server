@@ -33,6 +33,7 @@ import {
 import {
   promptSessionAsync,
   addSessionSyntheticContext,
+  applySessionModel,
   mimeFromPath,
   abortSession,
   compactSession,
@@ -1830,6 +1831,12 @@ const MIME_TYPES: Record<string, string> = {
             modelID,
             variant: typeof model?.variant === "string" ? model.variant : "default",
           };
+          const applied = await applySessionModel(sessionID, session.directory, modelRef);
+          if (applied.error) {
+            // omp rejected the model: don't record it as the session's model,
+            // or the picker would show a model the session never runs.
+            return jsonError(applied.error, 502);
+          }
           const updated = await backend.store.update(sessionID, { model: modelRef }, session.directory);
           if (!updated) return jsonError("session not found", 404);
           emitOpenCodeV2Event("session.model.selected", {
@@ -2189,7 +2196,7 @@ const MIME_TYPES: Record<string, string> = {
           agents: Array.isArray(body?.agents) ? body.agents : undefined,
           skills: Array.isArray(body?.skills) ? body.skills : undefined,
           delivery: body?.delivery === "steer" ? "steer" : body?.delivery === "queue" ? "queue" : undefined,
-        });
+        }, session.model);
         if (result.queued) return noContent();
         return jsonError(result.error ?? "command failed", result.status ?? 400);
       } catch (err) {
@@ -2415,7 +2422,7 @@ const MIME_TYPES: Record<string, string> = {
         const input = asRecord(body);
         const { session } = await resolveSessionRoute(sessionID, dir);
         if (!session) return jsonError("session not found", 404);
-        const result = await promptSessionAsync(sessionID, session.directory, session.path, body);
+        const result = await promptSessionAsync(sessionID, session.directory, session.path, body, session.model);
         if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
         const files = Array.isArray(input?.files) ? input.files.flatMap((entry) => {
           const file = asRecord(entry);
@@ -2457,7 +2464,7 @@ const MIME_TYPES: Record<string, string> = {
         const body = await readJson(req);
         const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const result = await promptSessionAsync(openCodeId, session.directory, session.path, body);
+        const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });
         return jsonError(result.error ?? "prompt failed", result.status ?? 400);
       } catch (err) {
@@ -2472,7 +2479,7 @@ const MIME_TYPES: Record<string, string> = {
         const body = await readJson(req);
         const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const result = await promptSessionAsync(openCodeId, session.directory, session.path, body);
+        const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });
         return jsonError(result.error ?? "prompt failed", result.status ?? 400);
       } catch (err) {

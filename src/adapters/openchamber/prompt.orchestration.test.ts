@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   abortSession,
+  applySessionModel,
   getSessionStatusMap,
   isSessionBusy,
   promptSessionAsync,
@@ -24,6 +25,7 @@ class FakeTransport implements OmpRpcTransport {
   switchSessionCalls: string[] = [];
   kills = 0;
   abortError: Error | undefined;
+  setModelError: Error | undefined;
   subagents: Array<{ id: string; status: BackendSubagentStatus }> = [];
   subagentsError: Error | undefined;
 
@@ -41,6 +43,8 @@ class FakeTransport implements OmpRpcTransport {
         return Promise.resolve({ model: { provider: "vllm", id: "qwen3.8-27b", variant: "default" } });
       case "abort":
         return this.abortError ? Promise.reject(this.abortError) : Promise.resolve();
+      case "set_model":
+        return this.setModelError ? Promise.reject(this.setModelError) : Promise.resolve();
       case "get_subagents":
         return this.subagentsError
           ? Promise.reject(this.subagentsError)
@@ -139,7 +143,7 @@ test("passes direct caller-owned credentials only to the OMP transport path", as
     },
   });
 
-  expect(result).toEqual({ queued: true });
+  expect(result).toEqual({ queued: true, messageID: expect.any(String) });
   await waitFor(() => receivedCredential !== undefined);
   expect(receivedCredential).toEqual({
     providerID: "vllm",
@@ -179,7 +183,7 @@ test("resolves credentialRef before creating the OMP transport", async () => {
     credentialRef: "cred_workspace_1",
   });
 
-  expect(result).toEqual({ queued: true });
+  expect(result).toEqual({ queued: true, messageID: expect.any(String) });
   await waitFor(() => receivedCredential !== undefined);
   expect(receivedCredential).toMatchObject({ providerID: "vllm", apiKey: "resolved-key" });
   const transport = lastTransport();
@@ -190,7 +194,7 @@ test("resolves credentialRef before creating the OMP transport", async () => {
     model: { providerID: "vllm", modelID: "qwen" },
     credentialRef: "cred_workspace_1",
   });
-  expect(second).toEqual({ queued: true });
+  expect(second).toEqual({ queued: true, messageID: expect.any(String) });
   expect(lastTransport()).toBe(transport);
   expect(resolverCalls).toBe(1);
   await completePrompt(transport, openCodeId, cwd);
@@ -251,7 +255,7 @@ describe("promptSessionAsync orchestration", () => {
     expect(c.status).toBe(400);
 
     const d = await promptSessionAsync("w", "/c", "/s", {
-      delivery: "queue",
+      delivery: "sideways",
       parts: [{ type: "text", text: "unsupported delivery" }],
     });
     expect(d.status).toBe(400);
@@ -266,7 +270,7 @@ describe("promptSessionAsync orchestration", () => {
     const a = await promptSessionAsync("a", "/c", "/s", { parts: [] });
     expect(a).toEqual({ queued: false, error: "no text parts", status: 400 });
 
-    const b = await promptSessionAsync("b", "/c", "/s", { parts: [{ type: "text" }, { type: "file", url: "x" }] });
+    const b = await promptSessionAsync("b", "/c", "/s", { parts: [{ type: "text" }] });
     expect(b.status).toBe(400);
 
     expect(created.length).toBe(before);
@@ -282,7 +286,7 @@ describe("promptSessionAsync orchestration", () => {
       model: { providerID: "vllm", modelID: "qwen" },
       variant: "thinking",
     });
-    expect(res).toEqual({ queued: true });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
 
     const t = lastTransport();
     expect(t.switchSessionCalls).toEqual([sessionPath]);
@@ -306,15 +310,16 @@ describe("promptSessionAsync orchestration", () => {
     expect(status[1].properties).toEqual({ sessionID: openCodeId, status: { type: "idle" } });
 
     const updated = events.filter((e) => e.type === "message.updated");
-    expect(updated).toHaveLength(2);
-    expect(info(updated[0]).model).toEqual({ id: "qwen", providerID: "vllm", modelID: "qwen", variant: "thinking" });
-    expect(info(updated[0]).finish).toBeUndefined();
-    expect(info(updated[1]).finish).toBe("stop");
-    expect(info(updated[1]).time?.completed).toBeTypeOf("number");
+    expect(updated.map((e) => info(e).role)).toEqual(["user", "assistant", "assistant"]);
+    expect(info(updated[1]).model).toEqual({ id: "qwen", providerID: "vllm", modelID: "qwen", variant: "thinking" });
+    expect(info(updated[1]).finish).toBeUndefined();
+    expect(info(updated[2]).finish).toBe("stop");
+    expect(info(updated[2]).time?.completed).toBeTypeOf("number");
 
     const parts = events.filter((e) => e.type === "message.part.updated");
-    expect(parts).toHaveLength(1);
-    expect(part(parts[0])).toMatchObject({ type: "text", text: "Hello from OMP", sessionID: openCodeId });
+    expect(parts).toHaveLength(2);
+    expect(part(parts[0])).toMatchObject({ type: "text", text: "hello", sessionID: openCodeId });
+    expect(part(parts[1])).toMatchObject({ type: "text", text: "Hello from OMP", sessionID: openCodeId });
 
     const deltas = events.filter((e) => e.type === "message.part.delta");
     expect(deltas).toHaveLength(1);
@@ -324,7 +329,7 @@ describe("promptSessionAsync orchestration", () => {
     expect(t.kills).toBe(0);
   });
 
-  test("keeps synthetic prompt text as a separate user part", async () => {
+  test("injects synthetic prompt text into OMP without echoing it into the chat", async () => {
     installFakeFactory();
     const { openCodeId, cwd, sessionPath } = newSession();
     const { events, stop } = captureEvents();
@@ -337,27 +342,27 @@ describe("promptSessionAsync orchestration", () => {
         { type: "text", text: syntheticText, synthetic: true },
       ],
     });
-    expect(res).toEqual({ queued: true });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
 
     const t = lastTransport();
     await waitFor(() => t.requestCount("prompt") === 1);
     expect(t.requests.at(-1)?.params).toEqual({
-      message: `Review the docs.\n\n${syntheticText}`,
+      message: `${syntheticText}\n\nReview the docs.`,
     });
 
     const userParts = events
       .filter((event) => event.type === "message.part.updated")
       .map(part);
-    expect(userParts).toHaveLength(2);
+    expect(userParts).toHaveLength(1);
     expect(userParts[0]).toMatchObject({ type: "text", text: "Review the docs." });
     expect(userParts[0].synthetic).toBeUndefined();
-    expect(userParts[1]).toMatchObject({ type: "text", text: syntheticText, synthetic: true });
+    expect(userParts.some((p) => p.text === syntheticText)).toBe(false);
 
     await completePrompt(t, openCodeId, cwd);
     stop();
   });
 
-  test("second prompt on a busy session returns 409 and reuses the transport", async () => {
+  test("second prompt on a busy session queues on the same transport", async () => {
     installFakeFactory();
     const { openCodeId, cwd, sessionPath } = newSession();
 
@@ -367,11 +372,16 @@ describe("promptSessionAsync orchestration", () => {
     const before = created.length;
 
     const second = await promptSessionAsync(openCodeId, cwd, sessionPath, { parts: [{ type: "text", text: "two" }] });
-    expect(second).toEqual({ queued: false, error: "session busy", status: 409 });
+    expect(second).toEqual({ queued: true, messageID: expect.any(String) });
     expect(created.length).toBe(before);
-    expect(t.requestCount("prompt")).toBe(1);
+    const prompts = t.requests.filter((request) => request.method === "prompt");
+    expect(prompts).toHaveLength(2);
+    // No delivery asked for: omp holds it until the running turn ends.
+    expect(prompts[1].params).toEqual({ message: "two", streamingBehavior: "followUp" });
 
-    await completePrompt(t, openCodeId, cwd);
+    t.fire({ type: "agent_end" });
+    for (const prompt of t.promptSettlers()) prompt.resolve();
+    await waitFor(() => !isSessionBusy(openCodeId, cwd), 1000);
     expect(isSessionBusy(openCodeId, cwd)).toBe(false);
   });
 
@@ -384,7 +394,7 @@ describe("promptSessionAsync orchestration", () => {
       messageID: "msg_first",
       parts: [{ type: "text", text: "one" }],
     });
-    expect(first).toEqual({ queued: true });
+    expect(first).toEqual({ queued: true, messageID: expect.any(String) });
 
     const t = lastTransport();
     await waitFor(() => t.requestCount("prompt") === 1);
@@ -394,7 +404,7 @@ describe("promptSessionAsync orchestration", () => {
       delivery: "steer",
       parts: [{ type: "text", text: "two" }],
     });
-    expect(steer).toEqual({ queued: true });
+    expect(steer).toEqual({ queued: true, messageID: expect.any(String) });
     expect(isSessionBusy(openCodeId, cwd)).toBe(true);
 
     const promptRequests = t.requests.filter((request) => request.method === "prompt");
@@ -423,7 +433,7 @@ describe("promptSessionAsync orchestration", () => {
     const res = await promptSessionAsync(openCodeId, cwd, sessionPath, {
       parts: [{ type: "text", text: "delegate" }],
     });
-    expect(res).toEqual({ queued: true });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
 
     const t = lastTransport();
     t.subagents = [{ id: "child-2", status: "running" }];
@@ -458,8 +468,9 @@ describe("promptSessionAsync orchestration", () => {
 
     expect(t.kills).toBe(0);
     const parts = events.filter((e) => e.type === "message.part.updated");
-    expect(parts).toHaveLength(1);
-    expect(part(parts[0]).text).toBe("Prompt failed: model down");
+    expect(parts).toHaveLength(2);
+    expect(part(parts[0]).text).toBe("go");
+    expect(part(parts[1]).text).toBe("Prompt failed: model down");
     const messages = events.filter((e) => e.type === "message.updated");
     expect(info(messages[messages.length - 1]).finish).toBe("error");
     expect(info(messages[messages.length - 1]).error).toEqual({ message: "model down" });
@@ -495,10 +506,13 @@ describe("promptSessionAsync orchestration", () => {
     stop();
 
     const messages = events.filter((e) => e.type === "message.updated");
-    expect(messages).toHaveLength(2);
+    expect(messages.map((e) => info(e).role)).toEqual(["user", "assistant", "assistant"]);
     expect(info(messages[messages.length - 1]).finish).toBe("error");
     expect(info(messages[messages.length - 1]).error).toEqual({ message: "context limit" });
-    expect(events.filter((e) => e.type === "message.part.updated")).toHaveLength(1);
+    const parts = events.filter((e) => e.type === "message.part.updated");
+    expect(part(parts[0]).text).toBe("go");
+    expect(part(parts[1]).text).toContain("context limit");
+    expect(parts.some((e) => String(part(e).text).startsWith("Prompt failed:"))).toBe(false);
     expect(events.filter((e) => e.type === "session.error")).toHaveLength(1);
     expect(events.filter((e) => e.type === "session.idle")).toHaveLength(1);
   });
@@ -652,5 +666,114 @@ describe("promptSessionAsync orchestration", () => {
       },
     });
     expect(lastAsst.cost).toBe(0.015);
+  });
+});
+
+describe("session model routing", () => {
+  test("applies the session's model when the prompt body carries none, and only once", async () => {
+    installFakeFactory();
+    const { openCodeId, cwd, sessionPath } = newSession();
+
+    const first = await promptSessionAsync(openCodeId, cwd, sessionPath,
+      { parts: [{ type: "text", text: "hi" }] },
+      { providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "high" });
+    expect(first).toEqual({ queued: true, messageID: expect.any(String) });
+
+    const t = lastTransport();
+    await waitFor(() => t.requestCount("prompt") === 1);
+    expect(t.requests.map((r) => r.method)).toEqual(["get_state", "set_model", "set_thinking_level", "prompt"]);
+    expect(t.requests[1].params).toEqual({ provider: "anthropic", modelId: "claude-sonnet-5-5" });
+    expect(t.requests[2].params).toEqual({ level: "high" });
+    await completePrompt(t, openCodeId, cwd);
+
+    // Same child, same picked model: nothing to re-assert.
+    const second = await promptSessionAsync(openCodeId, cwd, sessionPath,
+      { parts: [{ type: "text", text: "again" }] },
+      { providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "high" });
+    expect(second).toEqual({ queued: true, messageID: expect.any(String) });
+    await waitFor(() => t.requestCount("prompt") === 2);
+    expect(t.requestCount("set_model")).toBe(1);
+    expect(t.requestCount("set_thinking_level")).toBe(1);
+    await completePrompt(t, openCodeId, cwd);
+  });
+
+  test("a session with no recorded model keeps the child on its own model", async () => {
+    installFakeFactory();
+    const { openCodeId, cwd, sessionPath } = newSession();
+
+    const res = await promptSessionAsync(openCodeId, cwd, sessionPath,
+      { parts: [{ type: "text", text: "hi" }] },
+      { providerID: "omp", modelID: "omp", variant: "default" });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
+
+    const t = lastTransport();
+    await waitFor(() => t.requestCount("prompt") === 1);
+    expect(t.requests.map((r) => r.method)).toEqual(["get_state", "prompt"]);
+    await completePrompt(t, openCodeId, cwd);
+  });
+
+  test("matching the child's model skips the switch but still sets the effort", async () => {
+    installFakeFactory();
+    const { openCodeId, cwd, sessionPath } = newSession();
+
+    const res = await promptSessionAsync(openCodeId, cwd, sessionPath,
+      { parts: [{ type: "text", text: "hi" }] },
+      { providerID: "vllm", modelID: "qwen3.8-27b", variant: "xhigh" });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
+
+    const t = lastTransport();
+    await waitFor(() => t.requestCount("prompt") === 1);
+    expect(t.requests.map((r) => r.method)).toEqual(["get_state", "set_thinking_level", "prompt"]);
+    expect(t.requests[1].params).toEqual({ level: "xhigh" });
+    await completePrompt(t, openCodeId, cwd);
+  });
+
+  test("a variant omp has no level for is left to omp", async () => {
+    installFakeFactory();
+    const { openCodeId, cwd, sessionPath } = newSession();
+
+    const res = await promptSessionAsync(openCodeId, cwd, sessionPath,
+      { parts: [{ type: "text", text: "hi" }] },
+      { providerID: "anthropic", modelID: "claude-sonnet-5-5", variant: "default" });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
+
+    const t = lastTransport();
+    await waitFor(() => t.requestCount("prompt") === 1);
+    expect(t.requests.map((r) => r.method)).toEqual(["get_state", "set_model", "prompt"]);
+    await completePrompt(t, openCodeId, cwd);
+  });
+
+  test("applySessionModel reports omp's rejection instead of pretending it took", async () => {
+    installFakeFactory();
+    const { openCodeId, cwd, sessionPath } = newSession();
+
+    const res = await promptSessionAsync(openCodeId, cwd, sessionPath, { parts: [{ type: "text", text: "hi" }] });
+    expect(res).toEqual({ queued: true, messageID: expect.any(String) });
+    const t = lastTransport();
+    await waitFor(() => t.requestCount("prompt") === 1);
+
+    t.setModelError = new Error("Model not found: vllm/does-not-exist");
+    const applied = await applySessionModel(openCodeId, cwd, {
+      providerID: "vllm",
+      modelID: "does-not-exist",
+      variant: "default",
+    });
+    expect(applied.applied).toBe(false);
+    expect(applied.error).toContain("could not switch to vllm/does-not-exist");
+    expect(applied.error).toContain("Model not found");
+
+    t.setModelError = undefined;
+    t.fire({ type: "agent_end" });
+    t.promptSettler()?.resolve();
+    await waitFor(() => !isSessionBusy(openCodeId, cwd), 1000);
+  });
+
+  test("applySessionModel with no live child is a no-op, not an error", async () => {
+    const applied = await applySessionModel("sess_absent", "/tmp/fake-cwd-absent", {
+      providerID: "anthropic",
+      modelID: "claude-sonnet-5-5",
+      variant: "high",
+    });
+    expect(applied).toEqual({ applied: false });
   });
 });

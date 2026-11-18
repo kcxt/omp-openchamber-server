@@ -160,6 +160,9 @@ export function createOmpTurnConnection(transport: OmpRpcTransport, ctx: OmpTurn
     setModel(providerID: string, modelID: string) {
       return transport.request("set_model", { provider: providerID, modelId: modelID });
     },
+    setThinkingLevel(level: string) {
+      return transport.request("set_thinking_level", { level });
+    },
     compact() {
       return transport.request("compact", {});
     },

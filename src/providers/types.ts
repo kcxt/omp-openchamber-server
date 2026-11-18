@@ -372,6 +372,8 @@ export interface BackendTurnConnection {
   onEvent(sink: (event: NormalizedTurnEvent) => void): () => void;
   prompt(input: TurnPromptInput): Promise<unknown>;
   setModel(providerID: string, modelID: string): Promise<unknown>;
+  /** Reasoning effort for the live model, when the backend exposes one. */
+  setThinkingLevel?(level: string): Promise<unknown>;
   /** Compacts through the existing backend connection when supported. */
   compact?(): Promise<unknown>;
   /** Model currently configured on the backend session, if discoverable. */

@@ -481,6 +481,23 @@ function defaultModelRef(overrides?: Partial<ModelRef>): ModelRef {
   };
 }
 
+/** omp `set_thinking_level` accepts these; anything else stays on omp's own level. */
+const ompThinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function ompThinkingLevel(variant: string | undefined): string | undefined {
+  const level = variant?.trim().toLowerCase();
+  if (!level) return undefined;
+  if (level === "none") return "off";
+  return ompThinkingLevels.has(level) ? level : undefined;
+}
+
+/** The omp store's stand-in for a session with no recorded model. */
+function hasRealModel(model: Partial<ModelRef> | undefined): model is ModelRef {
+  return typeof model?.providerID === "string"
+    && typeof model?.modelID === "string"
+    && !(model.providerID === "omp" && model.modelID === "omp");
+}
+
 function emitAssistantInfo(
   openCodeId: string,
   messageID: string,
@@ -1107,11 +1124,70 @@ async function getOrCreateSessionState(
   sessionStates.set(key, state);
   return state;
 }
+
+/**
+ * Pushes the model the user picked onto the live omp child.
+ *
+ * The model switch is strict: a turn must never run on whatever model the child
+ * booted with (omp's configured default role). The reasoning effort is best
+ * effort — omp clamps it to what the active model supports, and a level omp
+ * rejects must not cancel an otherwise valid turn.
+ */
+async function applyModelRef(state: SessionState, model: ModelRef, strict: boolean): Promise<void> {
+  const sameModel = state.currentModel.providerID === model.providerID
+    && state.currentModel.modelID === model.modelID;
+  if (!sameModel) {
+    try {
+      await state.conn.setModel(nativeProviderID(model.providerID), model.modelID);
+    } catch (err) {
+      if (!strict) {
+        promptLogger.error({ err, sessionID: state.openCodeId }, `[prompt] ${state.openCodeId} set_model failed`);
+        return;
+      }
+      // The turn is aborted: tag the failure with the model the user asked for,
+      // not the one the child would otherwise have used.
+      state.currentModel = defaultModelRef(model);
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(`could not switch to ${model.providerID}/${model.modelID}: ${reason}`);
+    }
+  }
+  const level = ompThinkingLevel(model.variant);
+  // A model switch resets the effort to that model's default, so re-assert it.
+  if (level && state.conn.setThinkingLevel && (level !== ompThinkingLevel(state.currentModel.variant) || !sameModel)) {
+    await state.conn.setThinkingLevel(level).catch((err) => {
+      promptLogger.warn({ err, sessionID: state.openCodeId, level }, `[prompt] ${state.openCodeId} thinking level ${level} rejected`);
+    });
+  }
+  state.currentModel = defaultModelRef(model);
+}
+
+/**
+ * Applies a model the user just picked to this session's live child, if it has
+ * one. With no live child there is nothing to push: the next prompt reads the
+ * stored model back out of the session record and applies it then.
+ */
+export async function applySessionModel(
+  openCodeId: string,
+  cwd: string,
+  model: ModelRef,
+): Promise<{ applied: boolean; error?: string }> {
+  const state = sessionStates.get(sessionKey(openCodeId, cwd));
+  if (!state || state.conn.isAlive?.() === false) return { applied: false };
+  try {
+    await applyModelRef(state, model, true);
+    return { applied: true };
+  } catch (err) {
+    return { applied: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function promptSessionAsync(
   openCodeId: string,
   cwd: string,
   sessionPath: string,
   body: unknown,
+  /** The session's own model, from the session record the route already resolved. */
+  sessionModel?: Partial<ModelRef>,
 ): Promise<{ queued: boolean; messageID?: string; error?: string; status?: number }> {
   if (!isPromptBody(body)) {
     return { queued: false, error: "invalid body", status: 400 };
@@ -1141,13 +1217,23 @@ export async function promptSessionAsync(
     return { queued: false, status: 400, error: "model provider does not belong to this session's backend" };
   }
 
-  const modelRef = body.model?.providerID && body.model?.modelID
-    ? {
+  // OpenCode's v2 prompt body carries no model field: the model the user picked
+  // lives on the session record (set at create, or by POST /session/:id/model).
+  // Falling back to it is what makes that pick real — without it every turn ran
+  // on whatever model the omp child booted with, i.e. omp's default role.
+  const modelRef: ModelRef | undefined = body.model?.providerID && body.model?.modelID
+    ? defaultModelRef({
         providerID: nativeProviderID(body.model.providerID),
         modelID: body.model.modelID,
         variant: body.variant ?? "default",
-      }
-    : undefined;
+      })
+    : hasRealModel(sessionModel)
+      ? defaultModelRef({
+          providerID: nativeProviderID(sessionModel.providerID),
+          modelID: sessionModel.modelID,
+          variant: sessionModel.variant ?? "default",
+        })
+      : undefined;
   const hasCredentials = body.credentials !== undefined;
   const hasCredentialRef = body.credentialRef !== undefined;
   if (hasCredentials && hasCredentialRef) {
@@ -1190,14 +1276,9 @@ export async function promptSessionAsync(
       const parentMessageID = body.id ?? body.messageID ?? makeMessageId(openCodeId);
       syntheticContext.delete(contextKey);
       recordAndEmitUserPrompt(state, parentMessageID, userPromptText, userPromptTextParts, body);
-      if (modelRef) {
-        state.currentModel = defaultModelRef(modelRef);
-        // The turn already running keeps its model; omp applies this to the
-        // turns that follow. A failure here must not drop the steered message.
-        await state.conn.setModel(modelRef.providerID, modelRef.modelID).catch((err) => {
-          promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} set_model failed for queued prompt`);
-        });
-      }
+      // The turn already running keeps its model; omp applies this to the turns
+      // that follow. A failure here must not drop the steered message.
+      if (modelRef) await applyModelRef(state, modelRef, false);
       void state.conn.prompt(buildPromptPayload(promptText, images, delivery === "steer" ? "steer" : "followUp")).catch((err) => {
         emitSessionError(openCodeId, err, cwd);
         promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} steering acknowledgement failed`);
@@ -1212,10 +1293,6 @@ export async function promptSessionAsync(
     const parentMessageID = body.id ?? body.messageID ?? makeMessageId(openCodeId);
     syntheticContext.delete(contextKey);
 
-    if (modelRef) {
-      state.currentModel = defaultModelRef(modelRef);
-    }
-
     recordAndEmitUserPrompt(state, parentMessageID, userPromptText, userPromptTextParts, body);
 
     (async () => {
@@ -1228,22 +1305,15 @@ export async function promptSessionAsync(
       };
 
       try {
+        // Apply the picked model before subscribing: the handler tags every
+        // assistant event with the model it captured, and the turn must never
+        // run on whatever model the child booted with (omp's default role).
+        if (modelRef) await applyModelRef(state, modelRef, true);
+
         state.unsubscribe();
         state.unsubscribe = state.conn.onEvent(
           createEventHandler(openCodeId, parentMessageID, state.currentModel, complete, cwd, state.pendingInbox),
         );
-
-        if (modelRef) {
-          try {
-            await state.conn.setModel(nativeProviderID(modelRef.providerID), modelRef.modelID);
-          } catch (err) {
-            promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} set_model failed`);
-            // Never run the turn on whatever model the child already holds
-            // (its default role): the user picked this one.
-            const reason = err instanceof Error ? err.message : String(err);
-            throw new Error(`could not switch to ${modelRef.providerID}/${modelRef.modelID}: ${reason}`);
-          }
-        }
 
         await state.conn.prompt(
           buildPromptPayload(promptText, images, body.delivery === "steer" ? "steer" : undefined),
