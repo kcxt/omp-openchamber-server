@@ -42,6 +42,7 @@ import {
   shutdownAll,
 } from "./adapters/openchamber/prompt";
 import { page, toV2FileAttachment, toV2Message, toV2Session } from "./adapters/openchamber/v2";
+import { attachOmpRecapAssist } from "./providers/omp/recap";
 import { readSessionTodos } from "./providers/omp/todo";
 import { invalidateMessageCache } from "./providers/omp/messages";
 import { getSidecarExtensionPaths, MissingWorkingDirectoryError, withOmpRpc } from "./providers/omp/rpc";
@@ -1641,7 +1642,7 @@ const MIME_TYPES: Record<string, string> = {
             limit: limit != null ? parseInt(limit, 10) : undefined,
             search,
           });
-          return json(sessions);
+          return json(attachOmpRecapAssist(sessions));
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "list failed", 500);
         }
@@ -1669,8 +1670,8 @@ const MIME_TYPES: Record<string, string> = {
           const order = url.searchParams.get("order") === "asc" ? "asc" : "desc";
           const requestedLimit = limit == null ? 100 : Number.parseInt(limit, 10);
           const pageLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 500)) : 100;
-          const currentPage = page(ordered.map(toV2Session), pageLimit, url.searchParams.get("cursor"), order);
-          return json({ data: currentPage.data, cursor: currentPage.cursor });
+          const currentPage = page(ordered, pageLimit, url.searchParams.get("cursor"), order);
+          return json({ data: attachOmpRecapAssist(currentPage.data).map(toV2Session), cursor: currentPage.cursor });
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "list failed", 500);
         }
@@ -1914,7 +1915,7 @@ const MIME_TYPES: Record<string, string> = {
           try {
             const { session } = await resolveSessionRoute(openCodeId, dir);
             if (!session) return jsonError("session not found", 404);
-            return json({ data: toV2Session(session) });
+            return json({ data: toV2Session(attachOmpRecapAssist([session])[0] ?? session) });
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "lookup failed", 500);
         }
