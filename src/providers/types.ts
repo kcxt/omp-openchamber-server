@@ -307,6 +307,8 @@ export type NormalizedTurnEvent =
   | { kind: "text_delta"; text: string }
   | { kind: "reasoning_delta"; text: string }
   | { kind: "tool"; callID: string; tool?: string; state: ToolPartState }
+  /** Partial tool arguments as the model streams them (`toolcall_delta`). */
+  | { kind: "tool_input_delta"; callID: string; tool?: string; delta: string }
   | { kind: "usage"; tokens: TokenBreakdown; cost: number }
   | { kind: "telemetry"; telemetry: TurnTelemetry }
   | { kind: "model"; model: ModelRef }

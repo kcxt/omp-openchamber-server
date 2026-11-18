@@ -912,6 +912,21 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       const tool = getToolName(assistantMessageEvent);
       const existing = toolParts.get(toolCallId);
       const resolvedTool = tool ?? existing?.tool;
+      // Argument text arrives as a partial-JSON stream (`toolcall_delta`). A
+      // re-sent part snapshot cannot carry it, so it goes out as
+      // session.tool.input.delta and the tool card fills in as it streams.
+      if (eventType === "toolcall_delta") {
+        const delta = typeof assistantMessageEvent.delta === "string" ? assistantMessageEvent.delta : "";
+        const known = getToolCallId(assistantMessageEvent) ?? [...toolParts.keys()].pop();
+        if (!delta || !known || !toolParts.has(known)) return;
+        emit({
+          kind: "tool_input_delta",
+          callID: known,
+          ...(resolvedTool ? { tool: resolvedTool } : {}),
+          delta,
+        });
+        return;
+      }
       const state = reduceToolPartState(existing?.state, assistantMessageEvent, Date.now(), resolvedTool);
       toolParts.set(toolCallId, { tool: resolvedTool ?? "tool", state });
       emit({ kind: "tool", callID: toolCallId, tool: resolvedTool, state });

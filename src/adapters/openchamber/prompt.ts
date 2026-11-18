@@ -852,6 +852,13 @@ export function createEventHandler(
         emitToolPart(event.callID, event.tool, event.state);
         return;
       }
+      case "tool_input_delta": {
+        // The tool card already exists (toolcall_start opened it); its argument
+        // text fills in live instead of appearing whole when the call ends.
+        ensureStarted();
+        emitMessagePartDelta(openCodeId, assistantMessageID!, event.callID, event.delta, cwd, "raw");
+        return;
+      }
       case "todo": {
         emitTodoUpdated(openCodeId, event.todos, cwd);
         return;
