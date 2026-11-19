@@ -2,7 +2,7 @@
  * OpenChamber adapter boundary.
  *
  * The adapter owns the OpenCode/OpenChamber compatibility surface while the
- * provider packages remain usable by the Jarvis adapter and other callers.
+ * provider packages remain usable by other callers.
  */
 export * from "./approvals";
 export * from "./browser-control";

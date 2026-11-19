@@ -1,4 +1,4 @@
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { MissingWorkingDirectoryError, withOmpRpc } from "./rpc";
@@ -14,6 +14,7 @@ import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-norma
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import { resolveImageDataUrl, isBlobRef } from "../../shared/blobs";
 import type {
+  OpenCodeSession,
   OpenCodeFilePart,
   OpenCodeMessageRecord,
   OpenCodePart,
@@ -296,9 +297,22 @@ const TTL_MS = 5_000;
 interface CacheEntry {
   messages: OpenCodeMessageRecord[];
   at: number;
+  /** Transcript the messages were read from, and its `mtime:size` then: any append or rewrite by omp invalidates the entry. */
+  path?: string;
+  stamp?: string;
+}
+
+async function fileStamp(path: string): Promise<string | undefined> {
+  try {
+    const info = await stat(path);
+    return `${info.mtimeMs}:${info.size}`;
+  } catch {
+    return undefined;
+  }
 }
 
 const messageCache = new Map<string, CacheEntry>();
+const loadedFrom = new Map<string, { path: string; stamp: string | undefined }>();
 const inflightLoads = new Map<string, Promise<OpenCodeMessageRecord[]>>();
 
 function cacheKey(openCodeId: string, cwd: string): string {
@@ -359,6 +373,36 @@ function findRawMessageBoundary(
 }
 
 /**
+ * The lines to keep when cutting the transcript at `boundary` (a line index).
+ * omp reads the last tree entry of the file as the conversation's leaf, so
+ * branches abandoned earlier (`/tree`, an earlier edit) must not end up last:
+ * they stay, but ahead of the entries of the active branch, whose last kept
+ * entry is then the leaf. Header, title slot and the sidecar's own markers
+ * (no `id`) stay first, in their original order.
+ */
+function retainBeforeBoundary(lines: string[], boundary: number): string[] {
+  const parsed = lines.map((line) => {
+    try {
+      return line.trim() ? (JSON.parse(line) as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  });
+  const onActiveBranch = activeBranchFilter(parsed.filter((r): r is Record<string, unknown> => r !== null));
+  const flat: string[] = [];
+  const abandoned: string[] = [];
+  const active: string[] = [];
+  for (let index = 0; index < boundary; index++) {
+    const line = lines[index]!;
+    if (line.length === 0) continue;
+    const record = parsed[index];
+    if (!record || typeof record.id !== "string" || record.type === "session") flat.push(line);
+    else (onActiveBranch(record) ? active : abandoned).push(line);
+  }
+  return [...flat, ...abandoned, ...active];
+}
+
+/**
  * Commit a staged revert by removing its boundary message and everything after
  * it from OMP's append-only transcript. The target id exposed to OpenCode may
  * be the optimistic client id, so resolve it through the persisted message map
@@ -390,7 +434,7 @@ export async function truncateOmpSessionAtMessage(
 
   // Preserve all prior records (including the OMP session header and title
   // slot), then append a durable clear marker for any staged revert.
-  const retained = lines.slice(0, boundary).filter((line) => line.length > 0);
+  const retained = retainBeforeBoundary(lines, boundary);
   retained.push(JSON.stringify({ type: "revert_change", timestamp: new Date().toISOString(), revert: null }));
   const tempPath = join(dirname(session.path), `.${randomUUID()}.revert.tmp`);
   try {
@@ -454,7 +498,7 @@ export async function forkOmpSession(
   });
 
   const child = await createOmpSession(parent.directory, {
-    parentID: parent.id,
+    forkOf: parent.id,
     title: `Fork of ${parent.title ?? parent.id}`,
     agent: parent.agent,
     model: parent.model,
@@ -1153,6 +1197,34 @@ function extractMessagesFromRpcResponse(raw: unknown): unknown {
   return raw;
 }
 
+/**
+ * omp's transcript is a tree (`id`/`parentId`) whose active leaf is the last
+ * entry appended; `/tree`, `/branch` and edits leave abandoned branches in the
+ * file. Only the path from the leaf to the root is the conversation. Records
+ * without an `id` (the header, title slot, and the sidecar's own markers) are
+ * not tree nodes and pass through; a file with no tree ids at all is linear.
+ */
+function activeBranchFilter(records: Record<string, unknown>[]): (entry: Record<string, unknown>) => boolean {
+  // A tree node carries `id` and `parentId` (null at the root). Older files, and
+  // anything the sidecar appends, lack `parentId` and are never filtered.
+  const isNode = (entry: Record<string, unknown>) =>
+    typeof entry.id === "string" && entry.type !== "session" && "parentId" in entry;
+  const byId = new Map<string, Record<string, unknown>>();
+  let leaf: Record<string, unknown> | undefined;
+  for (const entry of records) {
+    if (!isNode(entry)) continue;
+    byId.set(entry.id as string, entry);
+    leaf = entry;
+  }
+  if (!leaf) return () => true;
+  const active = new Set<string>();
+  for (let node: Record<string, unknown> | undefined = leaf; node && !active.has(node.id as string);) {
+    active.add(node.id as string);
+    node = typeof node.parentId === "string" ? byId.get(node.parentId) : undefined;
+  }
+  return (entry) => !isNode(entry) || active.has(entry.id as string);
+}
+
 // Fast path: read the omp session JSONL directly from disk.
 //
 // The previous implementation (loadFromRpc) spawned a transient
@@ -1185,18 +1257,21 @@ export async function loadMessagesFromFile(
   const messages: AgentMessage[] = [];
   let hasSessionHeader = false;
 
+  const records: Record<string, unknown>[] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-
-    let entry: Record<string, unknown>;
     try {
-      entry = JSON.parse(trimmed) as Record<string, unknown>;
+      records.push(JSON.parse(trimmed) as Record<string, unknown>);
     } catch {
       continue;
     }
+  }
+  const onActiveBranch = activeBranchFilter(records);
 
+  for (const entry of records) {
     if (entry.type === "session") hasSessionHeader = true;
+    if (!onActiveBranch(entry)) continue;
 
     if (entry.type === "compaction") {
       let timestamp = typeof entry.timestamp === "number" ? entry.timestamp : undefined;
@@ -1268,7 +1343,7 @@ export async function loadSessionMessages(
   const key = cacheKey(openCodeId, cwd);
   const now = Date.now();
   const cached = messageCache.get(key);
-  if (cached && now - cached.at < TTL_MS) {
+  if (cached && now - cached.at < TTL_MS && (!cached.path || (await fileStamp(cached.path)) === cached.stamp)) {
     return cached.messages;
   }
 
@@ -1280,6 +1355,7 @@ export async function loadSessionMessages(
     if (!session) {
       throw new Error(`no session found for ${openCodeId} in ${cwd}`);
     }
+    loadedFrom.set(key, { path: session.path, stamp: await fileStamp(session.path) });
     const fromFile = await loadMessagesFromFile(session.path, openCodeId, dbPath);
     if (fromFile !== null) return fromFile;
     return loadFromRpc(openCodeId, cwd, dbPath);
@@ -1291,7 +1367,7 @@ export async function loadSessionMessages(
 
   try {
     const messages = await promise;
-    messageCache.set(key, { messages, at: Date.now() });
+    messageCache.set(key, { messages, at: Date.now(), ...loadedFrom.get(key) });
     return messages;
   } finally {
     inflightLoads.delete(key);

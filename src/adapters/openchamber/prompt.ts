@@ -103,6 +103,8 @@ interface SessionState {
    * appends in the same order it accepted them, so a FIFO pop is the match.
    */
   pendingInbox: string[];
+  /** Releases the child once it has been idle for OC_CHILD_IDLE_MS. */
+  idleTimer?: ReturnType<typeof setTimeout>;
 }
 
 function sessionKey(openCodeId: string, cwd: string): string {
@@ -111,6 +113,65 @@ function sessionKey(openCodeId: string, cwd: string): string {
 
 const sessionStates = new Map<string, SessionState>();
 const sessionBusyLocks = new Set<string>();
+/**
+ * How long an idle omp child keeps its session. omp owns a session through a
+ * lease held for as long as its process lives, so an idle child that lingers
+ * makes a terminal omp resuming the same session fork it instead of taking it
+ * over. 0 keeps children until the sidecar stops.
+ */
+function childIdleMs(): number {
+  const configured = Number(process.env.OC_CHILD_IDLE_MS);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 120_000;
+}
+
+function cancelIdleRelease(state: SessionState): void {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  state.idleTimer = undefined;
+}
+
+function scheduleIdleRelease(state: SessionState): void {
+  cancelIdleRelease(state);
+  const ms = childIdleMs();
+  if (ms === 0) return;
+  state.idleTimer = setTimeout(() => void releaseIdleChild(state), ms);
+  state.idleTimer.unref?.();
+}
+
+async function releaseIdleChild(state: SessionState): Promise<void> {
+  const key = sessionKey(state.openCodeId, state.cwd);
+  const release = await acquireSessionLock(key);
+  try {
+    if (sessionStates.get(key) !== state || state.busy) return;
+    // Background work (an async task, a subagent) may still wake the session.
+    const settled = await state.conn.isSettled?.().catch(() => false) ?? true;
+    if (!settled) return scheduleIdleRelease(state);
+    state.unsubscribe();
+    state.conn.kill();
+    clearSubagentStatuses(key);
+    sessionStates.delete(key);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * omp moves a session to a sibling transcript when another live process holds
+ * its lease. If this child did, the OpenChamber session continues in the new
+ * file; the original stays with whoever owns it.
+ */
+async function followMovedTranscript(state: SessionState): Promise<void> {
+  try {
+    const file = await state.conn.getSessionFile?.();
+    if (!file || file === state.sessionPath) return;
+    const backend = backendForSession(state.openCodeId);
+    await backend.store.adoptTranscript?.(state.openCodeId, file, state.cwd);
+    state.sessionPath = file;
+    promptLogger.info({ sessionID: state.openCodeId, file }, "[prompt] omp moved the session to a new transcript; following it");
+  } catch (err) {
+    promptLogger.warn({ err, sessionID: state.openCodeId }, "[prompt] could not check for a moved transcript");
+  }
+}
+
 const syntheticContext = new Map<string, Array<{ text: string; description?: string; metadata?: Record<string, unknown> }>>();
 
 interface SubagentStatusScope {
@@ -139,6 +200,7 @@ export function removeSessionState(openCodeId: string, cwd: string): void {
   clearSubagentStatuses(key);
   const state = sessionStates.get(key);
   if (state) {
+    cancelIdleRelease(state);
     state.unsubscribe();
     try {
       state.conn.kill();
@@ -469,8 +531,15 @@ function makeMessageId(openCodeId: string, suffix?: string): string {
   return `msg_${openCodeId}_${suffix ?? randomUUID().replace(/-/g, "")}`;
 }
 
-function makePartId(openCodeId: string, messageID: string, index: number): string {
-  return `part_${openCodeId}_${messageID}_${index}`;
+/**
+ * `ordinal` is the part's position among parts of the same type in its message,
+ * from 0: OpenChamber derives its own ids for text and reasoning parts from
+ * exactly that (`<message>:text:<ordinal>`), so live events and a transcript
+ * fetched later only merge into one part if the ordinals agree. The sse layer
+ * reads it back from the trailing digits.
+ */
+function makePartId(openCodeId: string, messageID: string, type: "text" | "reasoning", ordinal: number): string {
+  return `part_${openCodeId}_${messageID}_${type}_${ordinal}`;
 }
 
 function defaultModelRef(overrides?: Partial<ModelRef>): ModelRef {
@@ -727,6 +796,7 @@ export function createEventHandler(
   let activePartStartTime: number | undefined;
   let activePartText = "";
   let partIndex = 0;
+  const partOrdinals = { text: 0, reasoning: 0 };
   let hasStarted = false;
   let turnTelemetry: TurnTelemetry | undefined;
 
@@ -745,19 +815,17 @@ export function createEventHandler(
 
   const finalizeCurrentPart = () => {
     if (!currentPartType || !activePartId || !assistantMessageID) return;
-    if (currentPartType === "reasoning") {
-      const now = Date.now();
-      emitAssistantPart(
-        openCodeId,
-        assistantMessageID,
-        activePartId,
-        "reasoning",
-        activePartText,
-        cwd,
-        activePartStartTime ?? now,
-        now,
-      );
-    }
+    const now = Date.now();
+    emitAssistantPart(
+      openCodeId,
+      assistantMessageID,
+      activePartId,
+      currentPartType,
+      activePartText,
+      cwd,
+      activePartStartTime ?? now,
+      now,
+    );
     currentPartType = undefined;
     activePartId = undefined;
     activePartStartTime = undefined;
@@ -847,7 +915,7 @@ export function createEventHandler(
           finalizeCurrentPart();
           partIndex++;
           currentPartType = partType;
-          activePartId = makePartId(openCodeId, mid, partIndex);
+          activePartId = makePartId(openCodeId, mid, partType, partOrdinals[partType]++);
           activePartStartTime = Date.now();
           activePartText = deltaText;
           emitAssistantPart(openCodeId, mid, activePartId, partType, deltaText, cwd, activePartStartTime);
@@ -857,13 +925,17 @@ export function createEventHandler(
             emitMessagePartDelta(
               openCodeId,
               mid,
-              activePartId ?? makePartId(openCodeId, mid, partIndex),
+              activePartId ?? makePartId(openCodeId, mid, partType, 0),
               deltaText,
               cwd,
               partType,
             );
           }
         }
+        return;
+      }
+      case "part_end": {
+        finalizeCurrentPart();
         return;
       }
       case "tool": {
@@ -1028,6 +1100,8 @@ export function createEventHandler(
         assistantMessageID = undefined;
         assistantStartTime = undefined;
         partIndex = 0;
+        partOrdinals.text = 0;
+        partOrdinals.reasoning = 0;
         currentParentID = inboxID;
         return;
       }
@@ -1044,7 +1118,7 @@ export function createEventHandler(
             emitAssistantPart(
               openCodeId,
               assistantMessageID,
-              makePartId(openCodeId, assistantMessageID, 0),
+              makePartId(openCodeId, assistantMessageID, "text", 0),
               "text",
               errText,
               cwd,
@@ -1099,6 +1173,7 @@ async function getOrCreateSessionState(
     const mustReplace = dead || (auth !== undefined && existing.credentialFingerprint !== requestedCredentialFingerprint);
     if (!mustReplace) return existing;
 
+    cancelIdleRelease(existing);
     existing.unsubscribe();
     existing.conn.kill();
     sessionStates.delete(key);
@@ -1292,6 +1367,7 @@ export async function promptSessionAsync(
       return { queued: true, messageID: parentMessageID };
     }
 
+    cancelIdleRelease(state);
     state.busy = true;
     backendForSession(openCodeId).store.beforeTurn?.(openCodeId, cwd);
     emitSessionStatus(openCodeId, { type: "busy" }, cwd);
@@ -1369,11 +1445,16 @@ export async function promptSessionAsync(
           undefined,
           { message: errorMessage },
         );
-        emitAssistantPart(openCodeId, messageID, makePartId(openCodeId, messageID, 0), "text", `Prompt failed: ${errorMessage}`);
+        emitAssistantPart(openCodeId, messageID, makePartId(openCodeId, messageID, "text", 0), "text", `Prompt failed: ${errorMessage}`);
         promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} failed`);
       } finally {
         state.unsubscribe();
+        // Before going idle, so a refetch the idle event provokes already reads the right file.
+        if (state.conn.getSessionFile) {
+          await Promise.race([followMovedTranscript(state), new Promise((resolve) => setTimeout(resolve, 2_000).unref?.())]);
+        }
         state.busy = false;
+        scheduleIdleRelease(state);
         try {
           const session = await backendForSession(openCodeId).store.get(openCodeId, cwd);
           if (session) {
@@ -1412,6 +1493,28 @@ export async function compactSession(openCodeId: string, cwd: string): Promise<b
   if (!state?.credentialFingerprint || !state.conn.compact) return false;
   await state.conn.compact();
   return true;
+}
+
+/**
+ * Drops the omp child holding a session. After a revert commit rewrites the
+ * transcript the child still carries the old one in memory and would answer
+ * (and persist) from it; the next prompt spawns a fresh child that reloads the
+ * session file. Also what releases omp's ownership lease on the session.
+ */
+export async function discardSessionConnection(openCodeId: string, cwd: string): Promise<void> {
+  const key = sessionKey(openCodeId, cwd);
+  const release = await acquireSessionLock(key);
+  try {
+    const state = sessionStates.get(key);
+    if (!state) return;
+    cancelIdleRelease(state);
+    state.unsubscribe();
+    state.conn.kill();
+    clearSubagentStatuses(key);
+    sessionStates.delete(key);
+  } finally {
+    release();
+  }
 }
 
 export async function abortSession(openCodeId: string, cwd: string): Promise<boolean> {
@@ -1509,6 +1612,7 @@ export async function reconcileSessionStatuses(directory?: string): Promise<void
 export function shutdownAll(): void {
   for (const [key, state] of sessionStates) {
     try {
+      cancelIdleRelease(state);
       state.unsubscribe();
       state.busy = false;
       state.conn.kill();

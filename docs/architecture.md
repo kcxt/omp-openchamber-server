@@ -11,7 +11,6 @@ src/main.ts                         stable process entrypoint
 src/server.ts                       Bun HTTP/WebSocket composition
 src/adapters/openchamber/           OpenCode/OpenChamber compatibility adapter
 src/adapters/openchamber/extensions/  OpenChamber-facing OMP extensions
-src/adapters/jarvis/                Jarvis internal session/turn adapter
 src/providers/omp/                  OMP RPC, JSONL session, and model provider
 src/providers/fake/                 deterministic test backend
 src/shared/                         protocol types, event bus, logging, utilities
@@ -19,7 +18,7 @@ src/shared/                         protocol types, event bus, logging, utilitie
 
 The two adapters share the OMP provider runtime but do not share route
 contracts. OpenChamber-specific compatibility logic stays under its adapter;
-provider and shared modules do not import the Jarvis adapter.
+
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -38,7 +37,7 @@ provider and shared modules do not import the Jarvis adapter.
 │           │                   │                  │          │
 │  ┌────────▼────────┐ ┌────────▼─────────┐ ┌──────┴───────┐  │
 │  │ Adapters         │ │ JSONL Fast-Path  │ │ Event Bridges│  │
-│  │ OpenChamber/Jarvis│ │ providers/omp/*  │ │ prompt +     │  │
+│  │ OpenChamber     │ │ providers/omp/*  │ │ prompt +     │  │
 │  │ adapters/*       │ │                  │ │ adapters/*   │  │
 │  └────────┬────────┘ └────────┬─────────┘ └──────────────┘  │
 └───────────┼───────────────────┼─────────────────────────────┘
@@ -59,7 +58,7 @@ provider and shared modules do not import the Jarvis adapter.
 - `src/main.ts` is the stable process entrypoint used by package scripts and
   external launchers.
 - `src/server.ts` composes the Bun HTTP/WebSocket server and mounts the
-  OpenChamber and Jarvis adapters.
+  OpenChamber adapter.
 - Implements the OpenCode HTTP API surface expected by OpenChamber.
 - Supports multi-directory workspaces via `?directory=<path>` query parameters.
 - Dispatches requests for sessions, transcripts, prompts, provider configs, and real-time event streams.
@@ -107,35 +106,6 @@ The adapter seam that lets the sidecar serve multiple agent backends behind one 
   - `session.status` (`busy` / `idle`)
   - `server.connected` and periodic `server.heartbeat`
 - Emits standard data-only SSE payloads compatible with OpenChamber's client pipeline (`resolveEventPayload`).
-
-### 7. Jarvis adapter (`src/adapters/jarvis/*`)
-
-Jarvisbot uses a separate internal adapter instead of the OpenChamber route
-contract. It keeps Jarvis's `sessionId`, `turnId`, `attemptId`, workspace, and
-capability policy as opaque caller-owned values while mapping each Jarvis
-session to an OMP JSONL `sessionPath` and OpenCode-compatible provider id.
-
-- `POST /internal/jarvis/v1/sessions` registers or reuses a provider binding.
-- `POST /internal/jarvis/v1/sessions/:id/turns` starts an explicit turn.
-- `GET /internal/jarvis/v1/sessions/:id/events` replays events as JSON or SSE.
-- `POST /internal/jarvis/v1/sessions/:id/actions/:providerRequestId/result`
-  and `/update` complete or update a pending OMP host-tool call.
-- `POST /internal/jarvis/v1/sessions/:id/turns/:turnId` requests cancellation.
-- `POST /internal/jarvis/v1/sessions/:id/reconcile` checks provider state after
-  a sidecar restart and closes an abandoned active turn before reuse.
-
-The adapter starts OMP with `--no-tools --no-extensions`, then registers only
-the Jarvis-bound host tools using `set_host_tools`. OMP therefore supplies
-model execution and transcript persistence, while Jarvis remains responsible
-for capability authorization and executing the actual host action.
-Reasoning/thinking deltas are intentionally omitted from the Jarvis public
-event stream.
-
-When `OC_JARVIS_TOKEN` is set, all internal routes require a matching Bearer
-token (or `x-jarvis-token`). Bindings and their bounded event log are persisted
-under `OC_JARVIS_STATE_DIR`, or the platform state directory when unset. Raw
-credential payloads are never persisted; an opaque `credentialRef` may be
-retained so the configured credential resolver can recreate a child.
 
 ### 8. Approvals & Custom Extensions (`src/adapters/openchamber/approvals.ts`, `src/adapters/openchamber/extensions/`)
 - Surfaces interactive tool-call permissions and question requests to the OpenChamber frontend.

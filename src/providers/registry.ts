@@ -14,19 +14,22 @@
 import { ompBackend } from "./omp/backend";
 import type { AgentBackend, OpenCodeProvidersResponse, OpenCodeSession } from "./types";
 
-let backends: AgentBackend[] = [ompBackend];
+// Built on first use: `sse.ts` imports this module and the omp backend reaches `sse.ts`,
+// so `ompBackend` is not yet initialised while this module is being evaluated.
+let registered: AgentBackend[] | undefined;
+const enabled = (): AgentBackend[] => (registered ??= [ompBackend]);
 
 /** All enabled backends, in registration order (default first). */
 export function allBackends(): AgentBackend[] {
-  return backends;
+  return enabled();
 }
 
 export function defaultBackend(): AgentBackend {
-  return backends[0]!;
+  return enabled()[0]!;
 }
 
 export function backendById(id: string): AgentBackend | undefined {
-  return backends.find((backend) => backend.id === id);
+  return enabled().find((backend) => backend.id === id);
 }
 
 /**
@@ -34,18 +37,18 @@ export function backendById(id: string): AgentBackend | undefined {
  * the fake backend via OC_FAKE_BACKEND=1 and by multi-provider tests.
  */
 export function registerBackend(backend: AgentBackend): void {
-  if (backends.some((existing) => existing.id === backend.id)) return;
-  backends = [...backends, backend];
+  if (enabled().some((existing) => existing.id === backend.id)) return;
+  registered = [...enabled(), backend];
 }
 
 /** Restores the default catalog (omp only); used by tests after registration. */
 export function resetBackends(): void {
-  backends = [ompBackend];
+  registered = [ompBackend];
 }
 
 /** True once more than one backend is enabled (namespacing mode). */
 export function isMultiBackend(): boolean {
-  return backends.length > 1;
+  return enabled().length > 1;
 }
 
 const LEGACY_SESSION_ID = /^ses_[0-9a-f]{32}$/;
@@ -98,7 +101,7 @@ export function nativeProviderID(providerID: string): string {
 export async function listProviders(cwd: string): Promise<OpenCodeProvidersResponse> {
   if (!isMultiBackend()) return defaultBackend().listModels(cwd);
   const responses = await Promise.all(
-    backends.map(async (backend) => ({ backend, response: await backend.listModels(cwd) })),
+    enabled().map(async (backend) => ({ backend, response: await backend.listModels(cwd) })),
   );
   const providers = responses.flatMap(({ backend, response }) =>
     response.providers.map((provider) => ({ ...provider, id: `${backend.id}/${provider.id}` })),
@@ -117,6 +120,6 @@ export async function listSessionsAcrossBackends(
   options?: { all?: boolean; limit?: number; archived?: boolean; search?: string },
 ): Promise<OpenCodeSession[]> {
   if (!isMultiBackend()) return defaultBackend().store.list(directory, options);
-  const lists = await Promise.all(backends.map((backend) => backend.store.list(directory, options)));
+  const lists = await Promise.all(enabled().map((backend) => backend.store.list(directory, options)));
   return lists.flat();
 }

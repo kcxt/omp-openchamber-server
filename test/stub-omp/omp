@@ -1,0 +1,474 @@
+#!/usr/bin/env bun
+// Offline stand-in for `omp --mode rpc`, for the sidecar's end-to-end tests.
+//
+// It speaks the same stdio JSONL protocol as omp (docs/rpc.md in oh-my-pi) and
+// persists sessions the way omp does, so the sidecar's on-disk readers and its
+// RPC driving are exercised for real:
+//   - sessions live in `$PI_CODING_AGENT_DIR/sessions/<encoded cwd>/<ts>_<id>.jsonl`
+//     (default `~/.omp/agent`), with omp's directory encoding, a 256-byte title
+//     slot, a `type:"session"` header and `id`/`parentId` entry trees;
+//   - a process owns a session through a lease; a writer that finds the lease held
+//     by another live process moves to a sibling file (new id, `parentSession`
+//     pointing back) instead of writing the owner's file (docs/session.md);
+//   - `navigate_tree`, `fork`, `branch` and `get_entries` work on that tree.
+//
+// No network, no credentials: replies come from a script.
+//
+//   OMP_STUB_SCRIPT  JSON file, re-read on every prompt:
+//                    {"turns":[{"when":"<substring of the prompt>","steps":[...]}]}
+//                    The first turn whose `when` is contained in the prompt (or
+//                    has none) runs; with no match the stub echoes the prompt.
+//                    Steps: {"text"} ("{{users}}" expands to the number of user
+//                    messages in omp's current context) {"thinking"} {"sleep":ms} {"hang":true}
+//                    {"fail":"message"} {"tool":"bash","args":{},"result":"text",
+//                    "isError":bool,"details":{}}
+//   OMP_STUB_RECORD  file that receives every inbound frame (JSONL)
+//   OMP_STUB_TICK_MS pause between streamed chunks (default 4)
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+
+const VERSION = "18.2.8";
+if (process.argv.includes("--version")) {
+  console.log(`omp/${VERSION}`);
+  process.exit(0);
+}
+
+const argv = process.argv.slice(2);
+const flag = (name: string) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+const cwd = resolve(flag("--cwd") ?? process.cwd());
+const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
+const sessionsRoot = join(agentDir, "sessions");
+const leaseDir = process.env.PI_TEST_SESSION_OWNERS_DIR ?? join(dirname(agentDir), "run", "session-owners");
+const TICK = Number(process.env.OMP_STUB_TICK_MS ?? 4);
+const MODELS = [
+  { provider: "stub", id: "fast", name: "Stub Fast", reasoning: false },
+  { provider: "stub", id: "smart", name: "Stub Smart", reasoning: true },
+];
+
+// ---------------------------------------------------------------- directory layout
+function realpath(p: string): string {
+  try { return realpathSync(p); } catch { return resolve(p); }
+}
+function within(rel: string): boolean {
+  return rel !== ".." && !rel.startsWith(`..${"/"}`) && !isAbsolute(rel);
+}
+function encodeRel(prefix: string, rel: string): string {
+  const enc = rel.replace(/[/\\:]/g, "-");
+  return enc ? (prefix.endsWith("-") ? `${prefix}${enc}` : `${prefix}-${enc}`) : prefix;
+}
+/** omp's bucket name for a cwd: `-<rel>` under home, `-tmp-<rel>` under tmp, else `--<abs>--`. */
+function sessionDirName(dir: string): string {
+  const canon = realpath(dir);
+  const homeRel = relative(realpath(homedir()), canon);
+  const tmpRel = relative(realpath(tmpdir()), canon);
+  if (within(tmpRel)) return encodeRel("-tmp", tmpRel);
+  if (within(homeRel)) return encodeRel("-", homeRel);
+  return `--${canon.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+}
+
+// ---------------------------------------------------------------- leases
+const leasePath = (id: string) => join(leaseDir, id);
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+function leaseHeldByOther(id: string): boolean {
+  try {
+    const pid = Number(readFileSync(leasePath(id), "utf8"));
+    return Number.isFinite(pid) && pid !== process.pid && alive(pid);
+  } catch { return false; }
+}
+const owned = new Set<string>();
+function claim(id: string): void {
+  mkdirSync(leaseDir, { recursive: true });
+  writeFileSync(leasePath(id), String(process.pid));
+  owned.add(id);
+}
+function releaseAll(): void {
+  for (const id of owned) {
+    try { if (readFileSync(leasePath(id), "utf8") === String(process.pid)) unlinkSync(leasePath(id)); } catch { /* gone */ }
+  }
+  owned.clear();
+}
+
+// ---------------------------------------------------------------- session state
+type Entry = Record<string, any> & { id: string; parentId: string | null; type: string };
+type Header = Record<string, any> & { id: string; cwd: string };
+
+const hex8 = () => randomUUID().slice(0, 8);
+const now = () => new Date().toISOString();
+
+let header: Header = { type: "session", version: 3, id: randomUUID(), timestamp: now(), cwd };
+let file: string | null = null; // set once the session is first written
+let entries: Entry[] = [];
+let leaf: string | null = null;
+let model = MODELS[0]!;
+let thinking = "off";
+let todoPhases: any[] = [];
+let claimed = false;
+
+function titleSlot(title = ""): string {
+  const base = { type: "title", v: 1, title, updatedAt: now(), pad: "" };
+  const used = Buffer.byteLength(JSON.stringify(base)) + 1;
+  return JSON.stringify({ ...base, pad: " ".repeat(Math.max(0, 256 - used)) }) + "\n";
+}
+function newFilePath(h: Header): string {
+  return join(sessionsRoot, sessionDirName(h.cwd), `${h.timestamp.replace(/[:.]/g, "-")}_${h.id}.jsonl`);
+}
+function writeWhole(path: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const body = [JSON.stringify(header), ...entries.map((e) => JSON.stringify(e))].join("\n") + "\n";
+  writeFileSync(path, titleSlot(header.title) + body);
+}
+
+/** Take the session's lease; if another live process owns it, move to a sibling session. */
+function ensureOwnership(): void {
+  if (claimed) return;
+  if (leaseHeldByOther(header.id)) {
+    header = { ...header, id: randomUUID(), timestamp: now(), parentSession: header.id };
+    file = null;
+  }
+  claim(header.id);
+  claimed = true;
+}
+function persist(entry: Entry): void {
+  ensureOwnership();
+  if (!file || !existsSync(file)) {
+    file = file ?? newFilePath(header);
+    writeWhole(file); // header + every entry so far (a moved session publishes its whole transcript)
+    return;
+  }
+  appendFileSync(file, JSON.stringify(entry) + "\n");
+}
+function append(type: string, body: Record<string, any>): Entry {
+  const entry: Entry = { type, id: hex8(), parentId: leaf, timestamp: now(), ...body };
+  entries.push(entry);
+  leaf = entry.id;
+  persist(entry);
+  return entry;
+}
+
+function parseSessionFile(path: string): { header: Header; entries: Entry[] } {
+  let hdr: Header | undefined;
+  const list: Entry[] = [];
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let rec: any;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (rec.type === "session" && !hdr) hdr = rec;
+    else if (rec.type === "title") hdr = hdr ? { ...hdr, title: rec.title || hdr.title } : hdr;
+    else if (typeof rec.id === "string" && rec.type !== "session") list.push(rec);
+    // records without an id (foreign appends) are not part of the tree
+  }
+  if (!hdr) throw new Error(`Not a session file: ${path}`);
+  return { header: hdr, entries: list };
+}
+function load(path: string): void {
+  const parsed = parseSessionFile(path);
+  header = parsed.header;
+  entries = parsed.entries;
+  leaf = entries.length ? entries[entries.length - 1]!.id : null;
+  file = path;
+  claimed = false; // the lease is taken by the first write, not by opening
+  const lastModel = [...entries].reverse().find((e) => e.type === "message" && e.message?.role === "assistant");
+  if (lastModel) model = MODELS.find((m) => m.provider === lastModel.message.provider && m.id === lastModel.message.model) ?? model;
+  todoPhases = [];
+}
+function fresh(parentSession?: string): void {
+  header = { type: "session", version: 3, id: randomUUID(), timestamp: now(), cwd, ...(parentSession ? { parentSession } : {}) };
+  entries = []; leaf = null; file = null; claimed = false; todoPhases = [];
+}
+function pathTo(id: string | null): Entry[] {
+  const byId = new Map(entries.map((e) => [e.id, e]));
+  const out: Entry[] = [];
+  for (let e = id ? byId.get(id) : undefined; e; e = e.parentId ? byId.get(e.parentId) : undefined) out.unshift(e);
+  return out;
+}
+const branch = () => pathTo(leaf);
+const messages = () => branch().filter((e) => e.type === "message").map((e) => e.message);
+
+// ---------------------------------------------------------------- protocol output
+function out(frame: Record<string, unknown>): void {
+  process.stdout.write(JSON.stringify(frame) + "\n");
+}
+function respond(id: string | undefined, command: string, data?: unknown): void {
+  out({ ...(id ? { id } : {}), type: "response", command, success: true, ...(data !== undefined ? { data } : {}) });
+}
+function fail(id: string | undefined, command: string, error: string, code?: string): void {
+  out({ ...(id ? { id } : {}), type: "response", command, success: false, error, ...(code ? { code } : {}) });
+}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------- turns
+let busy = false;
+let aborted = false;
+let wake: (() => void) | undefined;
+const queued: Array<{ id?: string; message: string }> = [];
+
+async function pause(ms: number): Promise<void> {
+  if (aborted) return;
+  await Promise.race([sleep(ms), new Promise<void>((r) => { wake = r; })]);
+  wake = undefined;
+}
+
+function pickSteps(prompt: string): any[] {
+  let script: { turns?: Array<{ when?: string; steps: any[] }> } = {};
+  const path = process.env.OMP_STUB_SCRIPT;
+  if (path && existsSync(path)) {
+    try { script = JSON.parse(readFileSync(path, "utf8")); } catch { /* fall through to echo */ }
+  }
+  const turn = script.turns?.find((t) => !t.when || prompt.includes(t.when));
+  return turn?.steps ?? [{ text: `Echo: ${prompt}` }];
+}
+function usage(outTokens: number) {
+  return { input: 100, output: outTokens, cacheRead: 0, cacheWrite: 0, totalTokens: 100 + outTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+}
+function chunks(text: string): string[] {
+  return text.match(/[\s\S]{1,6}/g) ?? [];
+}
+
+async function runTurn(promptId: string | undefined, text: string): Promise<void> {
+  busy = true; aborted = false;
+  const newMessages: any[] = [];
+  out({ type: "agent_start" });
+  const userMsg = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+  out({ type: "message_start", message: userMsg });
+  append("message", { message: userMsg });
+  out({ type: "message_end", message: userMsg });
+  newMessages.push(userMsg);
+
+  // Group steps into assistant messages: content, then the tool calls it makes.
+  const groups: Array<{ content: any[]; tools: any[] }> = [];
+  let cur = { content: [] as any[], tools: [] as any[] };
+  for (const step of pickSteps(text)) {
+    if (step.tool) cur.tools.push(step);
+    else {
+      if (cur.tools.length) { groups.push(cur); cur = { content: [], tools: [] }; }
+      cur.content.push(step);
+    }
+  }
+  if (cur.content.length || cur.tools.length) groups.push(cur);
+
+  let failure: string | undefined;
+  for (const group of groups) {
+    if (aborted || failure) break;
+    out({ type: "turn_start" });
+    const blocks: any[] = [];
+    const partial = () => ({ role: "assistant", content: blocks.map((b) => ({ ...b })), api: "stub", provider: model.provider, model: model.id, usage: usage(0), stopReason: "stop", timestamp: Date.now() });
+    const msgStart = partial();
+    out({ type: "message_start", message: msgStart });
+    const event = (e: Record<string, unknown>) => out({ type: "message_update", message: partial(), assistantMessageEvent: { ...e, partial: partial() } });
+
+    for (const step of group.content) {
+      if (aborted) break;
+      if (step.fail) { failure = String(step.fail); break; }
+      if (step.sleep) { await pause(step.sleep); continue; }
+      if (step.hang) { while (!aborted) await pause(60_000); break; }
+      const kind = step.thinking !== undefined ? "thinking" : "text";
+      // `{{users}}` lets a script show how much context omp itself still holds.
+      const full: string = String(step.thinking ?? step.text ?? "").replaceAll("{{users}}", String(messages().filter((m) => m.role === "user").length));
+      const index = blocks.push(kind === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" }) - 1;
+      event({ type: `${kind}_start`, contentIndex: index });
+      for (const piece of chunks(full)) {
+        if (aborted) break;
+        blocks[index][kind === "thinking" ? "thinking" : "text"] += piece;
+        event({ type: `${kind}_delta`, contentIndex: index, delta: piece });
+        await pause(TICK);
+      }
+      event({ type: `${kind}_end`, contentIndex: index, content: blocks[index][kind === "thinking" ? "thinking" : "text"] });
+    }
+    const calls: any[] = [];
+    for (const step of group.tools) {
+      if (aborted || failure) break;
+      const call = { type: "toolCall", id: `call_${hex8()}`, name: step.tool, arguments: step.args ?? {} };
+      const index = blocks.push({ ...call, arguments: {} }) - 1;
+      event({ type: "toolcall_start", contentIndex: index });
+      const json = JSON.stringify(call.arguments);
+      for (const piece of chunks(json)) { event({ type: "toolcall_delta", contentIndex: index, delta: piece }); await pause(TICK); }
+      blocks[index] = call;
+      event({ type: "toolcall_end", contentIndex: index, toolCall: call });
+      calls.push({ call, step });
+    }
+
+    const final = {
+      role: "assistant", content: blocks, api: "stub", provider: model.provider, model: model.id,
+      usage: usage(blocks.length * 10),
+      stopReason: failure ? "error" : aborted ? "aborted" : calls.length ? "toolUse" : "stop",
+      ...(failure ? { errorMessage: failure } : {}),
+      ...(aborted ? { errorMessage: "Request was aborted" } : {}),
+      timestamp: Date.now(),
+    };
+    append("message", { message: final });
+    out({ type: "message_end", message: final });
+    newMessages.push(final);
+
+    const results: any[] = [];
+    if (!final.stopReason.match(/error|aborted/)) {
+      for (const { call, step } of calls) {
+        out({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+        if (step.sleep) await pause(step.sleep);
+        const text = String(step.result ?? "ok");
+        out({ type: "tool_execution_update", toolCallId: call.id, toolName: call.name, args: call.arguments, partialResult: { content: [{ type: "text", text }] } });
+        if (call.name === "todo" && step.details?.phases) todoPhases = step.details.phases;
+        const result = { content: [{ type: "text", text }], ...(step.details ? { details: step.details } : {}) };
+        out({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result, isError: !!step.isError });
+        const msg = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: result.content, ...(step.details ? { details: step.details } : {}), isError: !!step.isError, timestamp: Date.now() };
+        out({ type: "message_start", message: msg });
+        append("message", { message: msg });
+        out({ type: "message_end", message: msg });
+        results.push(msg); newMessages.push(msg);
+      }
+    }
+    out({ type: "turn_end", message: final, toolResults: results });
+  }
+
+  out({ type: "agent_end", messages: newMessages, yielded: true });
+  out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: true, status: aborted ? "aborted" : failure ? "error" : "completed", ...(failure ? { error: { message: failure, retryable: false } } : {}), sessionSettled: queued.length === 0 });
+  busy = false;
+  const next = queued.shift();
+  if (next) void runTurn(next.id, next.message);
+  else out({ type: "session_settled" });
+}
+
+// ---------------------------------------------------------------- commands
+function stateData() {
+  return {
+    model: { provider: model.provider, id: model.id, name: model.name },
+    thinkingLevel: thinking,
+    isStreaming: busy, isCompacting: false, isSettled: !busy, hasPendingAsyncWork: false,
+    sessionFile: file ?? undefined, sessionId: header.id, sessionName: header.title,
+    cwd, messageCount: messages().length, queuedMessageCount: queued.length,
+    todoPhases,
+  };
+}
+const modelInfo = (m: typeof MODELS[number]) => ({
+  provider: m.provider, id: m.id, name: m.name, reasoning: m.reasoning, input: ["text"],
+  contextWindow: 100_000, maxTokens: 8_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+});
+function messageEntryOrThrow(entryId: string): Entry {
+  const e = entries.find((x) => x.id === entryId);
+  if (!e) throw Object.assign(new Error(`Entry ${entryId} not found`), { code: "entry_not_found" });
+  return e;
+}
+/** Copy root→`upTo` into a new session file and move the process onto it. */
+function moveToSiblingUpTo(upTo: string | null, extra?: Partial<Header>): void {
+  const kept = pathTo(upTo);
+  const parent = header.id;
+  const parentFile = file;
+  fresh(parent);
+  header = { ...header, ...(parentFile ? { parentSession: parentFile } : {}), ...extra };
+  entries = kept; leaf = upTo;
+  claim(header.id); claimed = true;
+  file = newFilePath(header);
+  writeWhole(file);
+}
+
+async function handle(frame: any): Promise<void> {
+  const { id, type } = frame as { id?: string; type: string };
+  try {
+    switch (type) {
+      case "get_state": return respond(id, type, stateData());
+      case "get_available_models": return respond(id, type, MODELS.map(modelInfo));
+      case "get_available_commands": return respond(id, type, { commands: [] });
+      case "get_available_thinking_levels": return respond(id, type, model.reasoning ? ["off", "low", "medium", "high"] : ["off"]);
+      case "set_model": {
+        const m = MODELS.find((x) => x.provider === frame.provider && x.id === frame.modelId);
+        if (!m) return fail(id, type, `Model not found: ${frame.provider}/${frame.modelId}`);
+        model = m;
+        if (file) append("model_change", { model: `${m.provider}/${m.id}`, role: "default" });
+        return respond(id, type, modelInfo(m));
+      }
+      case "set_thinking_level": thinking = String(frame.level); return respond(id, type);
+      case "set_subagent_subscription": case "set_event_filter": case "set_host_tools": case "set_auto_compaction":
+      case "set_auto_retry": case "set_steering_mode": case "set_follow_up_mode": case "set_interrupt_mode": case "set_ask_dialog":
+        return respond(id, type, {});
+      case "get_subagents": return respond(id, type, { subagents: [] });
+      case "get_session_stats": return respond(id, type, { tokens: { input: 100, output: 10, total: 110 }, cost: 0 });
+      case "get_session_lease": {
+        const ids: string[] = frame.sessionIds ?? [];
+        return respond(id, type, { held: ids.filter((s) => s === header.id || leaseHeldByOther(s)), unknown: [] });
+      }
+      case "switch_session": {
+        if (busy) { aborted = true; wake?.(); }
+        if (!existsSync(frame.sessionPath)) return fail(id, type, `Session file not found: ${frame.sessionPath}`);
+        load(frame.sessionPath);
+        return respond(id, type, { cancelled: false });
+      }
+      case "new_session": fresh(frame.parentSession); return respond(id, type, { cancelled: false });
+      case "get_messages": return respond(id, type, { messages: messages() });
+      case "get_entries": return respond(id, type, { entries: frame.since ? entries.slice(entries.findIndex((e) => e.id === frame.since) + 1) : entries, leafId: leaf });
+      case "get_last_assistant_text": {
+        const last = [...messages()].reverse().find((m) => m.role === "assistant");
+        const text = last?.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") ?? "";
+        return respond(id, type, { text: text || null });
+      }
+      case "set_session_name": header = { ...header, title: frame.name }; if (file) writeFileSync(file, titleSlot(frame.name) + readFileSync(file, "utf8").split("\n").slice(1).join("\n")); return respond(id, type);
+      case "set_todos": todoPhases = frame.phases ?? []; return respond(id, type, {});
+      case "prompt": {
+        const text = String(frame.message ?? "");
+        if (busy) {
+          if (!frame.streamingBehavior) return fail(id, type, "Agent is already processing a prompt. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+          queued.push({ id, message: text });
+          return respond(id, type, {});
+        }
+        respond(id, type, {});
+        void runTurn(id, text);
+        return;
+      }
+      case "abort": respond(id, type); if (busy) { aborted = true; wake?.(); } return;
+      case "compact": append("compaction", { summary: "Stub summary", tokensBefore: 100, firstKeptEntryId: leaf ?? "" }); return respond(id, type, { summary: "Stub summary" });
+      case "bash": return respond(id, type, { output: "", exitCode: 0 });
+      case "export_html": {
+        const outputPath = frame.outputPath ?? join(cwd, `omp-session-${header.id}.html`);
+        writeFileSync(outputPath, `<!doctype html><title>${header.title ?? header.id}</title><pre>${JSON.stringify(messages())}</pre>`);
+        return respond(id, type, { path: outputPath });
+      }
+      case "navigate_tree": {
+        if (busy) return fail(id, type, "Session is busy", "session_busy");
+        const target = messageEntryOrThrow(frame.entryId);
+        const isUser = target.type === "message" && target.message?.role === "user";
+        // A user message rewinds past itself; the leaf is a memory pointer until the next append.
+        leaf = isUser ? target.parentId : target.id;
+        return respond(id, type, { cancelled: false, ...(isUser ? { editorText: target.message.content?.[0]?.text ?? "" } : {}) });
+      }
+      case "fork": case "branch": {
+        if (busy) return fail(id, type, "Session is busy", "session_busy");
+        const target = frame.entryId ? messageEntryOrThrow(frame.entryId) : undefined;
+        const upTo = type === "branch" ? (target?.parentId ?? null) : (target?.id ?? leaf);
+        moveToSiblingUpTo(upTo);
+        return respond(id, type, { cancelled: false, ...(type === "branch" && target ? { text: target.message?.content?.[0]?.text ?? "" } : {}) });
+      }
+      default: return fail(id, type, `Unknown command: ${type}`);
+    }
+  } catch (err: any) {
+    fail(id, type, err?.message ?? String(err), err?.code);
+  }
+}
+
+// ---------------------------------------------------------------- main loop
+const record = process.env.OMP_STUB_RECORD;
+out({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1], maxFrameBytes: 1_048_576, maxReassembledFrameBytes: 67_108_864, supportsBashExcludeFromContext: true });
+
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString("utf8");
+  let nl: number;
+  while ((nl = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, nl).trim();
+    buffer = buffer.slice(nl + 1);
+    if (!line) continue;
+    if (record) appendFileSync(record, line + "\n");
+    let frame: any;
+    try { frame = JSON.parse(line); } catch { fail(undefined, "parse", "Failed to parse command: invalid JSON"); continue; }
+    void handle(frame);
+  }
+});
+const shutdown = () => { releaseAll(); process.exit(0); };
+process.stdin.on("end", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGHUP", shutdown);
+process.on("exit", releaseAll);

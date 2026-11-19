@@ -866,6 +866,10 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
         ? extractTodosFromOmpDetails(
             payload.details
               ?? (typeof payload.data === "object" && payload.data != null ? (payload.data as Record<string, unknown>).details : undefined)
+              // omp's tool_execution_end carries the tool result as `result: { content, details }`.
+              ?? (typeof payload.result === "object" && payload.result != null && !Array.isArray(payload.result)
+                ? (payload.result as Record<string, unknown>).details
+                : undefined)
               ?? event.details,
             payload.result ?? payload.output,
           )
@@ -908,6 +912,11 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
     const eventType = assistantMessageEvent.type as string | undefined;
     const rawText = assistantMessageEvent.text ?? assistantMessageEvent.delta ?? assistantMessageEvent.content;
     const deltaText = typeof rawText === "string" ? rawText : "";
+
+    if (eventType === "text_end" || eventType === "thinking_end") {
+      emit({ kind: "part_end" });
+      return;
+    }
 
     if (eventType === "text_delta" || eventType === "thinking_delta") {
       emit(eventType === "thinking_delta"

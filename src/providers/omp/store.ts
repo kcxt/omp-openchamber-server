@@ -20,12 +20,16 @@ import { emitOpenCodeV2Event, emitSessionUpdated } from "../../shared/sse";
 import { mapOmpUsageToTokens } from "./messages";
 import type { OpenCodeSession, TokenBreakdown } from "../types";
 
-function ompSessionsRoot(): string {
-  return join(Bun.env.HOME!, ".omp", "agent", "sessions");
-}
-function homePrefix(): string {
-  return Bun.env.HOME! + "/";
-}
+import {
+  bucketOfSessionPath,
+  encodeCwd,
+  isSessionBucketOf,
+  ompSessionsRoot,
+  sameDirectory,
+  sessionBucketNames,
+} from "./paths";
+
+export { encodeCwd };
 
 interface SessionHeader {
   id: string;
@@ -45,14 +49,10 @@ interface SessionHeader {
   revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] };
   /** Client-minted OpenCode id (nanoid form) this omp session must answer to. */
   openCodeId?: string;
-}
-
-export function encodeCwd(cwd: string): string {
-  let encoded = cwd;
-  if (encoded.startsWith(homePrefix())) {
-    encoded = "/" + encoded.slice(homePrefix().length);
-  }
-  return encoded.replace(/\//g, "-");
+  /** True when `openCodeId` was bound by an `oc_alias` marker: this file continues another session's OpenChamber identity. */
+  aliased?: boolean;
+  /** OpenCode parent (a child session created through the API); `parentSession` alone is only omp lineage. */
+  childOf?: string;
 }
 
 /** Convert an internal omp UUID into the external OpenCode session id. */
@@ -202,6 +202,35 @@ export async function resolveOmpSubagentOpenCodeId(
 }
 
 /**
+ * An OpenChamber session that moved to a sibling transcript. omp never writes
+ * a session another live process holds: it moves to a new file (new id,
+ * `parentSession` pointing back) on its first write. The sidecar marks that
+ * file with an `oc_alias` line carrying the OpenChamber id, so the same
+ * OpenChamber session continues in it while the original stays the other
+ * process's. Among files claiming one id the alias wins, newest first.
+ */
+const aliasedSessions = new WeakSet<OpenCodeSession>();
+const aliasIndex = new Map<string, string>();
+
+/** Bind OpenChamber session `openCodeId` to the transcript omp moved it to. */
+export async function adoptOmpTranscript(openCodeId: string, transcriptPath: string): Promise<void> {
+  await appendFile(transcriptPath, JSON.stringify({ type: "oc_alias", openCodeId, timestamp: new Date().toISOString() }) + "\n");
+  aliasIndex.set(openCodeId, transcriptPath);
+}
+
+/** Drops sessions whose id an alias file has taken over; of several aliases the newest stays. */
+function dropSupersededSessions(sessions: OpenCodeSession[]): OpenCodeSession[] {
+  const winners = new Map<string, OpenCodeSession>();
+  for (const session of sessions) {
+    if (!aliasedSessions.has(session)) continue;
+    const current = winners.get(session.id);
+    if (!current || session.time.updated > current.time.updated) winners.set(session.id, session);
+  }
+  if (winners.size === 0) return sessions;
+  return sessions.filter((session) => !winners.has(session.id) || winners.get(session.id) === session);
+}
+
+/**
  * Parsed headers by file, valid while the file's size and mtime are unchanged.
  * A listing parses every session file (hundreds, each re-read and split), and
  * OpenChamber polls the global list, so without this a list costs seconds on
@@ -249,6 +278,7 @@ async function parseSessionHeader(
     let latestAgent: string | undefined;
     let latestRevert: SessionHeader["revert"] | null | undefined;
     let hasRevertUpdate = false;
+    let latestAlias: string | undefined;
 
     for (let i = 0; i < maxHeaderLines; i++) {
       const line = lines[i].trim();
@@ -284,6 +314,7 @@ async function parseSessionHeader(
               variant: typeof entry.variant === "string" ? entry.variant : "default",
             } : undefined,
             openCodeId: typeof entry.openCodeId === "string" ? entry.openCodeId : undefined,
+            childOf: typeof entry.openCodeParent === "string" ? entry.openCodeParent : undefined,
           };
           if (header.metadata) {
             latestMetadata = { ...(latestMetadata || {}), ...header.metadata };
@@ -312,6 +343,8 @@ async function parseSessionHeader(
           latestTitle = entry.title.trim();
         } else if (entry.type === "metadata" && entry.metadata && typeof entry.metadata === "object") {
           latestMetadata = { ...(latestMetadata || {}), ...entry.metadata };
+        } else if (entry.type === "oc_alias" && typeof entry.openCodeId === "string") {
+          latestAlias = entry.openCodeId;
         } else if (entry.type === "archive") {
           latestArchived = typeof entry.archived === "number" ? entry.archived : (entry.archived ? Date.now() : 0);
         } else if (entry.type === "viewed") {
@@ -388,6 +421,10 @@ async function parseSessionHeader(
       const indexed = lookupIndexedTitle(header.id);
       if (indexed) header.title = indexed;
     }
+    if (latestAlias !== undefined) {
+      header.openCodeId = latestAlias;
+      header.aliased = true;
+    }
     if (firstUserPrompt !== undefined) header.firstUserPrompt = firstUserPrompt;
     if (latestMetadata !== undefined) header.metadata = latestMetadata;
     if (latestArchived !== undefined) header.archived = latestArchived;
@@ -411,7 +448,10 @@ async function buildOpenCodeSession(
   artifactParentReference?: string,
 ): Promise<OpenCodeSession> {
   const openCodeId = header.openCodeId ?? toOpenCodeSessionId(header.id);
-  const parentID = normalizeParentSessionId(header.parentSession, artifactParentReference);
+  // `parentSession` is omp lineage (a /fork, a session moved off a contested
+  // lease): such a session is an ordinary top-level one. Only an artifact
+  // sub-session (a subagent) or one created through the API as a child has a parent.
+  const parentID = header.aliased ? undefined : normalizeParentSessionId(header.childOf, artifactParentReference);
   const compactId = header.id.replace(/-/g, "");
   const first8 = compactId.slice(0, 8);
   const created = Date.parse(header.timestamp) || Date.now();
@@ -431,7 +471,7 @@ async function buildOpenCodeSession(
     title = `Session ${first8}`;
   }
 
-  return {
+  const session: OpenCodeSession = {
     id: openCodeId,
     slug: openCodeId,
     projectID: "global",
@@ -460,6 +500,8 @@ async function buildOpenCodeSession(
     metadata: header.metadata,
     revert: header.revert,
   };
+  if (header.aliased) aliasedSessions.add(session);
+  return session;
 }
 
 /**
@@ -476,7 +518,7 @@ async function resolveOmpParentId(parentID?: string): Promise<string | undefined
 
 export async function createOmpSession(
   directory?: string | null,
-  options?: { id?: string; title?: string; parentID?: string; agent?: string; model?: { providerID: string; modelID: string; variant: string }; metadata?: Record<string, unknown> },
+  options?: { id?: string; title?: string; parentID?: string; forkOf?: string; agent?: string; model?: { providerID: string; modelID: string; variant: string }; metadata?: Record<string, unknown> },
 ): Promise<OpenCodeSession> {
   const cwd = directory || process.cwd();
   const canonicalID = options?.id && isCanonicalOpenCodeSessionId(options.id)
@@ -487,6 +529,7 @@ export async function createOmpSession(
     : undefined;
   const uuid = canonicalID ?? randomUUID();
   const parentOmpID = await resolveOmpParentId(options?.parentID);
+  const lineageOmpID = parentOmpID ?? (options?.forkOf ? await resolveOmpParentId(options.forkOf) : undefined);
   const timestamp = new Date().toISOString();
   const fileTimestamp = timestamp.replace(/[:.]/g, "-");
   const fileName = `${fileTimestamp}_${uuid}.jsonl`;
@@ -516,7 +559,8 @@ export async function createOmpSession(
     thinkingLevel: "off",
     version: 3,
     openCodeId: externalID,
-    parentSession: parentOmpID,
+    parentSession: lineageOmpID,
+    ...(parentOmpID ? { openCodeParent: parentOmpID } : {}),
   };
 
   await Bun.write(filePath, titleSlot + JSON.stringify(headerRecord) + "\n");
@@ -534,7 +578,8 @@ export async function createOmpSession(
       model: options?.model ?? { providerID: "omp", modelID: "omp", variant: "default" },
       metadata: options?.metadata,
       openCodeId: externalID,
-      parentSession: parentOmpID,
+      parentSession: lineageOmpID,
+      childOf: parentOmpID,
     },
     filePath,
   );
@@ -585,7 +630,7 @@ export async function moveOmpSession(
     }).join("\n");
     if (!updatedHeader) return null;
 
-    const sourceRoot = join(ompSessionsRoot(), encodeCwd(session.directory));
+    const sourceRoot = join(ompSessionsRoot(), bucketOfSessionPath(session.path));
     const destinationRoot = join(ompSessionsRoot(), encodeCwd(destination));
     const destinationPath = join(destinationRoot, relative(sourceRoot, session.path));
     await mkdir(destinationRoot, { recursive: true });
@@ -781,10 +826,8 @@ export async function listOmpSessions(
 
   let dirs = entries.filter((e) => e.isDirectory());
   if (!all && directory) {
-    const encoded = encodeCwd(directory);
-    dirs = dirs.filter(
-      (e) => e.name === encoded || e.name.startsWith(`${encoded}.`),
-    );
+    const buckets = sessionBucketNames(directory);
+    dirs = dirs.filter((e) => isSessionBucketOf(e.name, buckets));
   } else if (!all) {
     return sessions;
   }
@@ -805,7 +848,7 @@ export async function listOmpSessions(
         const filePath = join(dirPath, ent.name);
         const header = await readSessionHeader(filePath);
         if (!header) continue;
-        if (!all && header.cwd !== directory) continue;
+        if (!all && !sameDirectory(header.cwd, directory!)) continue;
         if (archived !== true && !!header.archived) continue;
 
         if (searchLower) {
@@ -819,6 +862,7 @@ export async function listOmpSessions(
           }
         }
 
+        if (header.aliased && header.openCodeId) aliasIndex.set(header.openCodeId, filePath);
         sessions.push(await buildOpenCodeSession(header, filePath));
         if (limit !== undefined && sessions.length >= limit) break;
       } else if (ent.isDirectory()) {
@@ -840,7 +884,7 @@ export async function listOmpSessions(
           if (!subHeader.title) {
             subHeader.title = subFile.slice(0, -6);
           }
-          if (!all && subHeader.cwd !== directory) continue;
+          if (!all && !sameDirectory(subHeader.cwd, directory!)) continue;
           if (archived !== true && !!subHeader.archived) continue;
 
           if (searchLower) {
@@ -862,13 +906,22 @@ export async function listOmpSessions(
     if (limit !== undefined && sessions.length >= limit) break;
   }
 
-  return sessions;
+  return dropSupersededSessions(sessions);
 }
 
 export async function getOmpSessionByOpenCodeId(
   openCodeId: string,
   directory?: string | null,
 ): Promise<OpenCodeSession | null> {
+  const aliasPath = aliasIndex.get(openCodeId);
+  if (aliasPath) {
+    const header = await readSessionHeader(aliasPath);
+    if (header?.aliased && header.openCodeId === openCodeId && (!directory || sameDirectory(header.cwd, directory))) {
+      return buildOpenCodeSession(header, aliasPath);
+    }
+    if (!header) aliasIndex.delete(openCodeId);
+  }
+
   const ompId = fromOpenCodeSessionId(openCodeId);
   const requestedAlias = isCanonicalOpenCodeSessionId(openCodeId)
     ? undefined
@@ -884,10 +937,8 @@ export async function getOmpSessionByOpenCodeId(
 
   let dirs = entries.filter((e) => e.isDirectory());
   if (directory) {
-    const encoded = encodeCwd(directory);
-    dirs = dirs.filter(
-      (e) => e.name === encoded || e.name.startsWith(`${encoded}.`),
-    );
+    const buckets = sessionBucketNames(directory);
+    dirs = dirs.filter((e) => isSessionBucketOf(e.name, buckets));
   }
 
   for (const dir of dirs) {
@@ -901,6 +952,7 @@ export async function getOmpSessionByOpenCodeId(
       }[];
     } catch { continue; }
 
+    let fallback: OpenCodeSession | undefined;
     for (const ent of dirents) {
       if (ent.isFile() && ent.name.endsWith(".jsonl")) {
         const filePath = join(dirPath, ent.name);
@@ -912,8 +964,10 @@ export async function getOmpSessionByOpenCodeId(
           (header.openCodeId && header.openCodeId === openCodeId) ||
           (requestedAlias !== undefined && normalizeSessionAlias(header.title ?? "") === requestedAlias)
         ) {
-          if (directory && header.cwd !== directory) continue;
-          return buildOpenCodeSession(header, filePath);
+          if (directory && !sameDirectory(header.cwd, directory)) continue;
+          if (header.aliased) return buildOpenCodeSession(header, filePath);
+          // Another file of this bucket may have taken the id over (an `oc_alias`).
+          fallback ??= await buildOpenCodeSession(header, filePath);
         }
       } else if (ent.isDirectory()) {
         const subDirPath = join(dirPath, ent.name);
@@ -944,12 +998,13 @@ export async function getOmpSessionByOpenCodeId(
             if (!subHeader.title) {
               subHeader.title = subFile.slice(0, -6);
             }
-            if (directory && subHeader.cwd !== directory) continue;
+            if (directory && !sameDirectory(subHeader.cwd, directory)) continue;
             return buildOpenCodeSession(subHeader, subFilePath, parentOmpUuid);
           }
         }
       }
     }
+    if (fallback) return fallback;
   }
 
   return null;

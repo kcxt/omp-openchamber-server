@@ -37,6 +37,7 @@ import {
   applySessionModel,
   mimeFromPath,
   abortSession,
+  discardSessionConnection,
   compactSession,
   getSessionStatusMap,
   reconcileSessionStatuses,
@@ -69,7 +70,6 @@ import { handleGitRequest } from "./adapters/openchamber/git";
 import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/message-queue";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
 import { createSessionKnowledgeRuntime, handleSessionKnowledgeRequest } from "./adapters/openchamber/session-knowledge";
-import { handleJarvisRequest } from "./adapters/jarvis";
 
 // Optional fake backend (test-only): OC_FAKE_BACKEND=1 enables multi-backend
 // mode over the HTTP surface. Off by default so the omp-only path stays
@@ -253,6 +253,43 @@ async function resolveSessionRoute(openCodeId: string, dir: string | undefined) 
   const backend = backendForSession(openCodeId);
   const session = (await backend.store.get(openCodeId, dir)) || (await backend.store.get(openCodeId));
   return { backend, session };
+}
+
+type RevertCommitResult = "none" | "committed" | "cleared" | "boundary-missing";
+
+/**
+ * Applies the session's staged revert: the boundary message and everything
+ * after it leave the transcript, and the omp child, which still holds them in
+ * memory, is dropped so the next turn reloads the cut transcript. OpenChamber
+ * stages a revert and then simply prompts (it never calls the commit route when
+ * the user edits a message), so every prompt route runs this first.
+ */
+async function commitStagedRevert(
+  sessionID: string,
+  backend: ReturnType<typeof backendForSession>,
+  session: NonNullable<Awaited<ReturnType<typeof resolveSessionRoute>>["session"]>,
+): Promise<RevertCommitResult> {
+  const target = session.revert?.messageID;
+  if (!target) return "none";
+  await discardSessionConnection(sessionID, session.directory);
+  const committed = await backend.store.commitRevert(sessionID, target, session.directory);
+  if (!committed) {
+    // A staged revert whose boundary message is no longer in the transcript can
+    // never be committed, and the client commits it before every new prompt
+    // (goals included), so it would wedge the session. Nothing is left to
+    // truncate: drop the stale marker instead.
+    const transcript = await backend.store.transcript?.(sessionID, session.directory).catch(() => null);
+    if (!transcript || transcript.some((message) => message.info.id === target)) return "boundary-missing";
+    await backend.store.update(sessionID, { revert: null }, session.directory);
+    emitOpenCodeV2Event("session.revert.cleared", { sessionID }, session.directory);
+    return "cleared";
+  }
+  emitOpenCodeV2Event("session.revert.committed", { sessionID, to: target }, session.directory);
+  const updated = await backend.store.get(sessionID, session.directory);
+  if (updated) {
+    emitOpenCodeV2Event("session.usage.updated", { sessionID, cost: updated.cost, tokens: updated.tokens }, session.directory);
+  }
+  return "committed";
 }
 
 const openChamberDataDir = Bun.env.OPENCHAMBER_DATA_DIR
@@ -601,12 +638,6 @@ const server = Bun.serve<SidecarWebSocketData>({
           headers: cors,
         });
       }
-
-      // Jarvisbot integration is deliberately mounted as a separate adapter.
-      // It shares the OMP provider runtime but does not alter the OpenCode /
-      // OpenChamber-compatible routes below.
-      const jarvisRoute = await handleJarvisRequest(req, url, { cors });
-      if (jarvisRoute) return jarvisRoute;
 
       const projectContextRoute = await handleProjectContextRequest(req, url, projectContextRuntime);
       if (projectContextRoute) {
@@ -2106,31 +2137,9 @@ const MIME_TYPES: Record<string, string> = {
         const sessionID = decodeURIComponent(revertCommitMatch[1]!);
         const { backend, session } = await resolveSessionRoute(sessionID, dir);
         if (!session) return jsonError("session not found", 404);
-        const target = session.revert?.messageID;
-        if (!target) return jsonError("no staged revert", 409);
-        const committed = await backend.store.commitRevert(sessionID, target, session.directory);
-        if (!committed) {
-          // A staged revert whose boundary message is no longer in the
-          // transcript can never be committed, and the client commits it before
-          // every new prompt (goals included), so it would wedge the session.
-          // Nothing is left to truncate: drop the stale marker instead.
-          const transcript = await backend.store.transcript?.(sessionID, session.directory).catch(() => null);
-          if (!transcript || transcript.some((message) => message.info.id === target)) {
-            return jsonError("revert boundary not found", 404);
-          }
-          await backend.store.update(sessionID, { revert: null }, session.directory);
-          emitOpenCodeV2Event("session.revert.cleared", { sessionID }, session.directory);
-          return noContent();
-        }
-        emitOpenCodeV2Event("session.revert.committed", { sessionID, to: target }, session.directory);
-        const updated = await backend.store.get(sessionID, session.directory);
-        if (updated) {
-          emitOpenCodeV2Event("session.usage.updated", {
-            sessionID,
-            cost: updated.cost,
-            tokens: updated.tokens,
-          }, session.directory);
-        }
+        const result = await commitStagedRevert(sessionID, backend, session);
+        if (result === "none") return jsonError("no staged revert", 409);
+        if (result === "boundary-missing") return jsonError("revert boundary not found", 404);
         return noContent();
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "revert commit failed", 500);
@@ -2428,8 +2437,9 @@ const MIME_TYPES: Record<string, string> = {
         const sessionID = decodeURIComponent(promptMatch[1]!);
         const body = await readJson(req);
         const input = asRecord(body);
-        const { session } = await resolveSessionRoute(sessionID, dir);
+        const { backend, session } = await resolveSessionRoute(sessionID, dir);
         if (!session) return jsonError("session not found", 404);
+        await commitStagedRevert(sessionID, backend, session);
         const result = await promptSessionAsync(sessionID, session.directory, session.path, body, session.model);
         if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
         const files = Array.isArray(input?.files) ? input.files.flatMap((entry) => {
@@ -2470,8 +2480,9 @@ const MIME_TYPES: Record<string, string> = {
       try {
         const openCodeId = promptAsyncMatch[1];
         const body = await readJson(req);
-        const { session } = await resolveSessionRoute(openCodeId, dir);
+        const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
+        await commitStagedRevert(openCodeId, backend, session);
         const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });
         return jsonError(result.error ?? "prompt failed", result.status ?? 400);
@@ -2485,8 +2496,9 @@ const MIME_TYPES: Record<string, string> = {
       try {
         const openCodeId = msgMatch[1];
         const body = await readJson(req);
-        const { session } = await resolveSessionRoute(openCodeId, dir);
+        const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
+        await commitStagedRevert(openCodeId, backend, session);
         const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });
         return jsonError(result.error ?? "prompt failed", result.status ?? 400);

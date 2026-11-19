@@ -40,6 +40,7 @@ import {
   resolveOmpSubagentOpenCodeId,
   setOmpSessionTitle,
   updateOmpSession,
+  adoptOmpTranscript,
 } from "./store";
 
 export interface OmpTurnContext {
@@ -179,6 +180,14 @@ export function createOmpTurnConnection(transport: OmpRpcTransport, ctx: OmpTurn
     isAlive() {
       return transport.isAlive?.() ?? true;
     },
+    async getSessionFile() {
+      const state = (await transport.request("get_state", {})) as { sessionFile?: unknown } | undefined;
+      return typeof state?.sessionFile === "string" ? state.sessionFile : undefined;
+    },
+    async isSettled() {
+      const state = (await transport.request("get_state", {})) as { isSettled?: unknown; hasPendingAsyncWork?: unknown } | undefined;
+      return state?.isSettled !== false && state?.hasPendingAsyncWork !== true;
+    },
     async getSubagentStatuses() {
       return parseSubagentSnapshots(await transport.request("get_subagents"), ctx.openCodeId, ctx.cwd);
     },
@@ -243,6 +252,10 @@ const ompStore: SessionStore = {
   },
   async commitRevert(openCodeId, messageID, directory) {
     return truncateOmpSessionAtMessage(openCodeId, directory ?? "", messageID);
+  },
+  async adoptTranscript(openCodeId, transcriptPath, cwd) {
+    await adoptOmpTranscript(openCodeId, transcriptPath);
+    invalidateMessageCache(openCodeId, cwd);
   },
   async fork(openCodeId, directory, before) {
     return forkOmpSession(openCodeId, directory, before);

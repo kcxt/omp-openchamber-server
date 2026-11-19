@@ -1,6 +1,7 @@
 import { Database, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ompAgentDir } from "./paths";
 
 const TITLE_TABLE_DDL = `
 CREATE TABLE IF NOT EXISTS session_titles (
@@ -51,8 +52,7 @@ let handle: TitleIndexHandle | undefined;
 let failedPath: string | undefined;
 
 export function getDefaultHistoryDbPath(): string {
-  const home = Bun.env.HOME || process.env.HOME || "";
-  return path.join(home, ".omp", "agent", "history.db");
+  return path.join(ompAgentDir(), "history.db");
 }
 
 export function closeTitleIndex(): void {

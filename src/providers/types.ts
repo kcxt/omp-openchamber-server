@@ -310,6 +310,8 @@ export interface BackendSubagentSnapshot {
 export type NormalizedTurnEvent =
   | { kind: "text_delta"; text: string }
   | { kind: "reasoning_delta"; text: string }
+  /** The streamed text or reasoning block ended; the next delta opens a new part. */
+  | { kind: "part_end" }
   | { kind: "tool"; callID: string; tool?: string; state: ToolPartState }
   /** Partial tool arguments as the model streams them (`toolcall_delta`). */
   | { kind: "tool_input_delta"; callID: string; tool?: string; delta: string }
@@ -386,6 +388,10 @@ export interface BackendTurnConnection {
   getSubagentStatuses?(): Promise<BackendSubagentSnapshot[]>;
   /** False once the backend child has exited; absent when the backend cannot tell. */
   isAlive?(): boolean;
+  /** Transcript the backend is currently writing; differs from the one it was given once it moved the session. */
+  getSessionFile?(): Promise<string | undefined>;
+  /** True when no turn, queued message or background work can still wake the session. */
+  isSettled?(): Promise<boolean>;
   abort(): Promise<unknown>;
   kill(): void;
 }
@@ -418,7 +424,9 @@ export interface SessionStore {
   ): Promise<OpenCodeSession | null>;
   /** Commit a staged revert by removing the boundary message and its tail. */
   commitRevert(openCodeId: string, messageID: string, directory?: string | null): Promise<boolean>;
-  /** Create a child session, optionally excluding the transcript from `before` onward. */
+  /** The backend moved this session to another transcript file: keep answering to the same id from there. */
+  adoptTranscript?(openCodeId: string, transcriptPath: string, cwd: string): Promise<void>;
+  /** Create a session forked from `openCodeId`, optionally excluding the transcript from `before` onward. */
   fork(openCodeId: string, directory: string, before?: string): Promise<OpenCodeSession | null>;
   move(openCodeId: string, directory: string, sourceDirectory?: string | null): Promise<OpenCodeSession | null>;
   setTitle(openCodeId: string, title: string, source: "auto" | "user", cwd: string): Promise<void>;

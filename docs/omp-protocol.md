@@ -41,26 +41,6 @@ Commands sent to OMP `stdin` take the shape `{"type": "<command>", "id": "<corre
 | `new_session` | `{"parentSession"?: string}` | Starts a new session or forks from a parent session. |
 | `abort` | `{}` | Requests immediate interruption of active turn generation. |
 
-The Jarvis adapter starts its OMP child with `--no-tools --no-extensions`.
-These are separate spawn options used only by `src/adapters/jarvis`; the
-existing OpenChamber adapter keeps OMP's normal native tools and extensions.
-
-### Host tools (Jarvis adapter)
-
-The RPC protocol supports a bidirectional host-tool bridge:
-
-| Frame | Direction | Purpose |
-|---|---|---|
-| `set_host_tools` | sidecar → OMP | Replaces the explicit tool definitions visible to the OMP session. |
-| `host_tool_call` | OMP → sidecar | Requests Jarvis to execute a capability; includes `id`, `toolCallId`, `toolName`, and `arguments`. |
-| `host_tool_update` | sidecar → OMP | Streams a partial `AgentToolResult` while a capability is running. |
-| `host_tool_result` | sidecar → OMP | Completes the request using the original provider request `id`. |
-| `host_tool_cancel` | OMP → sidecar | Notifies the host that a pending call was cancelled. |
-
-The sidecar does not execute a host tool. It records the pending provider
-request, publishes a Jarvis `tool_call_proposed` event, and waits for Jarvisbot
-to authorize and execute the capability.
-
 ---
 
 ## 3. Event Vocabulary
@@ -92,7 +72,9 @@ OMP stores session transcripts under:
 ~/.omp/agent/sessions/<cwd-slug>/<timestamp>_<uuidv7>.jsonl
 ```
 
-- **Path Slug**: The working directory path converted to a slug (e.g. `/Users/dev/my-project` → `-Users-dev-my-project`).
+- **Path Slug**: omp's bucket name for the canonical (realpath) cwd: `-<relative>` under `$HOME` (`/home/me/git/x` → `-git-x`), `-tmp-<relative>` under the temp root, and `--<absolute>--` for anything else (`/srv/x` → `--srv-x--`), with `/`, `\` and `:` turned into `-`. The sessions root is `$PI_CODING_AGENT_DIR/sessions`, default `~/.omp/agent/sessions`. `src/providers/omp/paths.ts` mirrors this.
+- **Tree**: entries carry `id`/`parentId`; the conversation is the path from the last entry back to the root, so branches abandoned by `/tree` or an edit stay in the file but are not shown.
+- **Leases and forks**: a process owns a session while it lives. A second process that writes it moves to a sibling file (new id, `parentSession` pointing back). When OpenChamber's child does this, the sidecar appends an `oc_alias` line carrying the OpenChamber session id to the sibling, and that id continues there. An idle child is released after `OC_CHILD_IDLE_MS` (default 120000) so a terminal omp can take the session over without forking. `parentSession` is lineage only; just artifact sub-sessions are children.
 - **File Format**: Append-only (or state-rewritten) JSON Lines.
 - **Header Line**: The first line contains a `type: "session"` metadata object:
   ```json
