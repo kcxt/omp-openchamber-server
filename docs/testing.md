@@ -1,65 +1,52 @@
 # Testing and coverage
 
-Three layers. Run them with `bun test` (unit + contract, `src/`), `bun run test:e2e` (browser, `test/e2e/`) and `bun run test:live` (real omp, opt-in, needs credentials; not run in CI or offline).
+One layer: `bun test` (alias for `bun test --timeout 90000 test/e2e`). The old unit/contract suites, the mock omp and the Jarvis adapter were removed; every test now drives the real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp`, with a throwaway `$HOME`, `PI_CODING_AGENT_DIR` and `TMPDIR`. No network, no credentials.
 
-`bun test src` has 30 failures that exist on the pre-e2e baseline (mostly `sse.test.ts`, `contract.test.ts`, `integration.test.ts`, the fake-backend HTTP tests, and part of the approvals/orchestration suites). They are untriaged, so treat those areas as **not currently verified** by the unit layer.
-
-## 1. Offline end-to-end (`test/e2e`)
-
-Real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp` (scripted omp that speaks the RPC protocol and persists sessions like omp). Throwaway `$HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR`; no network, no credentials. The stub is the main fidelity limit: it was written from omp's docs, never diffed against a real omp.
+The stub is the main fidelity limit: it was written from omp's docs and never diffed against a real omp. Script format (`when`, text/thinking/tool/sleep/hang/fail/crash steps) is documented at the top of the stub and in `test/e2e/stack.ts`.
 
 | File | What it asserts |
 |---|---|
-| `sessions.test.ts` | Terminal-written sessions are listed (API and sidebar) for a project under `$HOME`, outside `$HOME`, and reached via symlink; sessions created through the API land in omp's bucket. |
-| `chat.test.ts` | Text, reasoning, a bash tool card with command/output, todo panel (statuses, counts), v2 transcript shape, reload parity, model switch reaching omp `set_model` and the recorded turn. |
-| `history.test.ts` | Offset paging of `/session/:id/message` visits every message once (80 msgs); Export Markdown contains each message once, live and after reload; only the active `/tree` branch is shown. |
-| `edit.test.ts` | Cancel mid-stream (idle, partial kept once, next prompt works, omp context correct); "Revert to this message" edit (OpenChamber, file, and omp context agree); Redo; Fork from here. |
-| `takeover.test.ts` | A terminal omp holding the lease -> OpenChamber continues in a fork under the same id; idle release lets the terminal resume the same file; `/fork` lineage sessions are top-level. |
-
-## 2. Unit and contract suites (`src/**/*.test.ts`, mock omp)
-
-Route-level contract tests against `test/mock-omp.mjs`, plus focused suites for approvals/questions, browser control, git, image budget, project context, small-model/title generation, subagents, message mapping from JSONL (`messages.file.test.ts`), event normalisation, the RPC transport, the credential runtime, the Jarvis adapter, and the fake second backend. Some of these are in the failing set above.
+| `sessions` | Terminal-written sessions are listed (API and sidebar) for a project under `$HOME`, outside `$HOME`, and via symlink; API-created sessions land in omp's bucket. |
+| `chat` | Text, reasoning, bash tool card with command/output, todo panel, v2 transcript shape, reload parity, model switch reaching omp and the recorded turn. |
+| `history` | 80-message paging, Export Markdown (live and after reload), active `/tree` branch only. |
+| `edit` | Cancel mid-stream; "Revert to this message" edit (UI, file and omp context agree); Redo; Fork from here. |
+| `takeover` | A session a terminal omp still owns is refused (toast + API 400, no fork); once it exits the same file continues; idle release lets the terminal resume in place; `/fork` lineage sessions are top-level. |
+| `panels` | Git (branch, change), Changes, Files, Terminal (runs a command in the project), Project knowledge notes (survive reload), Context/Walkthrough/Browser open; Stats, Issues and PRs, Scheduled tasks, Archive, Integrations catalog, Settings open; the sidecar served every request those made. |
+| `failures` | Model API error (shown, idle, next turn works, survives reload); omp child dying mid-turn (error shown, idle, fresh child); sidecar SIGTERM and SIGKILL (history kept, open tab keeps working, reload consistent); sidecar killed mid-turn (ends idle). |
 
 ## API coverage at a glance
 
 | Surface | Level |
 |---|---|
-| Session list / get / create / delete | e2e (list, create, reload, delete not asserted) + unit |
-| Session rename, archive, move, mark viewed, pin metadata | unit only |
-| Message list + paging (`/session/:id/message`) | e2e |
-| Prompt (`prompt`, `prompt_async`, `message`) incl. model pick, thinking | e2e (plain text, tools, model); steer/queue, images, files, goals: unit only |
-| Abort / interrupt | e2e (abort); interrupt route unit only |
-| Revert stage / clear (Redo) / implicit commit before prompt | e2e; explicit `/revert/commit` route unit only |
-| Fork (`/session/:id/fork`, with `before`) | e2e (from here); fork-whole-session unit only |
-| SSE event stream (`/event`, `/global/event`) translated to UI state | e2e implicitly (text, reasoning, tool, todo, status, usage); websocket events, reconnection and heartbeat-loss recovery not covered |
-| Todos (`/session/:id/todo`) | e2e |
-| Providers / models / thinking levels | e2e (catalog, pick); credentials and `credentialRef` flows unit only |
-| Subagents / children (`/children`, subagent lifecycle events) | unit only (the stub emits no subagent frames) |
-| Permissions and questions (approvals bridge, `question` extension) | unit only |
-| Compaction (`summarize`/`compact`) | unit only; stub has a trivial `compact` |
-| Shell (`/session/:id/shell`), commands (`/command`) | unit only |
-| Git, file browsing/search, diff, raw files | unit only (git.test.ts); nothing in e2e |
-| Terminal websocket | not covered |
-| Message queue / inbox routes, steering mid-turn | unit only |
-| Goals, notes/plans/project context, session knowledge | unit only |
-| Settings routes, omp settings panel, config PATCH | unit only; some failing in baseline |
+| Session list / get / create / delete / archive | e2e (delete and rename not asserted) |
+| Message list + paging, export | e2e |
+| Prompt (`prompt`, `prompt_async`, `message`), model pick | e2e (text, tools, model); steer/queue, images, files, goals not covered |
+| Abort | e2e; `interrupt` route not covered |
+| Revert stage / Redo / implicit commit before prompt | e2e; explicit `/revert/commit` not covered |
+| Fork (`/session/:id/fork`) | e2e (from here) |
+| Refusing to prompt a session another omp owns | e2e |
+| SSE event stream translated to UI state | e2e implicitly (text, reasoning, tool, todo, status, usage, reconnect after restart); websocket events not covered |
+| Todos, Stats (`/experimental/session/stats`) | e2e |
+| Providers / models | e2e (catalog, pick); credentials / `credentialRef` not covered |
+| Git, files, terminal websocket, project notes | e2e through the panels |
+| Provider errors, child crash, sidecar restart | e2e |
+| Subagents / children and their lifecycle events | not covered (stub emits no subagent frames) |
+| Permissions and questions (approvals bridge, `question` extension) | not covered |
+| Compaction, shell (`/session/:id/shell`), slash commands | not covered |
+| Message queue / inbox, steering mid-turn | not covered |
+| Goals, plans, session knowledge | not covered |
+| Settings routes, omp settings panel | Settings dialog opens; routes not asserted |
+| Image attachments / blobs | not covered |
 | Auth / passkey / UI password | stub, not covered |
-| Jarvis internal adapter | unit + one smoke test in `e2e-openchamber.test.ts` |
-| Browser control broker | unit only |
-| Image attachments / blobs | unit only |
-| omp RPC failures: provider error, process crash, rpc timeout | unit only (stub supports `{fail}` but no e2e asserts it) |
+| Browser control broker | not covered (Browser panel only opens) |
 
 ## Where more attention is likely to pay off
 
-1. **The failing baseline in `src/`.** 30 tests, including the SSE envelope and contract suites, are red and nobody has looked.
-2. **Stub fidelity.** Real omp may differ on lease/fork timing, what `get_state.sessionFile` returns, `session_exit` records written when a child is SIGTERMed (idle release and revert now kill children more often), and how it reacts to the sidecar's own marker lines (`revert_change`, `viewed`, `oc_alias`, ...) appended to files it owns. A real-omp smoke (`test:live`) over fork/revert would settle this.
-3. **Steering, queued prompts and concurrent prompts** during a turn: only unit-tested with fake transports.
-4. **Subagents and approvals in the UI**: no e2e, and the stub has no frames for them.
-5. **Provider errors and a crashed child** as seen in the UI.
-6. **Restart behaviour**: `stack.restartSidecar()` exists but no test uses it. After a restart the alias index is rebuilt only by a session list, so a prompt before any list could resolve the pre-fork file.
-7. **Live partial text**: only the last open block of a turn is closed on omp's `text_end`; steered or interleaved parts are not exercised.
-8. **Deleting, archiving and renaming** sessions from the UI, and large or compacted histories.
-
-## Routes the UI asked for that we do not implement
-
-Across the e2e runs only `GET /api/websearch/provider` fell through to 404 (logged once per route as "unimplemented route"). Panels that were never opened in e2e (git, terminal, files, settings pages, scheduled tasks, stats) were not probed, so their missing routes are unknown; the sidecar log line is the quickest way to find them.
+1. **Stub fidelity.** Real omp may differ on lease/fork timing, `get_state.sessionFile`, `get_session_lease` (on Linux it probes an abstract socket; the stub uses pid files), `session_exit` records written when a child is SIGTERMed (idle release and revert kill children more often), and how it reacts to the sidecar's own marker lines (`revert_change`, `viewed`, `oc_alias`, ...) appended to files it owns. A real-omp smoke over fork/revert/ownership would settle this.
+2. **Ownership probe cost.** Every first prompt of a session without a live child spawns a probe omp (`get_session_lease`). A terminal omp that has the session open but has not written yet holds no lease and cannot be detected.
+3. **Steering, queued prompts, concurrent prompts, subagents, approvals** during a turn: no coverage at all now that the unit suites are gone.
+4. **Compaction, shell, slash commands, images, goals.**
+5. **The `alias` path** (omp moves the session after the sidecar's check): implemented, no longer exercised since ownership is refused up front.
+6. **OpenChamber-owned failures** seen in panels and deliberately ignored: `/api/source-control/binding` (422, no GitHub binding) and `/api/git/worktrees/archives` (500) come from OpenChamber's own web server, not the sidecar.
+7. Deleting and renaming sessions from the UI, large or compacted histories.
+8. Known TypeScript errors in `bun run check` (about 16, unrelated to the tests) are untouched.

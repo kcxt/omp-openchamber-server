@@ -38,6 +38,7 @@ import {
   mimeFromPath,
   abortSession,
   discardSessionConnection,
+  sessionOwnedElsewhere,
   compactSession,
   getSessionStatusMap,
   reconcileSessionStatuses,
@@ -68,6 +69,7 @@ import { createTerminalRuntime, TERMINAL_WS_PATH } from "./adapters/openchamber/
 import { createClientAuthRuntime } from "./adapters/openchamber/client-auth";
 import { handleGitRequest } from "./adapters/openchamber/git";
 import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/message-queue";
+import { buildUsageStats } from "./adapters/openchamber/usage-stats";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
 import { createSessionKnowledgeRuntime, handleSessionKnowledgeRequest } from "./adapters/openchamber/session-knowledge";
 
@@ -253,6 +255,21 @@ async function resolveSessionRoute(openCodeId: string, dir: string | undefined) 
   const backend = backendForSession(openCodeId);
   const session = (await backend.store.get(openCodeId, dir)) || (await backend.store.get(openCodeId));
   return { backend, session };
+}
+
+/**
+ * A session a terminal omp has open must not be prompted from here: omp would
+ * silently fork it. OpenChamber cannot ask for confirmation mid-send, so refuse
+ * with a message that says what to do.
+ */
+async function refuseIfOpenElsewhere(
+  sessionID: string,
+  session: NonNullable<Awaited<ReturnType<typeof resolveSessionRoute>>["session"]>,
+): Promise<string | null> {
+  if (!(await sessionOwnedElsewhere(sessionID, session.directory, session.path))) return null;
+  return (
+    "This session is open in another omp. Close that omp window and send again, or use \"Fork from here\" to continue in a copy."
+  );
 }
 
 type RevertCommitResult = "none" | "committed" | "cleared" | "boundary-missing";
@@ -1688,6 +1705,30 @@ const MIME_TYPES: Record<string, string> = {
         }
       }
 
+      // Stats page. Built from the transcripts omp wrote.
+      if (p === "/experimental/session/stats" && req.method === "GET") {
+        try {
+          const num = (name: string) => {
+            const value = Number(url.searchParams.get(name));
+            return url.searchParams.get(name) && Number.isFinite(value) ? value : undefined;
+          };
+          const data = await buildUsageStats({
+            from: num("from"),
+            to: num("to"),
+            timezone: url.searchParams.get("timezone") || "UTC",
+            tools: url.searchParams.get("tools") === "detail" ? "detail" : "none",
+          });
+          return json({ data });
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "stats failed", 500);
+        }
+      }
+
+      // Lists the UI probes; omp has no equivalents, so they are empty rather than missing.
+      if ((p === "/websearch/provider" || p === "/plugin") && req.method === "GET") {
+        return json({ data: [] });
+      }
+
       // Session list (GET /session)
       if (p === "/session" && req.method === "GET") {
         try {
@@ -2439,6 +2480,8 @@ const MIME_TYPES: Record<string, string> = {
         const input = asRecord(body);
         const { backend, session } = await resolveSessionRoute(sessionID, dir);
         if (!session) return jsonError("session not found", 404);
+        const held = await refuseIfOpenElsewhere(sessionID, session);
+        if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
         await commitStagedRevert(sessionID, backend, session);
         const result = await promptSessionAsync(sessionID, session.directory, session.path, body, session.model);
         if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
@@ -2482,6 +2525,8 @@ const MIME_TYPES: Record<string, string> = {
         const body = await readJson(req);
         const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
+        const held = await refuseIfOpenElsewhere(openCodeId, session);
+        if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
         await commitStagedRevert(openCodeId, backend, session);
         const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });
@@ -2498,6 +2543,8 @@ const MIME_TYPES: Record<string, string> = {
         const body = await readJson(req);
         const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
+        const held = await refuseIfOpenElsewhere(openCodeId, session);
+        if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
         await commitStagedRevert(openCodeId, backend, session);
         const result = await promptSessionAsync(openCodeId, session.directory, session.path, body, session.model);
         if (result.queued) return json({ queued: true });

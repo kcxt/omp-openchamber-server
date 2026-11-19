@@ -22,6 +22,7 @@ export type Step =
   | { sleep: number }
   | { hang: true }
   | { fail: string }
+  | { crash: true }
   | { tool: string; args?: Record<string, unknown>; result?: string; isError?: boolean; details?: unknown; sleep?: number };
 export type Turn = { when?: string; steps: Step[] };
 
@@ -164,9 +165,9 @@ export async function startStack(options: { env?: Record<string, string> } = {})
       page.setDefaultTimeout(15_000);
       return page;
     },
-    /** Restart only the sidecar (a fresh process, same disk state). */
-    async restartSidecar(): Promise<void> {
-      sidecar.kill();
+    /** Restart only the sidecar (a fresh process, same disk state). SIGKILL simulates a crash: no shutdown hooks run. */
+    async restartSidecar(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+      sidecar.kill(signal);
       await sidecar.exited;
       sidecar = startSidecar();
       await waitFor("sidecar", async () => (await fetch(`${api}/health`)).ok);

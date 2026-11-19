@@ -458,5 +458,7 @@ export interface AgentBackend {
     openCodeId: string,
     auth?: BackendCredentialInput,
   ): Promise<BackendTurnConnection>;
+  /** True when another live process (a terminal omp) owns the session's transcript. */
+  sessionOwnedElsewhere?(cwd: string, transcriptPath: string): Promise<boolean>;
   shutdownAll(): void;
 }

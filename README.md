@@ -85,13 +85,11 @@ Anything unlisted that falls through returns `404 not implemented`.
 
 ```bash
 bun run check    # type-check
-bun test         # unit + contract suites (unset OC_SIDECAR_HOST first)
-bun run test:e2e # OpenChamber UI in headless Chromium -> sidecar -> stub omp, fully offline
-bun run test:live
+bun test         # OpenChamber UI in headless Chromium -> sidecar -> stub omp, fully offline
 ```
 
-`test:e2e` needs `openchamber` on `PATH` and Chromium (`CHROMIUM_PATH` overrides `/usr/bin/chromium`). Each run builds a throwaway `$HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR` and OpenChamber data dir with an explicit child environment, so it never reads `~/.omp` or any API key. `omp` is `test/stub-omp/omp`, a scripted stand-in that speaks omp's RPC protocol and persists sessions the way omp does (bucket naming, `id`/`parentId` tree, session leases, `navigate_tree`/`fork`); `test/e2e/stack.ts` documents its script format. `E2E_KEEP=1` keeps the run directory.
+`bun test` needs `openchamber` on `PATH` and Chromium (`CHROMIUM_PATH` overrides `/usr/bin/chromium`). Each run builds a throwaway `$HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR` and OpenChamber data dir with an explicit child environment, so it never reads `~/.omp` or any API key. `omp` is `test/stub-omp/omp`, a scripted stand-in that speaks omp's RPC protocol and persists sessions the way omp does (bucket naming, `id`/`parentId` tree, session leases, `navigate_tree`/`fork`); `test/e2e/stack.ts` documents its script format. `E2E_KEEP=1` keeps the run directory. See [`docs/testing.md`](./docs/testing.md).
 
-Layout: `src/server.ts` (routing) · `src/adapters/openchamber/` (OpenChamber/OpenCode compat) · `src/adapters/jarvis/` · `src/providers/omp/` (RPC, session store) · `src/shared/`.
+Layout: `src/server.ts` (routing) · `src/adapters/openchamber/` (OpenChamber/OpenCode compat) · `src/providers/omp/` (RPC, session store) · `src/shared/`.
 
 Docs: [`architecture`](./docs/architecture.md) · [`api-reference`](./docs/api-reference.md) · [`providers`](./docs/providers.md) · [`omp-protocol`](./docs/omp-protocol.md) · [`openchamber-contract`](./docs/openchamber-contract.md)

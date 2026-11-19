@@ -1517,6 +1517,17 @@ export async function discardSessionConnection(openCodeId: string, cwd: string):
   }
 }
 
+/**
+ * Whether sending to this session would make omp fork it: another process
+ * (typically a terminal omp) owns its transcript. This sidecar's own live child
+ * counts as the owner, so only sessions without one are probed.
+ */
+export async function sessionOwnedElsewhere(openCodeId: string, cwd: string, transcriptPath: string): Promise<boolean> {
+  const state = sessionStates.get(sessionKey(openCodeId, cwd));
+  if (state && state.conn.isAlive?.() !== false) return false;
+  return (await backendForSession(openCodeId).sessionOwnedElsewhere?.(cwd, transcriptPath)) ?? false;
+}
+
 export async function abortSession(openCodeId: string, cwd: string): Promise<boolean> {
   const key = sessionKey(openCodeId, cwd);
   const release = await acquireSessionLock(key);

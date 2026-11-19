@@ -56,7 +56,7 @@ NoNewPrivileges=yes
 BindPaths=%h/.config/openchamber /hdd/brute/projects -%h/git %h/.omp %h/.pi %h/.paseo %h/.cache %h/.cargo %h/.rustup
 
 # Read-only: the omp binary link itself, bun cache, dotfiles agents read.
-BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.zshrc
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.gitignore %h/.zshrc
 
 # Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
 # lines in harness-sandbox.sh), e.g.:

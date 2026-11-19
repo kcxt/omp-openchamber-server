@@ -41,6 +41,7 @@ import {
   setOmpSessionTitle,
   updateOmpSession,
   adoptOmpTranscript,
+  readSessionIdSync,
 } from "./store";
 
 export interface OmpTurnContext {
@@ -311,6 +312,15 @@ export const ompBackend: AgentBackend = {
       ? await ompTransportFactory(cwd, sessionPath)
       : await ompTransportFactory(cwd, sessionPath, credential);
     return createOmpTurnConnection(transport, { openCodeId, cwd, sessionPath });
+  },
+  async sessionOwnedElsewhere(cwd, transcriptPath) {
+    const id = readSessionIdSync(transcriptPath);
+    if (!id) return false;
+    // A fresh omp that never opened the session: `held` can only be another process.
+    return withOmpRpc(cwd, async (conn) => {
+      const lease = (await conn.request("get_session_lease", { sessionIds: [id] })) as { held?: unknown } | undefined;
+      return Array.isArray(lease?.held) && lease.held.includes(id);
+    }).catch(() => false);
   },
   shutdownAll() {
     OmpRpcConnection.killAll();

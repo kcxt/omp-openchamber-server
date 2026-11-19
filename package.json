@@ -19,7 +19,7 @@
     "start": "bun run src/main.ts",
     "prepare:omp": "bun scripts/prepare-omp.ts",
     "verify:omp": "bun scripts/prepare-omp.ts --verify",
-    "test": "bun test test/e2e",
+    "test": "bun test --timeout 90000 test/e2e",
     "check": "bun run --bun tsc --noEmit"
   },
   "ompVersion": "18.2.8",

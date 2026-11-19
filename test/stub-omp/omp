@@ -20,7 +20,7 @@
 //                    has none) runs; with no match the stub echoes the prompt.
 //                    Steps: {"text"} ("{{users}}" expands to the number of user
 //                    messages in omp's current context) {"thinking"} {"sleep":ms} {"hang":true}
-//                    {"fail":"message"} {"tool":"bash","args":{},"result":"text",
+//                    {"fail":"message"} {"crash":true} (process dies mid-turn) {"tool":"bash","args":{},"result":"text",
 //                    "isError":bool,"details":{}}
 //   OMP_STUB_RECORD  file that receives every inbound frame (JSONL)
 //   OMP_STUB_TICK_MS pause between streamed chunks (default 4)
@@ -265,6 +265,7 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
 
     for (const step of group.content) {
       if (aborted) break;
+      if (step.crash) process.exit(7); // dies like a segfault/OOM kill: no frames, no cleanup
       if (step.fail) { failure = String(step.fail); break; }
       if (step.sleep) { await pause(step.sleep); continue; }
       if (step.hang) { while (!aborted) await pause(60_000); break; }

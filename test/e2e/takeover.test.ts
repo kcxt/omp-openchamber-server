@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { OmpInstance } from "./omp";
 import { startStack, type Stack } from "./stack";
-import { openSession, send } from "./ui";
+import { composer, openSession, send } from "./ui";
 
 let stack: Stack;
 
@@ -19,7 +19,7 @@ const header = (records: Array<Record<string, any>>) => records.find((r) => r.ty
 const fileOf = (marker: string) => stack.sessionFiles().filter((f) => userTexts(f.records).includes(marker));
 
 describe("the terminal still has the session open", () => {
-  test("OpenChamber continues it in a fork, like a second omp instance would", async () => {
+  test("OpenChamber refuses to send, so nothing is forked by accident", async () => {
     const terminal = await OmpInstance.start(stack, stack.project);
     await terminal.prompt("from the terminal");
     const original = (await terminal.state()).sessionFile!;
@@ -28,26 +28,25 @@ describe("the terminal still has the session open", () => {
     await page.goto(stack.ui);
     await openSession(page, "from the terminal");
     await send(page, "from openchamber");
-    await page.getByText("Echo: from openchamber").waitFor();
-    // Settle: the fork is discovered when the turn ends.
-    await Bun.sleep(600);
+    // The refusal reaches the user as a toast.
+    await page.getByText(/open in another omp/).first().waitFor();
 
-    // The terminal's own session is untouched; the continuation lives in a sibling that points back.
-    const files = stack.sessionFiles();
-    const mine = files.find((f) => f.path === original)!;
-    expect(userTexts(mine.records)).toEqual(["from the terminal"]);
-    const fork = files.find((f) => f.path !== original && userTexts(f.records).includes("from openchamber"))!;
-    expect(userTexts(fork.records)).toEqual(["from the terminal", "from openchamber"]);
-    expect(header(fork.records).parentSession).toBe(header(mine.records).id);
+    // The API says the same, and no sibling transcript appeared.
+    const id = (await listed()).find((s) => s.title === "from the terminal")!.id;
+    const direct = await stack.http(`/session/${id}/prompt_async?directory=${dir()}`, { json: { parts: [{ type: "text", text: "again" }] } });
+    expect(direct.status).toBe(400);
+    expect(JSON.stringify(direct.body)).toContain("another omp");
+    expect(stack.sessionFiles().filter((f) => f.path !== original && userTexts(f.records).includes("from the terminal"))).toEqual([]);
 
-    // OpenChamber still has one session for it, and it carries both turns after a reload.
-    const sessions = (await listed()).filter((s) => s.title === "from the terminal");
-    expect(sessions.length).toBe(1);
-    expect(sessions[0]!.parentID).toBeUndefined();
-    await page.reload();
-    await page.getByText("Echo: from openchamber").waitFor();
-    await page.getByText("Echo: from the terminal").waitFor();
+    // Once the terminal lets go, the very same session continues in place.
     await terminal.close();
+    await composer(page).click();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("from openchamber, later");
+    await page.keyboard.press("Enter");
+    await page.getByText("Echo: from openchamber, later").waitFor();
+    expect(userTexts(fileOf("from openchamber, later")[0]!.records)).toEqual(["from the terminal", "from openchamber, later"]);
+    expect(fileOf("from openchamber, later").map((f) => f.path)).toEqual([original]);
   });
 });
 
