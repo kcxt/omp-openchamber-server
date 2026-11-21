@@ -116,7 +116,8 @@ export async function startStack(options: { env?: Record<string, string> } = {})
   const ui = `http://127.0.0.1:${uiPort}`;
   await waitFor("openchamber", async () => (await fetch(`${ui}/health`)).ok, 60_000);
 
-  const browser: Browser = await chromium.launch({ executablePath: CHROMIUM, headless: true, args: ["--no-sandbox"] });
+  // Launched on first page(): API-only tests need no browser.
+  let browser: Browser | undefined;
 
   const stack = {
     root, home, agentDir, project, outside, api, ui, logs,
@@ -160,6 +161,7 @@ export async function startStack(options: { env?: Record<string, string> } = {})
       return { status: res.status, body };
     },
     async page(): Promise<Page> {
+      browser ??= await chromium.launch({ executablePath: CHROMIUM, headless: true, args: ["--no-sandbox"], env: { ...process.env, HOME: home } });
       const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true });
       const page = await context.newPage();
       page.setDefaultTimeout(15_000);
@@ -176,7 +178,7 @@ export async function startStack(options: { env?: Record<string, string> } = {})
       return readFileSync(join(logs, `${name}.log`), "utf8");
     },
     async stop(): Promise<void> {
-      await browser.close().catch(() => {});
+      await browser?.close().catch(() => {});
       for (const child of children) child.kill();
       await Promise.all(children.map((c) => c.exited));
       if (!process.env.E2E_KEEP) rmSync(root, { recursive: true, force: true });

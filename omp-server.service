@@ -35,7 +35,7 @@ Environment=OMP_BIN=%h/bin/omp
 # OC_SIDECAR_HOST to a tailnet address; it has no auth of its own.
 # Environment=OC_SIDECAR_HOST=100.x.y.z
 # Per-request access log, off by default:
-Environment=LOG_LEVEL=debug
+# Environment=LOG_LEVEL=debug
 # Optional secrets (EXA_API_KEY, NVIDIA_API_KEY, ...); missing file is ignored.
 EnvironmentFile=-%h/.config/omp-openchamber-server/env
 Restart=on-failure

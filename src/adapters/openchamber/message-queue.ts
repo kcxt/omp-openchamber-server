@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { backendForSession } from "../../providers/registry";
-import { promptSessionAsync, getSessionStatusMap } from "./prompt";
+import { promptSessionAsync, getSessionStatusMap, sessionOwnedElsewhere } from "./prompt";
 import { emitOpenCodeEvent, subscribeOpenCodeEvents } from "../../shared/sse";
 
 const MAX_SESSIONS = 50;
@@ -397,7 +397,10 @@ export function createMessageQueueRuntime(): MessageQueueRuntime {
     };
 
     try {
-      const result = await promptSessionAsync(sessionId, entry.directory, session.path, body);
+      // A terminal omp holding the session would make this send fork it; keep the item queued and retry.
+      const result = (await sessionOwnedElsewhere(sessionId, entry.directory, session.path))
+        ? { queued: false }
+        : await promptSessionAsync(sessionId, entry.directory, session.path, body);
       if (!result.queued) {
         sending.delete(sessionId);
         bump(sessionId);

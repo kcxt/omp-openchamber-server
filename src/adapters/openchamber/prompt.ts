@@ -50,7 +50,8 @@ import {
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { isBlobRef, readBlobBufferSync } from "../../shared/blobs";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { appendFile, readFile } from "node:fs/promises";
+import { invalidateMessageCache } from "../../providers/omp/messages";
 import { isAbsolute, resolve } from "node:path";
 
 interface OpenCodeTextPart {
@@ -786,6 +787,7 @@ export function createEventHandler(
   onComplete: () => void,
   cwd?: string,
   pendingInbox?: string[],
+  persistNotice?: (text: string, level: string, timestamp: number) => void,
 ): (event: NormalizedTurnEvent) => void {
   const subagentScope = cwd === undefined ? undefined : { key: sessionKey(openCodeId, cwd), directory: cwd };
   let currentParentID = parentMessageID;
@@ -1052,6 +1054,25 @@ export function createEventHandler(
         });
         emitQuestionAsked(qReq as unknown as Record<string, unknown>, cwd);
         emitFormCreated(toOpenCodeFormRequest(qReq) as unknown as Record<string, unknown>, cwd);
+        return;
+      }
+      case "notice": {
+        ensureStarted();
+        finalizeCurrentPart();
+        const now = Date.now();
+        const text = event.level === "info" ? event.text : `⚠️ ${event.text}`;
+        emitAssistantPart(
+          openCodeId,
+          assistantMessageID!,
+          makePartId(openCodeId, assistantMessageID!, "text", partOrdinals.text++),
+          "text",
+          text,
+          cwd,
+          now,
+          now,
+        );
+        partIndex++;
+        persistNotice?.(event.text, event.level, now);
         return;
       }
       case "compaction_start": {
@@ -1394,7 +1415,16 @@ export async function promptSessionAsync(
 
         state.unsubscribe();
         state.unsubscribe = state.conn.onEvent(
-          createEventHandler(openCodeId, parentMessageID, state.currentModel, complete, cwd, state.pendingInbox),
+          createEventHandler(
+            openCodeId, parentMessageID, state.currentModel, complete, cwd, state.pendingInbox,
+            // omp keeps no record of a command's notify message; without one the
+            // reply vanishes on the next refetch and the turn reads as unanswered.
+            (text, level, timestamp) => {
+              void appendFile(sessionPath, JSON.stringify({ type: "oc_notice", text, level, timestamp }) + "\n")
+                .then(() => invalidateMessageCache(openCodeId, cwd))
+                .catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, "[prompt] could not persist command notice"));
+            },
+          ),
         );
 
         await state.conn.prompt(
@@ -1515,6 +1545,12 @@ export async function discardSessionConnection(openCodeId: string, cwd: string):
   } finally {
     release();
   }
+}
+
+/** Whether this sidecar holds a live omp child for the session (it, not a transcript tail, emits its events). */
+export function isSessionDriven(openCodeId: string, cwd: string): boolean {
+  const state = sessionStates.get(sessionKey(openCodeId, cwd));
+  return state !== undefined && state.conn.isAlive?.() !== false;
 }
 
 /**

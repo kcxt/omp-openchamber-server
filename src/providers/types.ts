@@ -345,6 +345,8 @@ export type NormalizedTurnEvent =
   | { kind: "todo"; todos: OpenCodeTodo[] }
   | { kind: "compaction_start"; reason?: string; action?: string }
   | { kind: "compaction_end"; aborted?: boolean; willRetry?: boolean }
+  /** An extension command's `notify` message: the only reply a command that never invokes the agent gives. */
+  | { kind: "notice"; text: string; level: "info" | "warning" | "error" }
   /**
    * A user message omp appended to the transcript mid-turn: the steer or
    * follow-up it queued after the sidecar announced it as an inbox item.

@@ -15,6 +15,7 @@ import { invalidateMessageCache, mapOmpUsageToTokens, extractUserMessageText } f
 import { readSessionHeader, readSessionIdSync, toOpenCodeSessionId } from "./store";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "./todo";
 import type { OmpRpcEvent, OmpRpcTransport } from "./rpc";
+import { editToolMetadata } from "../../shared/edit-diff";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { promptLogger } from "../../shared/logger";
 
@@ -316,6 +317,14 @@ export function reduceToolPartState(
     const output = formatToolOutput(event.output ?? event.content ?? event.result ?? (typeof event.data === "object" && event.data != null ? event.data : undefined));
     if (output != null) {
       state.output = normalizeToolOutput(resolvedToolName, output, rawDetails);
+    }
+    if (!error && resolvedToolName?.toLowerCase() === "edit") {
+      // omp's tool_execution_end carries the tool result as `result: { content, details }`.
+      const resultDetails = typeof event.result === "object" && event.result != null && !Array.isArray(event.result)
+        ? (event.result as Record<string, unknown>).details
+        : undefined;
+      const metadata = editToolMetadata(rawDetails ?? resultDetails, state.input);
+      if (metadata) state.metadata = { ...state.metadata, ...metadata };
     }
     if (!state.time) state.time = { start: now };
     state.time.end = now;
@@ -723,7 +732,13 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       const title = String(event.title ?? "");
       const message = String(event.message ?? "");
 
-      if (method === "confirm") {
+      if (method === "notify") {
+        const text = String(event.message ?? "").trim();
+        if (text) {
+          const level = event.notifyType === "warning" || event.notifyType === "error" ? event.notifyType : "info";
+          emit({ kind: "notice", text, level });
+        }
+      } else if (method === "confirm") {
         emit({
           kind: "permission_request",
           id: reqId,

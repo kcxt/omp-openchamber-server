@@ -11,6 +11,9 @@ The stub is the main fidelity limit: it was written from omp's docs and never di
 | `history` | 80-message paging, Export Markdown (live and after reload), active `/tree` branch only. |
 | `edit` | Cancel mid-stream; "Revert to this message" edit (UI, file and omp context agree); Redo; Fork from here. |
 | `takeover` | A session a terminal omp still owns is refused (toast + API 400, no fork); once it exits the same file continues; idle release lets the terminal resume in place; `/fork` lineage sessions are top-level. |
+| `commands` | Plugin commands (`/pi-vcc`) are listed; `POST /session/:id/command` with only name/arguments reaches omp as `/name args`; reasoning streams as `session.reasoning.*` events and never as answer text. |
+| `edit-diff` | omp's numbered `details.diff` becomes unified hunks in the tool part's `metadata` (single file, batch, replace-mode input fallback); an edit call reaches the transcript with a patch. |
+| `follow` | A session a terminal omp owns is followed read-only: its appended messages arrive as events bracketed by busy/idle; nothing is written or forked. |
 | `panels` | Git (branch, change), Changes, Files, Terminal (runs a command in the project), Project knowledge notes (survive reload), Context/Walkthrough/Browser open; Stats, Issues and PRs, Scheduled tasks, Archive, Integrations catalog, Settings open; the sidecar served every request those made. |
 | `failures` | Model API error (shown, idle, next turn works, survives reload); omp child dying mid-turn (error shown, idle, fresh child); sidecar SIGTERM and SIGKILL (history kept, open tab keeps working, reload consistent); sidecar killed mid-turn (ends idle). |
 

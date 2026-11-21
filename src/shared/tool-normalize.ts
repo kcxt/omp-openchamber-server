@@ -101,6 +101,20 @@ export function normalizeToolInput(
     return normalized;
   }
 
+  if (tool === "edit") {
+    // Hashline calls carry everything in one `input` string headed `[path#TAG]`;
+    // OpenChamber's tool row needs a path to label the call instead of dumping JSON.
+    if (typeof normalized.input === "string" && normalized.path === undefined) {
+      const header = /^\[([^\]\n]+?)#[0-9A-Za-z]{2,}\]/m.exec(normalized.input);
+      if (header?.[1]) normalized.path = header[1];
+    }
+    // Replace-mode calls use old/new text; OpenCode's edit tool calls them oldString/newString.
+    for (const [from, to] of [["old_text", "oldString"], ["oldText", "oldString"], ["old_string", "oldString"], ["new_text", "newString"], ["newText", "newString"], ["new_string", "newString"]] as const) {
+      if (typeof normalized[from] === "string" && normalized[to] === undefined) normalized[to] = normalized[from];
+    }
+    if (typeof normalized.path === "string" && normalized.filePath === undefined) normalized.filePath = normalized.path;
+  }
+
   if (tool === "hub" || tool === "job") {
     if (normalized.ids && Array.isArray(normalized.ids)) {
       if (normalized.ids.length === 1) {

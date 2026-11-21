@@ -45,6 +45,8 @@ import {
   removeSessionState,
   shutdownAll,
 } from "./adapters/openchamber/prompt";
+import { followSession, followedStatuses, stopFollowingAll } from "./adapters/openchamber/follow";
+
 import { page, toV2FileAttachment, toV2Message, toV2Session } from "./adapters/openchamber/v2";
 import { attachOmpRecapAssist } from "./providers/omp/recap";
 import { readSessionTodos } from "./providers/omp/todo";
@@ -72,6 +74,9 @@ import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/
 import { buildUsageStats } from "./adapters/openchamber/usage-stats";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
 import { createSessionKnowledgeRuntime, handleSessionKnowledgeRequest } from "./adapters/openchamber/session-knowledge";
+
+/** Sessions this sidecar is driving plus those it only follows in another omp. */
+const allSessionStatuses = (directory?: string) => ({ ...followedStatuses(directory), ...getSessionStatusMap(directory) });
 
 // Optional fake backend (test-only): OC_FAKE_BACKEND=1 enables multi-backend
 // mode over the HTTP surface. Off by default so the omp-only path stays
@@ -724,7 +729,7 @@ const server = Bun.serve<SidecarWebSocketData>({
         await reconcileSessionStatuses();
         const now = Date.now();
         const sessions = Object.fromEntries(
-          Object.entries(getSessionStatusMap()).map(([sessionId, status]) => [sessionId, {
+          Object.entries(allSessionStatuses()).map(([sessionId, status]) => [sessionId, {
             status: status.type,
             lastUpdateAt: now,
           }]),
@@ -1761,7 +1766,7 @@ const MIME_TYPES: Record<string, string> = {
       // Session status
       if (p === "/session/status" && req.method === "GET") {
         await reconcileSessionStatuses(dir);
-        return json(getSessionStatusMap(dir));
+        return json(allSessionStatuses(dir));
       }
 
       // OpenCode v2 reports the global set of sessions with an active agent
@@ -1769,7 +1774,7 @@ const MIME_TYPES: Record<string, string> = {
       // so an unenveloped map reads as a failed call on the client.
       if (p === "/session/active" && req.method === "GET") {
         await reconcileSessionStatuses();
-        const statuses = getSessionStatusMap();
+        const statuses = allSessionStatuses();
         return json({
           data: Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])),
         });
@@ -2247,13 +2252,15 @@ const MIME_TYPES: Record<string, string> = {
         const command = typeof body?.name === "string" ? body.name : typeof body?.command === "string" ? body.command : "";
         const argumentsText = typeof body?.text === "string" ? body.text : typeof body?.arguments === "string" ? body.arguments : "";
         const commandText = `/${command}${argumentsText ? ` ${argumentsText}` : ""}`.trim();
+        const held = await refuseIfOpenElsewhere(openCodeId, session);
+        if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
         const result = await promptSessionAsync(openCodeId, session.directory, session.path, {
-          id: typeof body?.id === "string" ? body.id : undefined,
           text: commandText,
-          files: Array.isArray(body?.files) ? body.files : undefined,
-          agents: Array.isArray(body?.agents) ? body.agents : undefined,
-          skills: Array.isArray(body?.skills) ? body.skills : undefined,
-          delivery: body?.delivery === "steer" ? "steer" : body?.delivery === "queue" ? "queue" : undefined,
+          ...(typeof body?.id === "string" ? { id: body.id } : {}),
+          ...(Array.isArray(body?.files) ? { files: body.files } : {}),
+          ...(Array.isArray(body?.agents) ? { agents: body.agents } : {}),
+          ...(Array.isArray(body?.skills) ? { skills: body.skills } : {}),
+          ...(body?.delivery === "steer" || body?.delivery === "queue" ? { delivery: body.delivery } : {}),
         }, session.model);
         if (result.queued) return noContent();
         return jsonError(result.error ?? "command failed", result.status ?? 400);
@@ -2326,6 +2333,8 @@ const MIME_TYPES: Record<string, string> = {
         const { backend, session } = await resolveSessionRoute(msgMatch[1], dir);
         if (!session) return jsonError("session not found", 404);
         const messages = await backend.store.transcript(msgMatch[1], session.directory);
+        // Anything a terminal omp appends to this session from now on is pushed live.
+        if (messages != null) followSession(msgMatch[1], session.directory, session.path);
         if (messages == null) return jsonError("load failed", 500);
         const ordered = [...messages]
           .sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0))
@@ -3342,6 +3351,7 @@ function handleShutdownSignal(signal: string) {
     messageQueueRuntime.stop();
     void terminalRuntime.shutdown();
     shutdownAll();
+    stopFollowingAll();
   } catch {
     // ignore
   }

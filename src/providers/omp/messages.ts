@@ -10,6 +10,7 @@ import {
   listPersistedMessageIds,
   recordPersistedMessageId,
 } from "./title-db";
+import { editToolMetadata } from "../../shared/edit-diff";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import { resolveImageDataUrl, isBlobRef } from "../../shared/blobs";
@@ -654,6 +655,10 @@ function mergeToolResultIntoAssistant(
     target.state.error = content;
   } else {
     target.state.output = normalizeToolOutput(target.tool, content, msg.details ?? raw.details);
+    if (target.tool.toLowerCase() === "edit") {
+      const metadata = editToolMetadata(msg.details ?? raw.details, target.state.input);
+      if (metadata) target.state.metadata = { ...target.state.metadata, ...metadata };
+    }
   }
   // OpenChamber reads a todo list off the call's input; omp's `todo` tool takes
   // an op, so the list the call produced comes from its recorded details.
@@ -1288,6 +1293,19 @@ export async function loadMessagesFromFile(
         tokensAfter: typeof entry.tokensAfter === "number" ? entry.tokensAfter : undefined,
         method: typeof entry.method === "string" ? entry.method : undefined,
         timestamp: timestamp ?? Date.now(),
+      } as unknown as AgentMessage);
+      continue;
+    }
+
+    if (entry.type === "oc_notice") {
+      if (typeof entry.text !== "string" || typeof entry.timestamp !== "number") continue;
+      const text = entry.level === "info" ? entry.text : `⚠️ ${entry.text}`;
+      messages.push({
+        id: `notice_${entry.timestamp}`,
+        role: "assistant",
+        content: [{ type: "text", text }],
+        stopReason: "stop",
+        timestamp: entry.timestamp,
       } as unknown as AgentMessage);
       continue;
     }

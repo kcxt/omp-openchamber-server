@@ -233,6 +233,13 @@ function chunks(text: string): string[] {
 
 async function runTurn(promptId: string | undefined, text: string): Promise<void> {
   busy = true; aborted = false;
+  // Like omp's extension commands: a notify frame and no agent turn at all.
+  if (text.startsWith("/pi-vcc")) {
+    out({ type: "extension_ui_request", id: hex8(), method: "notify", message: "Nothing to compact yet.", notifyType: "warning" });
+    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
+    busy = false;
+    return;
+  }
   const newMessages: any[] = [];
   out({ type: "agent_start" });
   const userMsg = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
@@ -374,7 +381,7 @@ async function handle(frame: any): Promise<void> {
     switch (type) {
       case "get_state": return respond(id, type, stateData());
       case "get_available_models": return respond(id, type, MODELS.map(modelInfo));
-      case "get_available_commands": return respond(id, type, { commands: [] });
+      case "get_available_commands": return respond(id, type, { commands: [{ name: "pi-vcc", description: "Compact conversation with pi-vcc structured summary" }] });
       case "get_available_thinking_levels": return respond(id, type, model.reasoning ? ["off", "low", "medium", "high"] : ["off"]);
       case "set_model": {
         const m = MODELS.find((x) => x.provider === frame.provider && x.id === frame.modelId);
