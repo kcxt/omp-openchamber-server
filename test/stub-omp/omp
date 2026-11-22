@@ -840,6 +840,89 @@ async function resumeCommand(id: string | undefined, frame: any): Promise<void> 
   await runAgent(undefined, CONTINUE_TEXT, { synthetic: true });
   respond(id, "resume");
 }
+// ---------------------------------------------------------------- /btw (modes/rpc/rpc-btw.ts, session/btw-history.ts)
+// `btw` runs an ephemeral side turn against the session: no `agent_start`, nothing journaled in the transcript, answered
+// from the script by the question. Every turn is checkpointed into `<session file without .jsonl>/btw-history/entry-<id>.json`.
+type BtwTurn = { question: string; answer: string; status: string; createdAt: number; updatedAt: number; error?: string };
+type BtwRecord = BtwTurn & { id: string; leafId: string | null; followUps?: BtwTurn[] };
+let btwRunning: { record: BtwRecord; cancelled: boolean; wake?: () => void } | undefined;
+let btwSeq = 0;
+const btwDirectory = (): string | undefined => (file ? join(file.replace(/\.jsonl$/, ""), "btw-history") : undefined);
+function btwWrite(record: BtwRecord): void {
+  const dir = btwDirectory();
+  if (!dir) return;
+  mkdirSync(dir, { recursive: true });
+  const target = join(dir, `entry-${record.id}.json`);
+  writeFileSync(`${target}.tmp`, `${JSON.stringify(record)}\n`);
+  renameSync(`${target}.tmp`, target);
+}
+function btwRead(): BtwRecord[] {
+  const dir = btwDirectory();
+  if (!dir || !existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".json")).sort().flatMap((name) => {
+    try { return [JSON.parse(readFileSync(join(dir, name), "utf8")) as BtwRecord]; } catch { return []; }
+  });
+}
+function btwPatch(record: BtwRecord, patch: Partial<BtwTurn>): BtwRecord {
+  const followUps = record.followUps;
+  if (followUps?.length) return { ...record, followUps: [...followUps.slice(0, -1), { ...followUps.at(-1)!, ...patch }] };
+  return { ...record, ...patch };
+}
+function btwFinish(running: NonNullable<typeof btwRunning>, patch: Partial<BtwTurn>): void {
+  if (btwRunning !== running) return;
+  btwRunning = undefined;
+  running.record = btwPatch(running.record, patch);
+  out({ type: "btw_record", record: running.record });
+  btwWrite(running.record);
+}
+async function btwRun(running: NonNullable<typeof btwRunning>, question: string): Promise<void> {
+  const users = messages().filter((m) => m.role === "user").length;
+  const text = pickSteps(question).filter((s) => s.text !== undefined || s.sleep !== undefined);
+  let answer = "";
+  for (const step of text) {
+    if (step.sleep !== undefined) {
+      await Promise.race([sleep(Number(step.sleep)), new Promise<void>((r) => { running.wake = r; })]);
+    } else {
+      for (const piece of chunks(String(step.text).replaceAll("{{users}}", String(users)))) {
+        if (running.cancelled) return;
+        answer += piece;
+        running.record = btwPatch(running.record, { answer, updatedAt: Date.now() });
+        out({ type: "btw_delta", recordId: running.record.id, delta: piece });
+        await sleep(TICK);
+      }
+    }
+    if (running.cancelled) return;
+  }
+  btwFinish(running, { answer, status: "complete", updatedAt: Date.now() });
+}
+function btwAsk(id: string | undefined, frame: any): void {
+  const question = typeof frame.question === "string" ? frame.question.trim() : "";
+  if (!question) return fail(id, "btw", "btw requires a non-empty question");
+  if (btwRunning) return fail(id, "btw", "A /btw question is still running; cancel it first");
+  if (!model) return fail(id, "btw", "No active model available for /btw.");
+  if (!file || !existsSync(file)) { ensureOwnership(); file = file ?? newFilePath(header); writeWhole(file); }
+  const previous = frame.recordId === undefined ? undefined : btwRead().find((r) => r.id === frame.recordId);
+  if (frame.recordId !== undefined && !previous) return fail(id, "btw", `Unknown /btw topic: ${frame.recordId}`);
+  const at = Date.now();
+  const turn: BtwTurn = { question, answer: "", status: "running", createdAt: at, updatedAt: at };
+  const record: BtwRecord = previous ? { ...previous, followUps: [...(previous.followUps ?? []), turn] } : { ...turn, id: `${at}${String(++btwSeq).padStart(3, "0")}`, leafId: leaf };
+  btwWrite(record);
+  const running = { record, cancelled: false } as NonNullable<typeof btwRunning>;
+  btwRunning = running;
+  out({ type: "btw_record", record });
+  respond(id, "btw", { record });
+  // A macrotask: the `btw` response is written first, so it never trails this turn's frames.
+  setTimeout(() => void btwRun(running, question), 0);
+}
+function btwCancel(id: string | undefined, frame: any): void {
+  const running = btwRunning;
+  if (!running || (frame.recordId !== undefined && running.record.id !== frame.recordId)) return respond(id, "btw_cancel", { cancelled: false });
+  running.cancelled = true;
+  running.wake?.();
+  btwFinish(running, { status: "cancelled", updatedAt: Date.now() });
+  respond(id, "btw_cancel", { cancelled: true });
+}
+
 async function handle(frame: any): Promise<void> {
   const { id, type } = frame as { id?: string; type: string };
   // P1: the host's own message id must be a non-empty string wherever it is accepted.
@@ -1049,6 +1132,13 @@ async function handle(frame: any): Promise<void> {
         if (typeof frame.customType !== "string" || frame.customType.length === 0) return fail(id, type, "customType must be a non-empty string");
         const entry = append("custom", { customType: frame.customType, ...(frame.data !== undefined ? { data: frame.data } : {}) });
         return respond(id, type, { entryId: entry.id });
+      }
+      case "btw": return btwAsk(id, frame);
+      case "btw_cancel": return btwCancel(id, frame);
+      case "get_btw_history": {
+        const stored = new Map(btwRead().map((r) => [r.id, r]));
+        if (btwRunning) stored.set(btwRunning.record.id, btwRunning.record);
+        return respond(id, type, { records: [...stored.values()].sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id)) });
       }
       case "resume": return resumeCommand(id, frame);
       default: return fail(id, type, `Unknown command: ${type}`);

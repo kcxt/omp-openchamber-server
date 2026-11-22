@@ -1,6 +1,6 @@
 /** Turns: prompt, command, shell, abort, compact, and small-model generation. */
 import { randomUUID } from "node:crypto";
-import { abortSession, compactSession, promptSession, runShell } from "../sessions/service";
+import { abortSession, asideQuestionOf, compactSession, promptSession, runShell } from "../sessions/service";
 import { mimeFromPath } from "../sessions/prompt-input";
 import { generateSmallModelText } from "../adapters/openchamber/small-model";
 import { toV2FileAttachment } from "../adapters/openchamber/v2";
@@ -201,7 +201,8 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       if (!session) return jsonError("session not found", 404);
       const held = await refuseIfOpenElsewhere(sessionID, session);
       if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
-      await commitStagedRevert(sessionID, session);
+      // A side question is not a turn: it leaves a staged revert alone.
+      if (asideQuestionOf(body) === undefined) await commitStagedRevert(sessionID, session);
       const result = await promptSession(session, body);
       if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
       if (promptMatch[2] !== "prompt") return json({ queued: true });

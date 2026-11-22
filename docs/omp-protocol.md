@@ -45,6 +45,7 @@ omp --mode rpc --cwd <dir> --no-title --no-pty [--config <overlay>] [--extension
 | `set_subagent_subscription` | `{level:"off"\|"progress"\|"events"}` | `{level}` | Invalid level: `success:false`. |
 | `get_subagents`, `cancel_subagent{subagentId}`, `steer_subagent{subagentId,message}` | | `{subagents[]}`, `{cancelled}`, none | §5. |
 | `prompt "/move <dir>"` | | `{agentInvoked:false}` | Relocates the session (R5). Failure is only visible in `command_output`. |
+| `btw`, `btw_cancel`, `get_btw_history` | `{question, recordId?}`, `{recordId?}`, | `{record}`, `{cancelled}`, `{records[]}` | `/btw` side questions (§12): `recordId` continues a topic; one runs at a time; works while a run is live. |
 
 ## 3. Event frames
 
@@ -191,3 +192,9 @@ All three run in a fresh process, take no lease and write nothing (transcripts, 
   - Cost: ~0.8 s real (startup of the whole agent runtime); instant in the stub.
 - `omp session lease --json -- <id>…` → `{"held":[…],"unknown":[…]}`, the same answer as `get_session_lease` without a child (~0.2 s). `--` keeps ids starting with `-` from parsing as flags; no id: `Missing session id. Usage: omp session lease [--json] -- <session-id>...`.
 - `omp models --json` → `{"models":[{provider, kind:"chat", id, selector:"provider/id", name, contextWindow, maxTokens, reasoning, thinking: string[]|null, input[], cost{input,output,cacheRead,cacheWrite}, pricingStatus}]}`; `thinking` lists the supported levels for a reasoning model (`minimal, low, medium, high, xhigh`), `null` otherwise. With no provider configured: `{"models":[]}`, exit 0. ~1.5 s real.
+
+## 12. `/btw` side questions (`test/contract/btw.test.ts`)
+
+`btw {question}` answers a question beside the conversation: an ephemeral turn on a snapshot of the session, **no `agent_start`/`turn_start`/`message_*` frames, no transcript entry, no change to `get_state.isSettled`**, and it may be asked while a run streams. Frame order: `btw_record` (the topic, latest turn `status:"running"`, `answer:""`), the `btw` response `{record}`, `btw_delta{recordId, delta}`*, then a terminal `btw_record` (`complete`, or `cancelled`/`error` with `error`). A second `btw` while one runs fails (`A /btw question is still running; cancel it first`); `btw_cancel` ends the running one as `cancelled`; an empty question fails (`btw requires a non-empty question`).
+
+Every turn is checkpointed into `<session file without .jsonl>/btw-history/entry-<id>.json` (no `sessions/<scope>` level for the main session): `{id, leafId, question, answer, status, createdAt, updatedAt, error?, followUps?}`, `leafId` being the transcript leaf the topic was asked at (`null` before any entry). Streamed text is not checkpointed: a record left `running` belongs to a process that died. The sidecar only reads this store (`providers/omp/btw-history.ts`) and shows each turn as `/aside <question>` + the answer, after the entry `leafId` names.

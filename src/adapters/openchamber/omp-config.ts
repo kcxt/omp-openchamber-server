@@ -272,7 +272,7 @@ const commandInflight = new Map<string, Promise<SlashCommand[]>>();
  * (e.g. `/pi-vcc`). Read from a read-only `omp session inspect` of the
  * directory's newest session, so it is cached: answering it costs one omp spawn.
  */
-export async function listOmpSlashCommands(directory: string): Promise<SlashCommand[]> {
+async function loadOmpSlashCommands(directory: string): Promise<SlashCommand[]> {
   const cached = commandCache.get(directory);
   if (cached && Date.now() - cached.at < COMMAND_TTL_MS) return cached.commands;
   const pending = commandInflight.get(directory);
@@ -299,6 +299,14 @@ export async function listOmpSlashCommands(directory: string): Promise<SlashComm
   })();
   commandInflight.set(directory, load);
   return load;
+}
+
+/** `/aside` is the sidecar's name for omp's `/btw`. */
+const ASIDE_COMMAND: SlashCommand = { name: "aside", description: "Ask a side question without adding it to the conversation (omp /btw)" };
+
+export async function listOmpSlashCommands(directory: string): Promise<SlashCommand[]> {
+  const commands = await loadOmpSlashCommands(directory);
+  return commands.some((command) => command.name === ASIDE_COMMAND.name) ? commands : [...commands, ASIDE_COMMAND];
 }
 
 // -------------------------------------------------------------- routes

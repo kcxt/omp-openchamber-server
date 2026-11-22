@@ -7,6 +7,7 @@ import { goalChangeFor, ocGoalOf, type GoalChange } from "../adapters/openchambe
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { SessionDocs } from "../store/session-docs";
 import { CredentialInputError } from "../providers/omp/credentials";
+import { asideMessageIds } from "../providers/omp/btw-history";
 import { locateMessage } from "../providers/omp/messages";
 import { readSessionIdSync, toOpenCodeSessionId } from "../providers/omp/store";
 import { allBackends, backendById, backendForSession, nativeProviderID, splitProviderPrefix } from "../providers/registry";
@@ -16,6 +17,7 @@ import { promptLogger } from "../shared/logger";
 import {
   clearSessionSyntheticContext,
   emitUserPrompt,
+  extractPromptTextParts,
   isPromptBody,
   preparePrompt,
 } from "./prompt-input";
@@ -57,8 +59,37 @@ async function promptSubagent(session: OpenCodeSession, text: string, messageID:
   return { queued: true, messageID };
 }
 
+/** The question of an `/aside <question>` prompt (typed, or sent as the `aside` command); undefined for any other prompt. */
+export function asideQuestionOf(body: unknown): string | undefined {
+  if (!isPromptBody(body)) return undefined;
+  const text = extractPromptTextParts(body).filter((part) => part.synthetic !== true).map((part) => part.text).join("\n\n").trim();
+  const match = /^\/aside(?:\s+([\s\S]*))?$/i.exec(text);
+  return match ? (match[1] ?? "").trim() : undefined;
+}
+
+/**
+ * `/aside`: omp's `/btw` on the session's runtime (started when none is live;
+ * refused when another omp owns the session). It works mid-run and does not
+ * change the session's status. The messages come from the runtime's frames.
+ */
+async function askAside(session: OpenCodeSession, question: string): Promise<PromptOutcome> {
+  if (!question) return { queued: false, status: 400, error: "Usage: /aside <question>" };
+  if (isSubagentTranscript(session.path)) return { queued: false, status: 409, error: "Side questions are asked in the parent session." };
+  try {
+    const runtime = await Registry.ensure(session);
+    const topic = await runtime.btw(question);
+    return { queued: true, messageID: asideMessageIds(session.id, topic.id, 0, topic.createdAt).userId };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof OwnedElsewhereError) return { queued: false, error: message, status: 409 };
+    return { queued: false, error: message, status: /still running/i.test(message) ? 409 : 500 };
+  }
+}
+
 export async function promptSession(session: OpenCodeSession, body: unknown): Promise<PromptOutcome> {
   if (!isPromptBody(body)) return { queued: false, error: "invalid body", status: 400 };
+  const question = asideQuestionOf(body);
+  if (question !== undefined) return askAside(session, question);
   const prepared = await preparePrompt(session.id, session.directory, body);
   if ("error" in prepared) return { queued: false, error: prepared.error, status: 400 };
   if (isSubagentTranscript(session.path)) return promptSubagent(session, prepared.message, prepared.messageID);

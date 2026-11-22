@@ -16,6 +16,7 @@ import type {
   TokenBreakdown,
 } from "../types";
 import { contextPointOfMessage, type OmpContextPoint } from "./context";
+import { asideAnswerText, asideMessageIds, asideQuestionText, btwTurns, readBtwTopics, type BtwTopic, type BtwTurn } from "./btw-history";
 
 interface OmpTurnTelemetry {
   turnUsage: TokenBreakdown;
@@ -158,6 +159,8 @@ export interface AgentMessage {
   hostMessageId?: string;
   /** The transcript entry this message came from. */
   entryId?: string;
+  /** A `/btw` turn (omp's btw history); it is not a transcript message. */
+  aside?: { topicId: string; turnIndex: number; turn: BtwTurn };
   timestamp?: number;
   toolCallId?: string;
   toolName?: string;
@@ -541,6 +544,57 @@ function buildPromptTextParts(
   }));
 }
 
+/** The two messages of one `/btw` turn: the question as the user's, the answer as an assistant message marked as an aside. */
+function asideRecords(openCodeId: string, aside: NonNullable<AgentMessage["aside"]>): OpenCodeMessageRecord[] {
+  const { turn } = aside;
+  const { userId, assistantId } = asideMessageIds(openCodeId, aside.topicId, aside.turnIndex, turn.createdAt);
+  const live = turn.status === "running";
+  const finished = live ? undefined : turn.updatedAt;
+  const model = { id: "omp", providerID: "omp", modelID: "omp", variant: "default" };
+  const failed = turn.status === "error";
+  return [
+    {
+      info: { id: userId, role: "user", sessionID: openCodeId, agent: "omp", model, time: { created: turn.createdAt, completed: turn.createdAt } },
+      parts: [{
+        id: `part_${openCodeId}_${userId}_0`,
+        type: "text",
+        text: asideQuestionText(turn),
+        time: { start: turn.createdAt, end: turn.createdAt },
+        messageID: userId,
+        sessionID: openCodeId,
+      }],
+    },
+    {
+      info: {
+        id: assistantId,
+        role: "assistant",
+        sessionID: openCodeId,
+        parentID: userId,
+        agent: "omp",
+        model,
+        providerID: "omp",
+        modelID: "omp",
+        variant: "default",
+        mode: "aside",
+        metadata: { aside: { recordId: aside.topicId, turn: aside.turnIndex, status: turn.status } },
+        finish: live ? undefined : failed ? "error" : "stop",
+        ...(failed ? { error: { message: turn.error ?? "The side question failed." } } : {}),
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: turn.createdAt, ...(finished !== undefined ? { completed: finished } : {}) },
+      },
+      parts: [{
+        id: `part_${openCodeId}_${assistantId}_0`,
+        type: "text",
+        text: asideAnswerText(turn),
+        time: { start: turn.createdAt, ...(finished !== undefined ? { end: finished } : {}) },
+        messageID: assistantId,
+        sessionID: openCodeId,
+      }],
+    },
+  ];
+}
+
 /**
  * User message ids are exact, never matched by text or position: P1 stores the
  * client id on omp's entry (`hostMessageId`); a message from before the
@@ -593,7 +647,12 @@ export function mapRpcMessagesToOpenCodeRecords(
   };
 
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
+    const msg = messages[i]!;
+    if (msg.aside) {
+      // A side question: its own question and answer, never merged into the turn it sits in.
+      records.push(...asideRecords(openCodeId, msg.aside));
+      continue;
+    }
     if (msg.role === "developer") {
       // omp's own directives (resume's continue, goal nudges) read as a tool card in the turn they drive.
       const part = developerToolPart(msg, openCodeId);
@@ -818,9 +877,14 @@ function timestampOf(value: unknown): number | undefined {
  * The inner `message` object matches the AgentMessage shape the `get_messages`
  * RPC returns, so it flows through the same mapper.
  */
-function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: SessionDocNotice[] = []): AgentMessage[] {
+function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: SessionDocNotice[] = [], asides: BtwTopic[] = []): AgentMessage[] {
   const messages: AgentMessage[] = [];
+  /** entry id → how many messages the branch had once that entry was read. */
+  const after = new Map<string, number>();
+  let previous: string | undefined;
   for (const entry of branch) {
+    if (previous) after.set(previous, messages.length);
+    previous = typeof entry.id === "string" ? entry.id : undefined;
     const entryId = typeof entry.id === "string" ? entry.id : undefined;
     if (entry.type === "compaction") {
       messages.push({
@@ -866,6 +930,28 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: Session
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : timestampOf(entry.timestamp);
     messages.push({ ...message, id, entryId, timestamp } as unknown as AgentMessage);
   }
+  if (previous) after.set(previous, messages.length);
+
+  // Side questions (`/btw`) sit after the entry omp asked them at; one that was asked before the first entry leads.
+  const placed = new Map<number, AgentMessage[]>();
+  for (const topic of asides) {
+    const index = topic.leafId === null ? 0 : after.get(topic.leafId);
+    if (index === undefined) continue; // asked on a branch that is no longer the active one
+    const turns = btwTurns(topic).map((turn, turnIndex) => ({
+      role: "custom",
+      timestamp: turn.createdAt,
+      aside: { topicId: topic.id, turnIndex, turn },
+    }) as unknown as AgentMessage);
+    placed.set(index, [...(placed.get(index) ?? []), ...turns]);
+  }
+  if (placed.size > 0) {
+    const merged: AgentMessage[] = [];
+    for (let index = 0; index <= messages.length; index++) {
+      merged.push(...(placed.get(index) ?? []));
+      if (index < messages.length) merged.push(messages[index]!);
+    }
+    messages.splice(0, messages.length, ...merged);
+  }
 
   for (const notice of legacyNotices) {
     const message = noticeMessage(`notice_${notice.timestamp}`, notice.text, notice.level, notice.timestamp);
@@ -890,7 +976,8 @@ async function readBranch(openCodeId: string, path: string) {
   const transcript = await readTranscript(path);
   if (!transcript?.header) throw new Error(`Failed to load messages for ${openCodeId}: transcript unreadable`);
   const doc = await SessionDocs.get(transcript.header.id);
-  const messages = agentMessagesOfBranch(transcript.activeBranch, doc.legacyNotices);
+  const asides = await readBtwTopics(path);
+  const messages = agentMessagesOfBranch(transcript.activeBranch, doc.legacyNotices, asides);
   return { transcript, doc, messages };
 }
 

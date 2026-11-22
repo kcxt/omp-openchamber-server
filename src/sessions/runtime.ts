@@ -25,6 +25,8 @@ import {
   emitSessionUpdated,
 } from "../shared/sse";
 import { TurnTranslator, type OmpFrame } from "./turn-translator";
+import { AsideStream } from "./aside";
+import type { BtwTopic } from "../providers/omp/btw-history";
 
 export type RuntimeState = "starting" | "idle" | "active" | "aborting" | "closed";
 export type CloseReason = "idle" | "deleted" | "shutdown" | "crash" | "abort" | "replaced";
@@ -192,6 +194,7 @@ export class SessionRuntime {
   #undelivered: string[] = [];
   /** Collects `command_output` while the runtime runs a command itself (`/move`). */
   #capture?: string[];
+  readonly #aside: AsideStream;
 
   #pollTimer?: ReturnType<typeof setTimeout>;
   #releaseTimer?: ReturnType<typeof setTimeout>;
@@ -207,6 +210,7 @@ export class SessionRuntime {
     this.credentialFingerprint = init.credentialFingerprint;
     this.#transcriptPath = init.transcriptPath;
     this.#child = child;
+    this.#aside = new AsideStream(init.sessionId, init.cwd);
     this.#translator = new TurnTranslator({
       sessionId: init.sessionId,
       cwd: init.cwd,
@@ -509,6 +513,17 @@ export class SessionRuntime {
     });
   }
 
+  /**
+   * `/aside`: omp's `btw`, an ephemeral side turn that runs beside the main
+   * conversation (even mid-run), opens no run and never changes this runtime's
+   * state. The answer arrives as `btw_record` / `btw_delta` frames.
+   */
+  async btw(question: string): Promise<BtwTopic> {
+    this.#assertOpen();
+    const data = record(await this.#child.request("btw", { question }));
+    return data?.record as BtwTopic;
+  }
+
   /** Runs a shell command in the session's child (`/session/:id/shell`). */
   bash(command: string): Promise<unknown> {
     this.#assertOpen();
@@ -658,6 +673,12 @@ export class SessionRuntime {
         for (const listener of this.#goalListeners) listener(goal, false);
         return;
       }
+      case "btw_record":
+        this.#aside.onRecord(frame.record as BtwTopic);
+        return;
+      case "btw_delta":
+        if (typeof frame.recordId === "string" && typeof frame.delta === "string") this.#aside.onDelta(frame.recordId, frame.delta);
+        return;
       case "recap": {
         const text = typeof frame.recap === "string" ? frame.recap.trim() : "";
         const createdAt = typeof frame.createdAt === "number" ? frame.createdAt : Date.now();
@@ -768,6 +789,8 @@ export class SessionRuntime {
     const releasable = async (): Promise<{ ok: boolean; retryMs: number }> => {
       const state = await this.#getState();
       if (this.#state !== "idle" || !state) return { ok: false, retryMs: 5_000 };
+      // A side question still streaming dies with the child.
+      if (this.#aside.active) return { ok: false, retryMs: 5_000 };
       const owed = record(state.idleMaintenance);
       if (owed) {
         const due = Math.max(Number(owed.recapDueAt) || 0, Number(owed.compactionDueAt) || 0);
