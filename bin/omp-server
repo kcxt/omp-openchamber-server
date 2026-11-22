@@ -14,13 +14,6 @@ omp_bin=${OMP_BIN:-$HOME/bin/omp}
 # it directly (for OpenChamber's Remote Instances without the web server).
 host=${OC_SIDECAR_HOST:-127.0.0.1}
 
-# The sidecar writes goal results through OpenChamber's metadata route so every
-# open UI is told (src/adapters/openchamber/metadata-bridge.ts): point it at the
-# address OpenChamber actually binds.
-. "$repo/bin/openchamber-address" 2>/dev/null
-case "$openchamber_host" in *:*) openchamber_host="[$openchamber_host]" ;; esac
-export OC_OPENCHAMBER_URL=${OC_OPENCHAMBER_URL:-http://$openchamber_host:$openchamber_port}
-
 [ -x "$bun" ] || {
     echo "omp-server: no bun executable at $bun (set BUN=)" >&2
     exit 1

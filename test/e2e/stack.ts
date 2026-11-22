@@ -103,8 +103,6 @@ export async function startStack(options: { env?: Record<string, string>; binary
       ...baseEnv,
       OC_SIDECAR_PORT: String(sidecarPort),
       OC_SIDECAR_HOST: "127.0.0.1",
-      // Where the sidecar reaches OpenChamber's own server (goal changes it makes go through its metadata route).
-      OC_OPENCHAMBER_URL: `http://127.0.0.1:${uiPort}`,
     });
   }
   const api = `http://127.0.0.1:${sidecarPort}`;

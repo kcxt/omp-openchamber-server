@@ -34,13 +34,14 @@ describe("omp's own goal mode", () => {
     await page.getByText("Echo: hello").waitFor();
     const id = await sessionId();
 
-    // Armed the way OpenChamber does it: the goal record is written to the session metadata through its server.
+    // Armed the way OpenChamber's UI does it: through OpenChamber's metadata route, which stores the
+    // goal (PATCHing the sidecar) and broadcasts it to the UI.
     const now = Date.now();
     const goal = { id: "goal1", objective: "ship it", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
-    const res = await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
-      method: "PATCH",
+    const res = await fetch(`${stack.ui}/api/openchamber/sessions/${id}/metadata`, {
+      method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
+      body: JSON.stringify({ patch: { openchamber: { goal } }, directory: stack.project }),
     });
     expect(res.ok).toBe(true);
 
@@ -52,6 +53,9 @@ describe("omp's own goal mode", () => {
         await sleep(60);
       }
     })();
+    // The UI shows the goal as running before omp finishes it.
+    const row = page.getByRole("group", { name: "Session goal — open details" });
+    await row.getByText(/^(Active|Evaluating…)$/).waitFor({ timeout: 15_000 });
     await page.getByText("all done").first().waitFor({ timeout: 30_000 });
     expect(stack.frames().some((f) => f.type === "goal" && f.op === "create" && f.objective === "ship it")).toBe(true);
 
@@ -63,10 +67,9 @@ describe("omp's own goal mode", () => {
     }
     expect(settled?.status).toBe("complete");
     expect(settled?.statusReason).toBe("reported by agent");
-    // OpenChamber's UI learns of the settled goal from its own metadata broadcast: the goal row shows it complete.
-    const row = page.getByRole("group", { name: "Session goal — open details" });
-    await row.waitFor({ timeout: 15_000 });
-    expect(await row.getByText("Complete", { exact: true }).isVisible()).toBe(true);
+    // The UI learns of the settled goal live (OpenCode's `session.metadata.updated`): the row it already
+    // showed as running turns complete without a reload or refetch.
+    await row.getByText("Complete", { exact: true }).waitFor({ timeout: 15_000 });
     for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
     expect(await status(id)).toBe("idle");
     samples.push("done");
@@ -102,6 +105,45 @@ describe("omp's own goal mode", () => {
     expect(current?.status).toBe("blocked");
     for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
     expect(await status(id)).toBe("idle");
+  });
+
+  test("resuming a blocked goal: OpenChamber's progress check is answered without asking a model", async () => {
+    stack.script([{ when: "session goal", steps: [{ text: "pondering" }] }]);
+    await newSession(page);
+    await send(page, "begin");
+    await page.getByText("Echo: begin").waitFor();
+    const id = await sessionId();
+    const record = async () => (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
+    const writeGoal = async (goal: Record<string, unknown>) => {
+      const res = await fetch(`${stack.ui}/api/openchamber/sessions/${id}/metadata`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ patch: { openchamber: { goal } }, directory: stack.project }),
+      });
+      expect(res.ok).toBe(true);
+    };
+    const now = Date.now();
+    await writeGoal({ id: "goal5", objective: "ponder", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now });
+    let current: any;
+    for (let i = 0; i < 80 && current?.status !== "blocked"; i++) {
+      current = await record();
+      await sleep(250);
+    }
+    expect(current?.status).toBe("blocked");
+    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
+
+    // OpenChamber's Resume: its loop ticks 250 ms later, while the session is still idle, and runs its progress check.
+    const resumesBefore = stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length;
+    await writeGoal({ ...current, status: "active", statusReason: "resumed", updatedAt: Date.now() });
+    for (let i = 0; i < 100 && !stack.log("openchamber").match(/\[session-goal(:diagnostic)?\] (progress check|ses_\S+ progress check unavailable)/); i++) await sleep(100);
+
+    // The check got a verdict, and no model was spawned for it.
+    expect(stack.frames().filter((f) => f.type === "print").map((f) => String(f.prompt).slice(0, 60))).toEqual([]);
+    expect(stack.log("openchamber")).toContain("[session-goal:diagnostic] progress check");
+    expect(stack.log("openchamber")).not.toContain("progress check unavailable");
+    // omp carries the resumed goal.
+    for (let i = 0; i < 80 && stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length === resumesBefore; i++) await sleep(100);
+    expect(stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length).toBe(resumesBefore + 1);
   });
 
   test("goal with background work: the parent is idle while the job runs, the goal resumes after the wake", async () => {

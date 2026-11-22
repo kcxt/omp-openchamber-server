@@ -13,7 +13,6 @@ import { logger } from "../shared/logger";
 import { browserControlBroker, messageQueueRuntime, terminalRuntime } from "./instances";
 import { openChamberDataDir } from "./settings-file";
 import { runImporter } from "../store/importer";
-import { openChamberUrl } from "../adapters/openchamber/metadata-bridge";
 
 export interface SidecarConfig {
   host: string;
@@ -73,7 +72,6 @@ function logStartupBanner(sidecarHost: string, port?: number): void {
 
   logger.info(`[sidecar] 🚀 OMP Sidecar started successfully`);
   logger.info(`[sidecar] Listening on http://${sidecarHost}:${effectivePort}`);
-  logger.info(`[sidecar] OpenChamber (goal results, metadata): ${openChamberUrl()}${process.env.OPENCHAMBER_UI_PASSWORD ? " with the UI password" : ""}`);
   logger.info(`[sidecar] Configuration:`);
   logger.info(`  • Working directory : ${process.cwd()}`);
   logger.info(`  • OMP version       : ${ompRuntime.version ?? "unknown"} (${ompRuntime.source})`);

@@ -12,6 +12,7 @@ import { locateMessage } from "../omp/messages";
 import { getOmpSessionByOpenCodeId, readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
 import { OmpCli } from "../omp/cli";
 import { RpcChild } from "../omp/rpc-child";
+import { sameDirectory } from "../omp/paths";
 import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../shared/types";
 import { emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
@@ -290,6 +291,20 @@ export async function applyGoalChange(session: OpenCodeSession, prev: unknown, n
   }, GOAL_PROMPT_GRACE_MS);
   timer.unref?.();
   armedGoals.set(runtime, { change, timer });
+}
+
+/**
+ * Whether omp carries a goal with this objective in `directory`, or is about to:
+ * armed and waiting for its prompt, or omp's own goal active.
+ */
+export async function ompCarriesGoal(objective: string, directory: string | undefined): Promise<boolean> {
+  for (const runtime of Registry.all()) {
+    if (directory && !sameDirectory(runtime.cwd, directory)) continue;
+    if (armedGoals.get(runtime)?.change.objective === objective) return true;
+    const goal = await runtime.getGoal().catch(() => null);
+    if (goal?.status === "active" && goal.objective.trim() === objective) return true;
+  }
+  return false;
 }
 
 /** `/session/:id/shell`: through the session's runtime when it has one, else a plain shell in the session's directory. */

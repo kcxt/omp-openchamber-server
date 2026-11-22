@@ -11,7 +11,6 @@ import { withOmpRecapAssist } from "./recap";
 import { getOmpSessionByOpenCodeId, updateOmpSession } from "../store/sessions";
 import type { BackendCredentialInput, BackendGoalSnapshot } from "../shared/types";
 import { ocPatchForOmpGoal, withGoalPatch, type OcGoal } from "../adapters/openchamber/goal";
-import { writeMetadataThroughOpenChamber } from "../adapters/openchamber/metadata-bridge";
 import { emitOpenCodeV2Event, emitSessionError, emitSessionIdle, emitSessionStatus } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import { SessionRuntime, type CloseReason, type RuntimeState, type SubagentInfo } from "./runtime";
@@ -40,12 +39,8 @@ export function isSubagentTranscript(path: string): boolean {
  * (the agent calls the `goal` tool); a stretch that settles with the goal still
  * active means omp stopped continuing it, which OpenChamber shows as blocked.
  *
- * A goal that settles goes through OpenChamber's metadata route: its UI only
- * learns of a metadata change from OpenChamber's own broadcast, and that route
- * stores the change (back through this sidecar's PATCH, which maps a settled
- * goal to no omp operation), broadcasts it and re-arms its goal runtime. When
- * OpenChamber cannot be reached the session document is written directly. A
- * progress tick (`tokensUsed` of a goal still active) needs no broadcast.
+ * The write is announced as OpenCode's `session.metadata.updated`, which
+ * OpenChamber's UI applies directly, behind any OpenChamber server.
  */
 async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | null, stalled: boolean): Promise<void> {
   const patch: Partial<OcGoal> = {
@@ -59,13 +54,6 @@ async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | n
     const session = await getOmpSessionByOpenCodeId(runtime.sessionId, runtime.cwd);
     const metadata = withGoalPatch(session?.metadata, patch);
     if (!metadata) return;
-    const settles = patch.status !== undefined && patch.status !== "active";
-    const goalRecord = (metadata.openchamber as Record<string, unknown>).goal;
-    if (settles) {
-      const failure = await writeMetadataThroughOpenChamber(runtime.sessionId, { openchamber: { goal: goalRecord } }, runtime.cwd);
-      if (!failure) return;
-      emitSessionError(runtime.sessionId, { message: `The goal is ${String(patch.status)}, but the UI could not be told: ${failure}. Reload to see it.` }, runtime.cwd);
-    }
     await updateOmpSession(runtime.sessionId, { metadata }, runtime.cwd);
   } catch (err) {
     promptLogger.warn({ err, sessionID: runtime.sessionId }, "[goal] could not mirror omp's goal into the session metadata");

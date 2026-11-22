@@ -107,3 +107,25 @@ export function withGoalPatch(metadata: Record<string, unknown> | undefined, pat
   const openchamber = asRecord(metadata?.openchamber) ?? {};
   return { openchamber: { ...openchamber, goal: { ...goal, ...patch, updatedAt: Date.now() } } };
 }
+
+/**
+ * The objective of OpenChamber's goal progress check, or undefined when `prompt`
+ * is not one. Its loop asks the small model this (server/lib/session-goal/audit.js
+ * `buildSmallModelAuditPrompt`) when a session with an active goal goes idle.
+ */
+export function goalAuditObjective(prompt: string): string | undefined {
+  if (!prompt.startsWith("You check the progress of an AI coding agent. Answer three yes/no questions")) return undefined;
+  return prompt.match(/<objective>\n([\s\S]*?)\n<\/objective>\n\n<answer>\n/)?.[1]?.trim() ?? "";
+}
+
+/**
+ * The progress check's answer, decided by omp instead of a model: a goal omp
+ * carries (or is about to start) continues; one omp is not carrying waits for
+ * the user. A goal omp finished is already `complete` in OpenChamber's record
+ * (`ocPatchForOmpGoal`), which its loop re-reads before it writes a verdict.
+ */
+export function goalAuditReply(ompCarriesGoal: boolean): string {
+  return JSON.stringify(ompCarriesGoal
+    ? { all_done: false, remaining: true, needs_user: false }
+    : { all_done: false, remaining: false, needs_user: true });
+}

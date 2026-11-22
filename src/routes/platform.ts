@@ -16,7 +16,6 @@ import { emptyProjectSetup, projectPathFromId } from "../services/projects";
 import { browserControlBroker, projectContextRuntime } from "../services/instances";
 import { logger } from "../shared/logger";
 import { listJobs } from "../sessions/status";
-import { checkOpenChamberBridge } from "../adapters/openchamber/metadata-bridge";
 
 // OpenChamber's host probe (packages/electron/electron-host-probe.mjs) reads
 // /api/version and marks a server `incompatible` when the reported major is
@@ -69,11 +68,6 @@ export async function handlePlatform(ctx: RouteContext): Promise<Response | unde
       status: "ok",
       compatibility: COMPATIBILITY,
     });
-  }
-
-  // Can the sidecar reach OpenChamber and log in (goal results go through its metadata route)?
-  if (path === "/api/omp/openchamber-bridge" && req.method === "GET") {
-    return json(await checkOpenChamberBridge(url.searchParams.get("session") ?? undefined, url.searchParams.get("directory") ?? ""));
   }
 
   // OpenCode 2.0.8+ uses /api/info as its readiness probe. `version` is the

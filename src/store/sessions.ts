@@ -396,6 +396,9 @@ export async function updateOmpSession(
       session.metadata = { ...(session.metadata || {}), ...metadata };
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
+      // OpenCode's own event for a metadata change: every OpenChamber client applies it
+      // (packages/ui/src/lib/opencode/events.ts), whichever OpenChamber server it is behind.
+      emitOpenCodeV2Event("session.metadata.updated", { sessionID: openCodeId, metadata: session.metadata }, session.directory);
     }
   }
 

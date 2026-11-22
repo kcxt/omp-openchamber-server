@@ -1,8 +1,9 @@
 /** Turns: prompt, command, shell, abort, compact, and small-model generation. */
 import { randomUUID } from "node:crypto";
-import { abortSession, asideQuestionOf, compactSession, promptSession, runShell } from "../sessions/service";
+import { abortSession, asideQuestionOf, compactSession, ompCarriesGoal, promptSession, runShell } from "../sessions/service";
 import { mimeFromPath } from "../sessions/prompt-input";
 import { generateSmallModelText } from "../adapters/openchamber/small-model";
+import { goalAuditObjective, goalAuditReply } from "../adapters/openchamber/goal";
 import { toV2FileAttachment } from "../adapters/openchamber/v2";
 import { loadSessionMessages } from "../omp/messages";
 import { emitOpenCodeV2Event } from "../shared/sse";
@@ -166,11 +167,17 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
 
   // `/experimental/generate/text` is what OpenChamber's own small-model
   // service (goal progress checks, titles, commit text) calls on its server.
-  // The named model runs exactly as asked, through omp.
+  // The named model runs exactly as asked, through omp; a goal progress check
+  // is omp's to answer, so it runs no model.
   if ((p === "/generate/text" || p === "/experimental/generate/text") && req.method === "POST") {
     try {
       const body = asRecord(await readJson(req));
       if (typeof body?.prompt !== "string" || !body.prompt.trim()) return jsonError("prompt required", 400);
+      const auditObjective = goalAuditObjective(body.prompt);
+      if (auditObjective !== undefined) {
+        const text = goalAuditReply(await ompCarriesGoal(auditObjective, dir));
+        return json({ data: { text }, text });
+      }
       const model = asRecord(body.model);
       const providerID = typeof model?.providerID === "string" ? model.providerID : "";
       const modelId = typeof model?.id === "string" ? model.id : undefined;

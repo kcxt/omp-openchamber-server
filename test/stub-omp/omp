@@ -1280,6 +1280,14 @@ function runCli(): number {
   }
 }
 if (argv[0] === "session" || argv[0] === "models") process.exit(runCli());
+// Print mode (`omp -p ... -- <prompt>`): one model turn, which the sidecar runs for small-model text. Recorded as a
+// `print` frame so a test can assert that no model was asked.
+if (argv.includes("-p")) {
+  const prompt = argv[argv.indexOf("--") + 1] ?? "";
+  if (process.env.OMP_STUB_RECORD) appendFileSync(process.env.OMP_STUB_RECORD, JSON.stringify({ type: "print", model: flag("--model"), prompt }) + "\n");
+  process.stdout.write("stub print reply\n");
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------- main loop
 const record = process.env.OMP_STUB_RECORD;
