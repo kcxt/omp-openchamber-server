@@ -89,14 +89,16 @@ export async function writeMetadataThroughOpenChamber(sessionID: string, patch: 
 }
 
 /**
- * `GET /api/omp/openchamber-bridge`: can the sidecar reach OpenChamber and log in?
- * Reads a nonexistent session's metadata, which needs only authentication.
+ * `GET /api/omp/openchamber-bridge?session=<id>&directory=<dir>`: can the sidecar
+ * reach OpenChamber and log in, and what does OpenChamber hold for that session's
+ * goal? Without a session it reads a nonexistent one (expect 404/500, never 401).
  */
-export async function checkOpenChamberBridge(): Promise<Record<string, unknown>> {
+export async function checkOpenChamberBridge(sessionID = "ses_bridgeprobe", directory = ""): Promise<Record<string, unknown>> {
   const base = openChamberUrl();
   const password = process.env.OPENCHAMBER_UI_PASSWORD;
   const report: Record<string, unknown> = { url: base, passwordSet: Boolean(password) };
-  const probe = () => fetch(`${base}/api/openchamber/sessions/ses_bridgeprobe/metadata`, {
+  const query = directory ? `?directory=${encodeURIComponent(directory)}` : "";
+  const probe = () => fetch(`${base}/api/openchamber/sessions/${encodeURIComponent(sessionID)}/metadata${query}`, {
     headers: sessionCookie ? { cookie: sessionCookie } : {},
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
@@ -107,9 +109,16 @@ export async function checkOpenChamberBridge(): Promise<Record<string, unknown>>
       res = await probe();
     }
     report.status = res.status;
-    report.ok = res.status !== 401 && res.status < 500;
+    report.authenticated = res.status !== 401;
+    const text = await res.text();
+    try {
+      const body = JSON.parse(text) as { metadata?: { openchamber?: { goal?: unknown } }; error?: unknown };
+      report.goal = body.metadata?.openchamber?.goal ?? null;
+      if (body.error) report.error = body.error;
+    } catch {
+      report.body = text.slice(0, 300);
+    }
   } catch (err) {
-    report.ok = false;
     report.error = err instanceof Error ? err.message : String(err);
   }
   return report;

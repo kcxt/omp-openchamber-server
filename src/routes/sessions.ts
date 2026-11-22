@@ -305,7 +305,8 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
     if (req.method === "GET") {
       try {
         const { session } = await resolveSessionRoute(openCodeId, dir);
-        if (!session) return jsonError("session not found", 404);
+        // OpenCode's not-found shape: OpenChamber's client reads `_tag` to tell "no such session" from a failure.
+        if (!session) return json({ _tag: "SessionNotFoundError", message: "session not found", error: "session not found" }, { status: 404 });
         const withContext = await attachOmpSessionContext((await attachOmpRecapAssist([session]))[0] ?? session);
         return json({ data: toV2Session(withContext) });
       } catch (err) {

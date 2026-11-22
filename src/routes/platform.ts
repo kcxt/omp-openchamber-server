@@ -73,7 +73,7 @@ export async function handlePlatform(ctx: RouteContext): Promise<Response | unde
 
   // Can the sidecar reach OpenChamber and log in (goal results go through its metadata route)?
   if (path === "/api/omp/openchamber-bridge" && req.method === "GET") {
-    return json(await checkOpenChamberBridge());
+    return json(await checkOpenChamberBridge(url.searchParams.get("session") ?? undefined, url.searchParams.get("directory") ?? ""));
   }
 
   // OpenCode 2.0.8+ uses /api/info as its readiness probe. `version` is the
