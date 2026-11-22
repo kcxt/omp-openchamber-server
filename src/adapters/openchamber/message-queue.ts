@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { backendForSession } from "../../providers/registry";
-import { promptSessionAsync, getSessionStatusMap, sessionOwnedElsewhere } from "./prompt";
+import { promptSession } from "../../sessions/service";
+import { sessionOwnedElsewhere, sessionStatusMap } from "../../sessions/status";
 import { emitOpenCodeEvent, subscribeOpenCodeEvents } from "../../shared/sse";
 
 const MAX_SESSIONS = 50;
@@ -374,7 +375,7 @@ export function createMessageQueueRuntime(): MessageQueueRuntime {
     }
     holds.delete(sessionId);
 
-    const status = getSessionStatusMap(entry.directory)[sessionId]?.type;
+    const status = sessionStatusMap(entry.directory)[sessionId]?.type;
     if (status === "busy" || status === "retry") {
       scheduleDispatch(sessionId, RETRY_DELAY_MS);
       return;
@@ -401,7 +402,7 @@ export function createMessageQueueRuntime(): MessageQueueRuntime {
       // no proof it is free: keep the item queued and retry.
       const result = (await sessionOwnedElsewhere(sessionId, entry.directory, session.path)) !== false
         ? { queued: false }
-        : await promptSessionAsync(sessionId, entry.directory, session.path, body);
+        : await promptSession(session, body);
       if (!result.queued) {
         sending.delete(sessionId);
         bump(sessionId);

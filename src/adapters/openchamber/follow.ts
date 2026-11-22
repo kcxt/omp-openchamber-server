@@ -22,7 +22,7 @@ import {
   emitSessionStatus,
   emitSessionUpdated,
 } from "../../shared/sse";
-import { isSessionDriven, sessionOwnedElsewhere } from "./prompt";
+import { isSessionDriven, sessionOwnedElsewhere } from "../../sessions/status";
 import { stat } from "node:fs/promises";
 
 const POLL_MS = Number(process.env.OC_FOLLOW_POLL_MS ?? 750);

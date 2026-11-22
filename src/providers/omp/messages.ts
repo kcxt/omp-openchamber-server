@@ -5,7 +5,6 @@ import { parseTranscript, mapOmpUsageToTokens, readTranscript, type TranscriptEn
 import { SessionDocs, type SessionDocNotice } from "../../store/session-docs";
 import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId, readSessionHeader } from "./store";
 import {
-  bindPersistedOmpMessageId,
   deletePersistedMessageIdsFrom,
   listPersistedMessageIds,
   recordPersistedMessageId,
@@ -164,6 +163,8 @@ export interface AgentMessage {
   error?: unknown;
   display?: boolean;
   attribution?: "user" | "assistant";
+  /** OpenChamber's client message id, stored on the user entry by omp (P1) or on a `host-resume` marker (P5). */
+  hostMessageId?: string;
   timestamp?: number;
   toolCallId?: string;
   toolName?: string;
@@ -391,7 +392,6 @@ export async function forkOmpSession(
 function openCodeRoleFor(msg: AgentMessage): "user" | "assistant" | null {
   switch (msg.role) {
     case "user":
-    case "developer":
       return "user";
     case "assistant":
     case "toolResult":
@@ -414,6 +414,31 @@ function normalizedContentBlocks(
   if (Array.isArray(content)) return content;
   if (typeof content === "string" && content.length > 0) return [{ type: "text", text: content }];
   return [];
+}
+
+/**
+ * A developer message (omp's own directive: resume's continue, a goal nudge)
+ * as a completed `developer` tool card, so it can be read without posing as
+ * something the user said. Its id is the message timestamp, which the live
+ * translator (sessions/turn-translator.ts) uses too.
+ */
+function developerToolPart(msg: AgentMessage, openCodeId: string): OpenCodeToolPart {
+  const at = typeof msg.timestamp === "number" ? msg.timestamp : Date.now();
+  const id = `developer_${at}`;
+  return {
+    id,
+    type: "tool",
+    callID: id,
+    tool: "developer",
+    state: {
+      status: "completed",
+      input: { description: "omp developer message" },
+      output: extractTextFromContent(msg.content),
+      time: { start: at, end: at },
+    },
+    messageID: "",
+    sessionID: openCodeId,
+  };
 }
 
 function createToolPart(
@@ -805,27 +830,67 @@ export function extractUserMessageText(msg: AgentMessage): string {
   return "";
 }
 
+/**
+ * User message ids are exact, never matched by text or position: P1 stores the
+ * client id on omp's entry (`hostMessageId`); a message from before the
+ * migration uses the id the importer recorded for its entry
+ * (`legacyIdsByEntry`); anything else gets an id derived from its entry id.
+ * The ledger keyed by client id only supplies the visible prompt parts.
+ */
 export function mapRpcMessagesToOpenCodeRecords(
   messages: AgentMessage[],
   openCodeId: string,
   dbPath?: string,
+  legacyIdsByEntry: Record<string, string> = {},
 ): OpenCodeMessageRecord[] {
   const records: OpenCodeMessageRecord[] = [];
   let lastUserMessageId: string | undefined;
   let lastUserMatched = false;
   let lastAssistantRecord: OpenCodeMessageRecord | undefined;
   let visibleIndex = 0;
-  const recordedList = getRecordedUserMessages(openCodeId, dbPath);
-  const matchedRecordedIndices = new Set<number>();
-  let userMessageIndex = 0;
+  const recordedById = new Map(getRecordedUserMessages(openCodeId, dbPath).map((r) => [r.clientMessageId, r]));
   let assistantSegmentIndex = 0;
-
-  const userMessages = messages.filter((m) => openCodeRoleFor(m) === "user");
+  /** Developer messages waiting for the assistant record they lead into. */
+  let pendingDeveloper: OpenCodeToolPart[] = [];
+  /** Developer messages nothing answered (e.g. a refused resume) still show, in a record of their own. */
+  const flushDeveloper = () => {
+    if (pendingDeveloper.length === 0) return;
+    const at = pendingDeveloper[0]!.state.time.start;
+    const id = `msg_${timeHexFromTimestamp(at)}_${openCodeId}_developer_${at}`;
+    records.push({
+      info: {
+        id,
+        role: "assistant",
+        sessionID: openCodeId,
+        parentID: lastUserMessageId,
+        agent: "omp",
+        model: { id: "omp", providerID: "omp", modelID: "omp", variant: "default" },
+        providerID: "omp",
+        modelID: "omp",
+        variant: "default",
+        finish: "stop",
+        mode: "primary",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: at, completed: at },
+      },
+      parts: pendingDeveloper.map((part) => ({ ...part, messageID: id })),
+    });
+    pendingDeveloper = [];
+  };
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
+    if (msg.role === "developer") {
+      // omp's own directives (resume's continue, goal nudges) read as a tool card in the turn they drive.
+      const part = developerToolPart(msg, openCodeId);
+      if (lastAssistantRecord) lastAssistantRecord.parts.push({ ...part, messageID: lastAssistantRecord.info.id });
+      else pendingDeveloper.push(part);
+      continue;
+    }
     const role = openCodeRoleFor(msg);
     if (role === null) continue;
+    if (role === "user") flushDeveloper();
 
     const createdAt = typeof msg.timestamp === "number" ? msg.timestamp : Date.now();
     const assistantCompletionAt = msg.role === "assistant"
@@ -843,52 +908,12 @@ export function mapRpcMessagesToOpenCodeRecords(
     let messageId: string;
     if (role === "user") {
       assistantSegmentIndex = 0;
-      const msgText = extractUserMessageText(msg);
-      let matchedIndex = -1;
-
-      // 1. Direct OMP message ID match if already bound
-      if (typeof msg.id === "string" && msg.id.length > 0) {
-        matchedIndex = recordedList.findIndex(
-          (r, idx) => !matchedRecordedIndices.has(idx) && r.ompMessageId === msg.id,
-        );
-      }
-
-      // 2. Exact prompt text match
-      if (matchedIndex === -1 && msgText) {
-        if (
-          userMessageIndex < recordedList.length &&
-          !matchedRecordedIndices.has(userMessageIndex) &&
-          recordedList[userMessageIndex].text === msgText
-        ) {
-          matchedIndex = userMessageIndex;
-        } else {
-          matchedIndex = recordedList.findIndex(
-            (r, idx) => !matchedRecordedIndices.has(idx) && r.text === msgText,
-          );
-        }
-      }
-
-      // 3. Positional match when session user message count matches or candidate text is empty
-      if (
-        matchedIndex === -1 &&
-        userMessageIndex < recordedList.length &&
-        !matchedRecordedIndices.has(userMessageIndex) &&
-        (!recordedList[userMessageIndex].text || recordedList.length === userMessages.length)
-      ) {
-        matchedIndex = userMessageIndex;
-      }
-
-      if (matchedIndex !== -1) {
-        matchedRecordedIndices.add(matchedIndex);
-        const match = recordedList[matchedIndex];
-        messageId = match.clientMessageId;
+      const clientId = typeof msg.hostMessageId === "string" && msg.hostMessageId.length > 0
+        ? msg.hostMessageId
+        : typeof msg.id === "string" ? legacyIdsByEntry[msg.id] : undefined;
+      if (clientId) {
+        messageId = clientId;
         lastUserMatched = true;
-
-        // If not yet bound to omp_message_id, bind it now in SQLite & memory
-        if (typeof msg.id === "string" && msg.id.length > 0 && match.ompMessageId !== msg.id) {
-          match.ompMessageId = msg.id;
-          bindPersistedOmpMessageId(openCodeId, match.clientMessageId, msg.id, dbPath);
-        }
       } else if (typeof msg.id === "string" && msg.id.startsWith("msg_")) {
         messageId = msg.id;
         lastUserMatched = false;
@@ -897,9 +922,8 @@ export function mapRpcMessagesToOpenCodeRecords(
         lastUserMatched = false;
       }
 
-      userMessageIndex++;
       visibleIndex++;
-      const matchedPromptParts = matchedIndex !== -1 ? recordedList[matchedIndex].promptParts : undefined;
+      const matchedPromptParts = clientId ? recordedById.get(clientId)?.promptParts : undefined;
       const parts = matchedPromptParts && matchedPromptParts.length > 0
         ? buildPromptTextParts(matchedPromptParts, openCodeId, messageId, createdAt)
         : buildParts(msg, openCodeId, messageId);
@@ -1006,9 +1030,11 @@ export function mapRpcMessagesToOpenCodeRecords(
           });
           if (!finish) finish = "stop";
         } else {
-          parts.push(...buildParts(msg, openCodeId, messageId, 0));
+          const own = buildParts(msg, openCodeId, messageId, pendingDeveloper.length);
+          parts.push(...pendingDeveloper.map((part) => ({ ...part, messageID: messageId })), ...own);
+          pendingDeveloper = [];
           if (!finish) {
-            finish = parts.some((p) => p.type === "tool") ? "tool-calls" : "stop";
+            finish = own.some((p) => p.type === "tool") ? "tool-calls" : "stop";
           }
         }
 
@@ -1051,6 +1077,7 @@ export function mapRpcMessagesToOpenCodeRecords(
     }
   }
 
+  flushDeveloper();
   return records;
 }
 
@@ -1091,6 +1118,20 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNot
       } as unknown as AgentMessage);
       continue;
     }
+    // P5: a `.` sent from OpenChamber is journaled as a `host-resume` marker (never shown to the model);
+    // it is the user message the continuation answers, under the client's id.
+    if (entry.type === "custom" && entry.customType === "host-resume") {
+      const data = entry.data as Record<string, unknown> | undefined;
+      if (typeof data?.hostMessageId !== "string") continue;
+      messages.push({
+        id: typeof entry.id === "string" ? entry.id : undefined,
+        role: "user",
+        content: [{ type: "text", text: typeof data.text === "string" ? data.text : "." }],
+        hostMessageId: data.hostMessageId,
+        timestamp: timestampOf(entry.timestamp) ?? Date.now(),
+      });
+      continue;
+    }
     if (entry.type !== "message") continue;
     const raw = entry.message;
     if (raw == null || typeof raw !== "object") continue;
@@ -1126,5 +1167,5 @@ export async function loadSessionMessages(
   const transcript = await readTranscript(session.path);
   if (!transcript?.header) throw new Error(`Failed to load messages for ${openCodeId}: transcript unreadable`);
   const doc = await SessionDocs.get(transcript.header.id);
-  return mapRpcMessagesToOpenCodeRecords(agentMessagesOfBranch(transcript.activeBranch, doc.notices), openCodeId, dbPath);
+  return mapRpcMessagesToOpenCodeRecords(agentMessagesOfBranch(transcript.activeBranch, doc.notices), openCodeId, dbPath, doc.legacyMessageIds);
 }

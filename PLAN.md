@@ -67,13 +67,15 @@ Measured today (`local://state.md`, `local://routes.md`):
 
 ### 3.1 The busy model, taken from omp
 
-omp already defines exactly what OpenChamber calls "busy": an **activity stretch**. `RpcSessionSettleWatcher` (`modes/rpc/rpc-session-settle.ts`) opens a stretch on `agent_start` (or a pending host-scheduled turn such as a goal continuation) and closes it with one `session_settled` frame after the final run yields *and* background work that could wake the session (queued steer/follow-up, async bash/task, goal continuation) has drained. `prompt_result.sessionSettled` says whether that frame will follow.
+omp already tracks everything the sidecar needs; the sidecar only has to pick the right boundary. omp's **activity stretch** (`RpcSessionSettleWatcher`, `modes/rpc/rpc-session-settle.ts`) opens on `agent_start` (or a pending host-scheduled turn such as a goal continuation) and closes with one `session_settled` after the final run yields *and* background work that could wake the session (queued steer/follow-up, async bash/task, background subagents, goal continuation) has drained. `prompt_result.sessionSettled` says whether that frame will follow.
 
-So for a driven session:
+The parent agent, however, is legitimately idle while background subagents and async jobs run (user decision; it is how omp itself behaves). So "busy" for a session is **the parent's own work**, not the whole stretch:
 
-- `active` from the first `agent_start` (or accepted `prompt` with `agentInvoked: true`) until `session_settled`, or `prompt_result{sessionSettled:true}`, or `prompt_result{agentInvoked:false}`.
-- Steering, follow-ups, goal continuations, async-job wakes all live inside one stretch: no sidecar loop follows them.
-- OpenChamber gets exactly one busy → idle per stretch, which is what its goal/queue/dispatch/guest consumers assume (`local://oc-contract.md` §3).
+- `active` while a parent run is live or already due: from `agent_start` (or an accepted `prompt` with `agentInvoked: true`) until the run's terminal `agent_end`, and again whenever omp starts another run (a queued steer/follow-up, a goal continuation, a background job or subagent delivering its result wakes the parent: all arrive as a new `agent_start`). A goal continuation that omp has decided but not yet started (`get_state.isSettled === false`, `hasPendingAsyncWork === false`, `queuedMessageCount === 0`, nothing streaming, goal active) also counts, so the gap between goal turns is not an idle.
+- `idle` once the parent run has yielded and nothing for the parent is due, even if `session_settled` is still pending on background work. Background work is reported where OpenChamber looks for it: the subagent child sessions are busy (§3.15), and `/experimental/job` lists running subagents and async jobs from `get_subagents` / `get_state` (today it returns `[]`). OpenChamber's goal, queue and dispatch consumers treat a parent idle as "check children and jobs before acting" (`session-activity.js`: a parent's first idle can be a pause while a background subagent runs), so a parent idle with busy children does not trigger an audit or a send.
+- Steering and follow-ups sent during a run join that run. No sidecar loop follows goal turns or wakes; each omp run is one busy period, so OpenChamber may see several busy → idle pairs inside one omp stretch, each a real parent turn.
+
+Verified (docs/research/R10-parent-idle.md, real omp): parent idle with background work = `isStreaming:false, isSettled:false, hasPendingAsyncWork:true, queuedMessageCount:0` (no frames in the gap); goal continuation due = `isStreaming:false, isSettled:false, hasPendingAsyncWork:false, queuedMessageCount:0` with the goal active (omp holds a continuation back while background work runs, and stops continuing when a wake turn made no tool progress, leaving the goal active and the stretch settled); `queuedMessageCount > 0` with nothing streaming is a stretch stranded by a plain abort, not a due run.
 
 This deletes `SessionState.busy`, `followGoalTurns`, `pendingGoal`/`kickOffGoal`, `waitUntilStopped`, `isStreaming`, the 400 ms settle poll, and the busy-lock spin (`acquireSessionLock` polls every 5 ms).
 
@@ -100,9 +102,9 @@ class SessionRuntime {
 ```
 
 - Owns one `RpcChild`. Commands run through a per-runtime serial queue (promise chain), not a global lock set.
-- State transitions come only from omp frames and child exit. `aborting` is entered by `abort()` and left by `session_settled` or the abort deadline.
+- State transitions come only from omp frames and child exit. `aborting` is entered by `abort()` and left when the parent run stops or the abort deadline passes.
 - Model/effort: no cached copy and no stored pick. `setModel` sends `set_model` (when `get_state.model` differs) and `set_thinking_level` whenever the pick has an effort; omp journals both. `POST /session/:id/model` applies immediately, starting a runtime if none is live.
-- Idle release: the child closes once it is `idle`, `get_state.isSettled === true`, **and omp owes no idle maintenance** (`get_state.idleMaintenance` absent, P4), then waits `OC_CHILD_IDLE_MS` more. omp's idle recap (`recap.idleSeconds`, default 240 s) and idle compaction (`compaction.idleTimeoutSeconds`, default 300 s) therefore always run before release; the sidecar never mirrors those settings. Unreadable state keeps the child (fail closed). This is a resource timer (kind: handle). Note: today's 120 s release is shorter than the 240 s default recap delay, so a recap only appears if the user idles past it with a lowered `recap.idleSeconds` or the child was kept alive by something else.
+- Idle release: the child closes once it is `idle`, `get_state.isSettled === true` (no background subagents or jobs still running in it), **and omp owes no idle maintenance** (`get_state.idleMaintenance` absent, P4), then waits `OC_CHILD_IDLE_MS` more. omp's idle recap (`recap.idleSeconds`, default 240 s) and idle compaction (`compaction.idleTimeoutSeconds`, default 300 s) therefore always run before release; the sidecar never mirrors those settings. Unreadable state keeps the child (fail closed). This is a resource timer (kind: handle). Note: today's 120 s release is shorter than the 240 s default recap delay, so a recap only appears if the user idles past it with a lowered `recap.idleSeconds` or the child was kept alive by something else.
 - Child crash → `closed`; the active stretch is ended with an error turn and status goes idle. The next prompt creates a new runtime.
 - The child opens its session with `switch_session { claimLease: true }` (P3), so omp never moves it to a sibling transcript; a refusal is the "owned elsewhere" error.
 
@@ -119,9 +121,9 @@ Merges today's `providers/omp/events.ts` normalizer and `prompt.ts#createEventHa
 ### 3.4 Abort (Esc)
 
 1. `state → aborting`; publish nothing new (still busy to OpenChamber).
-2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned to OpenChamber as un-sent queue items. R9: this aborts synchronous subagents with the parent turn but leaves async (background) subagents running, which keeps the stretch open. Esc means stop everything, so the runtime also sends `cancel_subagent` for every async subagent `get_subagents` reports as `pending`/`running`.
-3. Wait until settled: `session_settled`, `prompt_result` with `sessionSettled`, or `get_state.isSettled === true` polled after the abort response (R1: a stretch stranded by queued input never emits `session_settled`, even after `abort_and_restore_queue`; the `abort` response itself arrives after `agent_end`). Bounded by `ABORT_DEADLINE_MS` (5 s).
-4. On deadline: kill the child process group, `state → closed`, publish idle with `aborted: true`. The next prompt starts a fresh child on the same transcript.
+2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned to OpenChamber as un-sent queue items. This stops the parent run and its synchronous subagents. Async (background) subagents keep running, by design (user decision): Esc stops the agent, not delegated background work. Each can be stopped on its own session (`cancel_subagent`, §3.15).
+3. Wait until the parent run has stopped: the run's `agent_end`, or `get_state.isStreaming === false` polled after the abort response (R1: the `abort` response arrives after `agent_end`). Bounded by `ABORT_DEADLINE_MS` (5 s). Then `state → idle` (§3.1: background subagents or jobs left running do not keep the parent busy; their child sessions stay busy until they finish).
+4. On deadline (the parent run is still streaming): kill the child process group, `state → closed`, publish idle with `aborted: true`. The next prompt starts a fresh child on the same transcript. Settlement waits on background work are never a reason to kill.
 
 There is no separate `killedOnAbort` flag and no dangling prompt promise: the prompt promise resolves on acceptance, not on turn end.
 
@@ -132,9 +134,9 @@ function statusOf(sessionId, cwd): "busy" | "idle" | "unknown"
 ```
 
 - Driven (`Registry` has a live runtime): `starting|active|aborting → busy`, `idle → idle`.
-- Not driven: **lease first, tail second.** `lease = Utility.leaseHeld(id)` (one persistent child answers `get_session_lease` in milliseconds; no spawn per probe). `lease === false → idle`, regardless of the tail. `lease === true` → busy iff the transcript tail is mid-turn. Probe failure → `unknown`.
+- Not driven: **lease first, tail second.** `lease = OmpCli.leaseHeld(id)` (§3.11). `lease === false → idle`, regardless of the tail. `lease === true` → busy iff the transcript tail is mid-turn. Probe failure → `unknown`.
 - `/session/status` and `/session/active` are built from `statusOf` over driven + followed sessions. `unknown` makes `/session/active` return an error, never an empty map (rule 5).
-- Subagents: from `get_subagents` on the parent's runtime when asked, not a pushed map.
+- Subagents: from `get_subagents` on the parent's runtime when asked, not a pushed map. A parent's status never includes its children's (§3.1).
 
 This removes the cold-read guess entirely: a dead tail is never busy because no process holds its lease. No dead-turn memory, no expiry interaction.
 
@@ -232,6 +234,14 @@ The sidecar runs a patched omp (D2). Patches stay small, each one commit with it
 | P5 | `resume { subagentId?, hostMessageId? }` → `AgentSession.resume()` on the session or subagent, journaling a `host-resume` custom entry when `hostMessageId` is given (§3.14). | `.` reaching the model as a literal message; synthetic restart text. |
 | P6 | `omp session inspect --json <sessionPath>`: normal startup, read-only session manager (no lease, every write path disabled), prints model, thinking level, context breakdown, commands, todos, goal, title, lease state. | The shared Utility child and its `switch_session` onto sessions it does not own (§3.11). |
 
+**Agent tooling (P7, not sidecar-related; one commit each):** from this session's agent transcripts (3 wrong-checkout writes, ~100 `sed -n` range reads, 11 rejected edits).
+
+- P7a: read/edit results show the resolved absolute path when given a relative one (`[src/foo.ts → /abs/…/src/foo.ts#TAG]`), and warn when the agent's last bash command `cd`'d into a different git root than the one the path resolved to.
+- P7b: edit "no ops follow the header" error includes a minimal worked example (`PUT 12.=14:` + `+` lines) and, when possible, the line that failed to parse.
+- P7c: edit tool description leads with the cross-file `CUT … @name` / `PUT … @name` move for refactors; read tool description states plainly that `path:N-M:raw` returns exact lines plus an editable tag. (Read collapsing of code is a user config change, not a patch.)
+- Rejected: a per-task `cwd` for the `task` tool (user: risk of other issues).
+- Tabled: bash interception that redirects `sed -n N,Mp` / `cat` / `head` / `tail` on a single file to the read tool or appends a hint.
+
 **Not patched, deliberately:** OpenChamber metadata stays in the sidecar (§3.10). Putting it in omp's transcript would need the lease holder to write it (impossible while a terminal omp owns the session, and a child spawn per PATCH otherwise; OpenChamber writes turn timings every few seconds while a session is active), and transcript entries are branch-scoped, so a revert would hide session-level state.
 
 **Known gap, no patch planned:** a session another omp holds and that is idle at its prompt, whose tail ends mid-turn from an earlier crashed process, reads busy (lease held + tail mid-turn) until that omp writes. A cross-process "is streaming" signal would close it; not worth a patch now.
@@ -251,7 +261,7 @@ Sidecar wiring:
 
 ### 3.15 Subagents
 
-**How omp runs them.** A subagent is not a separate omp process. The `task` tool creates an in-process `AgentSession` inside the parent's omp child (`task/executor.ts` → `createAgentSession`), writing an artifact transcript next to the parent (`<parent>/<Name>.jsonl`). Synchronous tasks run inside the parent's turn; async (background) tasks count as pending async work, so the parent's activity stretch stays open until they finish (§3.1). The host sees them through the parent's RPC stream:
+**How omp runs them.** A subagent is not a separate omp process. The `task` tool creates an in-process `AgentSession` inside the parent's omp child (`task/executor.ts` → `createAgentSession`), writing an artifact transcript next to the parent (`<parent>/<Name>.jsonl`). Synchronous tasks run inside the parent's turn; async (background) tasks run while the parent is idle (§3.1: the parent session reads idle, its running children read busy) and wake the parent with their result as a new run. The host sees them through the parent's RPC stream:
 
 - `set_subagent_subscription { level: "events" }` → `subagent_lifecycle` (started / completed / failed / aborted, with `sessionFile` and `parentToolCallId`), `subagent_progress`, and `subagent_event` (the child's full `AgentSessionEvent` stream).
 - `get_subagents` (snapshots), `get_subagent_messages { subagentId | sessionFile, fromByte }`, `cancel_subagent`, `steer_subagent`.

@@ -3,13 +3,10 @@
  *
  * Layering rules (see docs/providers.md):
  *  - `src/providers/types.ts` (this file) is a leaf: it imports only shared
- *    src-level protocol modules (approvals) and is imported by every backend.
+ *    src-level protocol modules and is imported by every backend.
  *  - Backend implementations live under `src/providers/<backendId>/` and may
- *    import shared src modules, but must never import `main.ts`/`prompt.ts`.
- *  - `prompt.ts` consumes backends only through `AgentBackend` /
- *    `BackendTurnConnection` / `SessionStore` / `NormalizedTurnEvent`.
+ *    import shared src modules, but must never import `main.ts` or `src/sessions/`.
  */
-import type { QuestionInfo } from "../shared/contracts";
 
 // ---------------------------------------------------------------------------
 // Model catalog protocol (OpenCode /provider surface)
@@ -141,13 +138,6 @@ export interface ImageContent {
   mimeType: string;
 }
 
-export interface TurnPromptInput {
-  message: string;
-  images?: ImageContent[];
-  /** Select the queueing behavior when the backend is already streaming. */
-  streamingBehavior?: "steer" | "followUp";
-}
-
 // ---------------------------------------------------------------------------
 // Tool part state (SSE assembly)
 // ---------------------------------------------------------------------------
@@ -277,84 +267,6 @@ export interface OpenCodeMessageRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Normalized turn events
-//
-// Backends translate their native event streams into this vocabulary; the SSE
-// assembly layer in prompt.ts consumes it and keeps part-id generation, delta
-// emission, heartbeats, and error formatting in one place.
-//
-// Contract notes:
-//  - The backend OWNS usage/model aggregation: a `usage` event is a full
-//    snapshot (tokens replace-if-positive happens backend-side) and MUST be
-//    emitted before the terminal `turn_end`. The sink stores snapshots as-is.
-//  - A `telemetry` event is an aggregate over completed raw model requests in
-//    the current visible turn. The sink stores it in a namespaced message
-//    metadata field so it cannot be confused with the final context snapshot.
-//  - Respond closures for approval/question requests are bound to the
-//    backend transport INSIDE the backend; the sink only decorates them with
-//    SSE bookkeeping.
-//  - A non-terminal `turn_end` (backend ended without a definitive terminal
-//    event) is emitted by the backend after its own grace timer; the sink
-//    finalizes on every `turn_end`.
-// ---------------------------------------------------------------------------
-
-export type SubagentStatus = "busy" | "idle";
-
-export type BackendSubagentStatus = "pending" | "running" | "completed" | "failed" | "aborted";
-
-export interface BackendSubagentSnapshot {
-  id: string;
-  status: BackendSubagentStatus;
-}
-
-export type NormalizedTurnEvent =
-  | { kind: "text_delta"; text: string }
-  | { kind: "reasoning_delta"; text: string }
-  /** The streamed text or reasoning block ended; the next delta opens a new part. */
-  | { kind: "part_end" }
-  | { kind: "tool"; callID: string; tool?: string; state: ToolPartState }
-  /** Partial tool arguments as the model streams them (`toolcall_delta`). */
-  | { kind: "tool_input_delta"; callID: string; tool?: string; delta: string }
-  | { kind: "usage"; tokens: TokenBreakdown; cost: number }
-  | { kind: "telemetry"; telemetry: TurnTelemetry }
-  | { kind: "model"; model: ModelRef }
-  | {
-      kind: "permission_request";
-      id: string;
-      permission: string;
-      metadata: Record<string, unknown>;
-      respond: (response: { confirmed?: boolean; cancelled?: boolean }) => void;
-    }
-  | {
-      kind: "question_request";
-      id: string;
-      questions: QuestionInfo[];
-      metadata?: Record<string, unknown>;
-      respond: (response: { value?: string; cancelled?: boolean }) => void;
-    }
-  | {
-      kind: "subagent_started";
-      childId: string;
-      agent?: string;
-      description?: string;
-      sessionFile?: string;
-  }
-  | { kind: "subagent_ended"; childId: string }
-  | { kind: "subagent_failed"; childId: string; message?: string }
-  | { kind: "subagent_status"; childId: string; status: SubagentStatus }
-  | { kind: "todo"; todos: OpenCodeTodo[] }
-  | { kind: "compaction_start"; reason?: string; action?: string }
-  | { kind: "compaction_end"; aborted?: boolean; willRetry?: boolean }
-  /** An extension command's `notify` message: the only reply a command that never invokes the agent gives. */
-  | { kind: "notice"; text: string; level: "info" | "warning" | "error" }
-  /**
-   * A user message omp appended to the transcript mid-turn: the steer or
-   * follow-up it queued after the sidecar announced it as an inbox item.
-   */
-  | { kind: "user_message"; text: string; ompMessageId?: string }
-  | { kind: "turn_end"; error?: string; stopReason?: string };
-
-// ---------------------------------------------------------------------------
 // Backends
 // ---------------------------------------------------------------------------
 
@@ -386,36 +298,6 @@ export interface BackendGoalSnapshot {
 }
 
 export type BackendGoalOp = "create" | "resume" | "pause" | "drop";
-
-/** Per-session live connection to one backend turn. */
-export interface BackendTurnConnection {
-  onEvent(sink: (event: NormalizedTurnEvent) => void): () => void;
-  prompt(input: TurnPromptInput): Promise<unknown>;
-  setModel(providerID: string, modelID: string): Promise<unknown>;
-  /** Reasoning effort for the live model, when the backend exposes one. */
-  setThinkingLevel?(level: string): Promise<unknown>;
-  /** Compacts through the existing backend connection when supported. */
-  compact?(): Promise<unknown>;
-  /** Model currently configured on the backend session, if discoverable. */
-  getInitialModel?(): Promise<ModelRef | undefined>;
-  /** Current subagent snapshot, used to recover missed lifecycle events. */
-  getSubagentStatuses?(): Promise<BackendSubagentSnapshot[]>;
-  /** False once the backend child has exited; absent when the backend cannot tell. */
-  isAlive?(): boolean;
-  /** Transcript the backend is currently writing; differs from the one it was given once it moved the session. */
-  getSessionFile?(): Promise<string | undefined>;
-  /** True when no turn, queued message or background work can still wake the session. */
-  isSettled?(): Promise<boolean>;
-  /** True while the backend is still generating or running tools for a turn. */
-  isStreaming?(): Promise<boolean>;
-  /** Goal mode, when the backend drives goals itself. */
-  goal?(op: BackendGoalOp, input?: { objective?: string; tokenBudget?: number }): Promise<void>;
-  getGoal?(): Promise<BackendGoalSnapshot | null>;
-  /** Fires for every goal change, including the backend's own (the agent completing it). */
-  onGoalUpdate?(sink: (goal: BackendGoalSnapshot | null) => void): () => void;
-  abort(): Promise<unknown>;
-  kill(): void;
-}
 
 export interface SessionUpdateInput {
   title?: string;
@@ -453,12 +335,8 @@ export interface SessionStore {
   setTitle(openCodeId: string, title: string, source: "auto" | "user", cwd: string): Promise<void>;
   children(parentOpenCodeId: string, directory?: string | null): Promise<OpenCodeSession[]>;
   transcript(openCodeId: string, cwd: string): Promise<OpenCodeMessageRecord[] | null>;
-  recordUserMessage?(
-    openCodeId: string,
-    text: string,
-    messageId?: string,
-    parts?: OpenCodePromptTextPart[],
-  ): void;
+  /** Records the visible prompt parts a client message id was sent with (the transcript holds the full prompt). */
+  recordUserMessage?(openCodeId: string, text: string, messageId?: string, parts?: OpenCodePromptTextPart[]): void;
   getTodos?(openCodeId: string, cwd: string): Promise<OpenCodeTodo[] | undefined>;
 }
 
@@ -471,12 +349,6 @@ export interface AgentBackend {
   defaultModel: ModelRef;
   listModels(cwd: string, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse>;
   store: SessionStore;
-  createTurnConnection(
-    cwd: string,
-    sessionPath: string,
-    openCodeId: string,
-    auth?: BackendCredentialInput,
-  ): Promise<BackendTurnConnection>;
   /**
    * True when another live process (a terminal omp) owns the session's transcript.
    * `undefined` when ownership could not be determined (probe failed or omp reported the id unknown).

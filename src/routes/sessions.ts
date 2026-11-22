@@ -1,15 +1,9 @@
 /** Session lifecycle: create, list, get, update, delete, fork, status, view/move/model/agent. */
-import {
-  addSessionSyntheticContext,
-  applyGoalChange,
-  applySessionModel,
-  getSessionStatusMap,
-  reconcileSessionStatuses,
-  removeSessionState,
-} from "../adapters/openchamber/prompt";
+import { applyGoalChange, applySessionModel, removeSession, resumeAfterRestart } from "../sessions/service";
+import { addSessionSyntheticContext } from "../sessions/prompt-input";
+import { sessionStatusMap } from "../sessions/status";
 import { getPendingBlockingRequestsSnapshot, toOpenCodeFormRequest, toOpenCodePermissionRequest } from "../adapters/openchamber/approvals";
 import { ocGoalOf } from "../adapters/openchamber/goal";
-import { followedStatuses } from "../adapters/openchamber/follow";
 import { attachOmpSessionContext } from "../adapters/openchamber/omp-context";
 import { buildUsageStats } from "../adapters/openchamber/usage-stats";
 import { page, toV2Session } from "../adapters/openchamber/v2";
@@ -21,9 +15,6 @@ import type { RouteContext } from "../http/router";
 import { asRecord, readJson } from "../http/response";
 import { refuseIfOpenElsewhere, resolveSessionRoute } from "../services/session-route";
 
-/** Sessions this sidecar is driving plus those it only follows in another omp. */
-const allSessionStatuses = (directory?: string) => ({ ...followedStatuses(directory), ...getSessionStatusMap(directory) });
-
 const sessionInstructionEntries = new Map<string, Map<string, string>>();
 
 export async function handleSessions(ctx: RouteContext): Promise<Response | undefined> {
@@ -32,10 +23,10 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   // /session/status route below. Expose the host snapshot shape while
   // preserving the existing OpenCode-compatible endpoint unchanged.
   if (path === "/api/sessions/status" && req.method === "GET") {
-    await reconcileSessionStatuses();
+    // Idle sessions are absent: the map lists what is busy now.
     const now = Date.now();
     const sessions = Object.fromEntries(
-      Object.entries(allSessionStatuses()).map(([sessionId, status]) => [sessionId, {
+      Object.entries(sessionStatusMap()).map(([sessionId, status]) => [sessionId, {
         status: status.type,
         lastUpdateAt: now,
       }]),
@@ -161,16 +152,14 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
 
   // Session status
   if (p === "/session/status" && req.method === "GET") {
-    await reconcileSessionStatuses(dir);
-    return json(allSessionStatuses(dir));
+    return json(sessionStatusMap(dir));
   }
 
   // OpenCode v2 reports the global set of sessions with an active agent
   // loop and uses "running" as its status value. The SDK unwraps `data`,
   // so an unenveloped map reads as a failed call on the client.
   if (p === "/session/active" && req.method === "GET") {
-    await reconcileSessionStatuses();
-    const statuses = allSessionStatuses();
+    const statuses = sessionStatusMap();
     return json({
       data: Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])),
     });
@@ -246,11 +235,27 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       if (!session) return jsonError("session not found", 404);
       const body = asRecord(await readJson(req));
       if (typeof body?.text !== "string") return jsonError("text required", 400);
+      const metadata = asRecord(body.metadata) ?? undefined;
+      // OpenChamber's restart continuation: omp's recovery directive continues
+      // the interrupted turn instead of the synthetic text being prompted.
+      if (body.resume === true && metadata?.notice === "opencode-restart") {
+        await resumeAfterRestart(session).catch((err) => logger.info({ err, sessionID }, "[resume] nothing to continue after the restart"));
+        return json({
+          data: {
+            id: typeof body.id === "string" ? body.id : `syn_${Date.now()}`,
+            sessionID,
+            time: { created: Date.now() },
+            type: "synthetic",
+            payload: { text: body.text, metadata },
+            delivery: "queue",
+          },
+        });
+      }
       const item = addSessionSyntheticContext(sessionID, session.directory, {
         id: typeof body.id === "string" ? body.id : undefined,
         text: body.text,
         description: typeof body.description === "string" ? body.description : undefined,
-        metadata: asRecord(body.metadata) ?? undefined,
+        metadata,
       });
       return json({ data: item });
     } catch (err) {
@@ -280,7 +285,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       };
       const held = await refuseIfOpenElsewhere(sessionID, session);
       if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
-      const applied = await applySessionModel(sessionID, session.directory, session.path, modelRef);
+      const applied = await applySessionModel(session, modelRef);
       if (applied.error) {
         // omp rejected the model: don't record it as the session's model,
         // or the picker would show a model the session never runs.
@@ -336,7 +341,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
         const ok = await backend.store.delete(openCodeId, dir);
-        removeSessionState(openCodeId, session.directory);
+        removeSession(openCodeId, session.directory);
         emitSessionDeleted(openCodeId);
         return ok ? noContent() : jsonError("session not found", 404);
       } catch (err) {
@@ -361,7 +366,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         if (!updated) return jsonError("session not found", 404);
         // OpenChamber's goal record is served by omp's own goal, not OpenChamber's audit loop.
         if (body?.metadata && "openchamber" in body.metadata && backend.capabilities.goals) {
-          void applyGoalChange(openCodeId, updated.directory, updated.path, previousGoal, ocGoalOf(updated.metadata))
+          void applyGoalChange(updated, previousGoal, ocGoalOf(updated.metadata))
             .catch((err) => logger.warn({ err, sessionID: openCodeId }, "[goal] could not apply the goal change to omp"));
         }
         return noContent();

@@ -28,6 +28,20 @@ const TMP_BASE = process.env.CONTRACT_TMP ?? (existsSync("/hdd/brute/tmp") ? "/h
 export const MODELS = ["fast", "smart"] as const;
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+export interface RigOptions {
+  /** Idle recap delay in seconds: omp's `recap.idleSeconds` (default 240), the stub's OMP_STUB_RECAP_MS. */
+  recapSeconds?: number;
+  /** models.yml declares no provider, so nothing can be selected. Only the one-shot CLI is meaningful then: `spawn` would (rightly) fail its fake-models check. */
+  noModels?: boolean;
+}
+
+/** The argv that runs the omp under test, one-shot CLI and RPC child alike. */
+function ompCommand(args: string[]): string[] {
+  return kind === "real"
+    ? ["bun", "--preload", "./packages/coding-agent/scripts/omp.ts", "packages/coding-agent/src/cli.ts", ...args]
+    : [STUB, ...args];
+}
+
 /** One throwaway world: directories, a fake model server, and the children started in it. */
 export class Rig {
   readonly root = mkdtempSync(join(TMP_BASE, "omp-contract-"));
@@ -39,37 +53,48 @@ export class Rig {
   readonly children: OmpChild[] = [];
   readonly kind = kind;
 
-  constructor() {
+  readonly options: RigOptions;
+
+  constructor(options: RigOptions = {}) {
+    this.options = options;
     for (const dir of [this.agentDir, this.tmp, this.project, join(this.home, ".config"), join(this.home, ".local", "state"), join(this.home, ".local", "share")]) {
       mkdirSync(dir, { recursive: true });
     }
     writeFileSync(
       join(this.agentDir, "models.yml"),
-      [
-        "providers:",
-        "  fake:",
-        `    baseUrl: ${this.fake.baseUrl}`,
-        "    apiKey: dummy",
-        "    api: openai-completions",
-        "    models:",
-        "      - id: fast",
-        "        name: Stub Fast",
-        "        reasoning: false",
-        "        input: [text]",
-        "        contextWindow: 100000",
-        "        maxTokens: 8000",
-        "      - id: smart",
-        "        name: Stub Smart",
-        "        reasoning: true",
-        "        input: [text]",
-        "        contextWindow: 100000",
-        "        maxTokens: 8000",
-        "",
-      ].join("\n"),
+      options.noModels
+        ? "providers: {}\n"
+        : [
+            "providers:",
+            "  fake:",
+            `    baseUrl: ${this.fake.baseUrl}`,
+            "    apiKey: dummy",
+            "    api: openai-completions",
+            "    models:",
+            "      - id: fast",
+            "        name: Stub Fast",
+            "        reasoning: false",
+            "        input: [text]",
+            "        contextWindow: 100000",
+            "        maxTokens: 8000",
+            "      - id: smart",
+            "        name: Stub Smart",
+            "        reasoning: true",
+            "        input: [text]",
+            "        contextWindow: 100000",
+            "        maxTokens: 8000",
+            "",
+          ].join("\n"),
     );
+    // goal.continuationModes [rpc]: the sidecar's own setting, without it an active goal never continues between turns.
     writeFileSync(
       join(this.agentDir, "config.yml"),
-      ["autoResume: false", "mcp:", "  enableProjectConfig: false", "browser:", "  enabled: false", "  relay: false", ""].join("\n"),
+      [
+        "autoResume: false", "mcp:", "  enableProjectConfig: false", "browser:", "  enabled: false", "  relay: false",
+        "goal:", "  continuationModes: [rpc]",
+        ...(options.recapSeconds ? ["recap:", `  idleSeconds: ${options.recapSeconds}`] : []),
+        "",
+      ].join("\n"),
     );
   }
 
@@ -93,9 +118,19 @@ export class Rig {
       OMP_STUB_SCRIPT: join(this.root, "script.json"),
       OMP_STUB_PROVIDER: "fake",
       OMP_STUB_PROVIDER_PORT: String(this.fake.port),
+      ...(this.options.recapSeconds ? { OMP_STUB_RECAP_MS: String(this.options.recapSeconds * 1000) } : {}),
+      ...(this.options.noModels ? { OMP_STUB_NO_MODELS: "1" } : {}),
       PI_TEST_SESSION_OWNERS_DIR: join(this.root, "run", "session-owners"),
       ...extra,
     };
+  }
+
+  /** A one-shot CLI invocation (`omp session inspect …`, `omp models --json`) in the same hermetic environment. */
+  async cli(args: string[], extraEnv: Record<string, string> = {}): Promise<{ stdout: string; stderr: string; code: number }> {
+    const proc = Bun.spawn(ompCommand(args), { cwd: kind === "real" ? OMP_DIR : REPO, env: this.env(extraEnv), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    const code = await proc.exited;
+    return { stdout, stderr, code };
   }
 
   /** Start a child, wait for it to answer, and verify it can only reach fake/* models. */
@@ -152,9 +187,7 @@ export class OmpChild {
 
   static start(rig: Rig, cwd: string, args: string[], env: Record<string, string>): OmpChild {
     const common = ["--mode", "rpc", "--cwd", cwd, "--no-title", "--no-pty", ...args];
-    const cmd = kind === "real"
-      ? ["bun", "--preload", "./packages/coding-agent/scripts/omp.ts", "packages/coding-agent/src/cli.ts", ...common]
-      : [STUB, ...common];
+    const cmd = ompCommand(common);
     const proc = Bun.spawn(cmd, {
       cwd: kind === "real" ? OMP_DIR : REPO,
       env: rig.env(env), // allow-list only: Bun.spawn replaces the environment, it never inherits it

@@ -34,8 +34,12 @@ CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/p
 | `lease` | R6 `get_session_lease` from a sessionless child: correctness, latency, crash release, the open-but-unwritten gap, fork lease. |
 | `consumed` | R7 every frame/response field the sidecar reads, by type. |
 | `subagents` | Subagent lifecycle/progress/event frames, wake ordering, `get_subagents`, `steer_subagent`, `cancel_subagent`. |
+| `host-message-id`, `custom-entry`, `claim-lease`, `idle-maintenance`, `resume`, `cli` | omp patches P1–P6 (PLAN.md §3.13): `hostMessageId` journaling and echo, `append_custom_entry`, `switch_session {claimLease}` / `session_busy`, `get_state.idleMaintenance` + `recap` frame, `resume` (idle, streaming, subagent), and the read-only `omp session inspect|lease` / `omp models` CLI. |
+| `parent-idle` | R10: `get_state` while background work runs after the parent run ended, the wake run, and the goal-continuation gap. |
 
-Last run: stub 43/43, real 43/43.
+Stub knobs beyond the script: `OMP_STUB_RECAP_MS` (deterministic idle recap after N ms; off by default), `OMP_STUB_NO_MODELS` (start with no model, for fallback paths), `OMP_STUB_START_DELAY_MS` (slow boot), `OMP_STUB_PROVIDER`. The stub also answers the one-shot CLI: `omp session inspect --json <path>`, `omp session lease --json -- <ids>`, `omp models --json`.
+
+Last run: stub 93/93, real 93/93.
 
 ## API coverage at a glance
 

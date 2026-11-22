@@ -15,6 +15,7 @@ import { readJson } from "../http/response";
 import { emptyProjectSetup, projectPathFromId } from "../services/projects";
 import { browserControlBroker, projectContextRuntime } from "../services/instances";
 import { logger } from "../shared/logger";
+import { listJobs } from "../sessions/status";
 
 // OpenChamber's host probe (packages/electron/electron-host-probe.mjs) reads
 // /api/version and marks a server `incompatible` when the reported major is
@@ -316,10 +317,19 @@ export async function handlePlatform(ctx: RouteContext): Promise<Response | unde
     return json({ data: [] });
   }
 
-  // Background work the sidecar can report. omp's own background jobs are
-  // not surfaced, so both lists are empty, but they must answer: the goal
-  // loop treats an unanswered list as "could not look" and never audits.
-  if (p === "/experimental/job" && req.method === "GET") return json({ data: [] });
+  // Background work running in driven sessions: subagents and async jobs, from
+  // the parent runtimes. OpenChamber's goal and queue consumers read it before
+  // acting on a parent that went idle while its background work continues.
+  if (p === "/experimental/job" && req.method === "GET") {
+    return json({
+      data: await listJobs({
+        sessionID: url.searchParams.get("sessionID") ?? undefined,
+        kind: url.searchParams.get("kind") ?? undefined,
+        status: url.searchParams.get("status") ?? undefined,
+        descendants: url.searchParams.get("descendants") === "true",
+      }),
+    });
+  }
   if (p === "/shell" && req.method === "GET") return json({ location: { directory: effectiveDir }, data: [] });
 
   // OpenCode credential store and integration catalog. omp owns credentials

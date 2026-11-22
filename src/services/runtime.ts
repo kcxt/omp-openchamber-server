@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseCliArgs, printHelp } from "../adapters/openchamber/cli";
 import { resolveProviderConnection, resolveSmallModel } from "../adapters/openchamber/small-model";
-import { shutdownAll } from "../adapters/openchamber/prompt";
+import { shutdownSessions } from "../sessions/service";
 import { stopFollowingAll } from "../adapters/openchamber/follow";
 import { allBackends, defaultBackend, listSessionsAcrossBackends } from "../providers/registry";
 import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBinary } from "../providers/omp/binary";
@@ -163,7 +163,7 @@ export function startRuntime(server: { port?: number; stop(closeActiveConnection
       browserControlBroker.rejectAll("Server shutting down");
       messageQueueRuntime.stop();
       void terminalRuntime.shutdown();
-      shutdownAll();
+      shutdownSessions();
       stopFollowingAll();
     } catch {
       // ignore

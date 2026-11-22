@@ -11,5 +11,4 @@ export * from "./discovery";
 export * from "../../panels/git";
 export * from "./message-queue";
 export * from "../../panels/project-context";
-export * from "./prompt";
 export * from "./small-model";

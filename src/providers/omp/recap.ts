@@ -208,6 +208,38 @@ export function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): 
   });
 }
 
+/**
+ * `metadata` with a recap omp just produced (P4 `recap` frame) in
+ * `openchamber.assist`, or null when OpenChamber's recap feature is off or no
+ * assistant message is known to attach it to. `forMessageID` is the assistant
+ * message the runtime last completed; without one it is rebuilt as above.
+ */
+export function withOmpRecapAssist(
+  session: OpenCodeSession,
+  recap: string,
+  createdAt: number,
+  forMessageID: string | undefined,
+): Record<string, unknown> | null {
+  if (!openchamberRecapEnabled()) return null;
+  const subject = forMessageID ?? recapSubjectMessageID(session);
+  if (!subject) return null;
+  const metadata = (session.metadata ?? {}) as Record<string, unknown>;
+  const openchamber = (metadata.openchamber ?? {}) as Record<string, unknown>;
+  return {
+    ...metadata,
+    openchamber: {
+      ...openchamber,
+      assist: {
+        ...((openchamber.assist as Record<string, unknown> | undefined) ?? {}),
+        recap: withinLimit(recap),
+        suggestion: "",
+        forMessageID: subject,
+        generatedAt: createdAt,
+      },
+    },
+  };
+}
+
 /** Test seam: drop the cached recaps and the database handle. */
 export function resetOmpRecapCache(): void {
   cache.clear();

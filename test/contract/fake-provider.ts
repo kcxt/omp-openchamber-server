@@ -22,6 +22,8 @@ export interface ScriptStep {
   subagent?: { steps: ScriptStep[] };
   /** Stub only: how long a background `bash` job runs before it wakes the session. */
   asyncMs?: number;
+  /** Stub only: the agent completes the active goal at this step (the real omp needs a `goal` tool call: `{tool:"goal", args:{op:"complete"}}`). */
+  goalComplete?: boolean;
 }
 export interface ScriptTurn {
   when?: string;

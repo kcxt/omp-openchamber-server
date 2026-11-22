@@ -1,11 +1,11 @@
 /** Turns: prompt, command, shell, abort, compact, and small-model generation. */
 import { randomUUID } from "node:crypto";
-import { abortSession, compactSession, mimeFromPath, promptSessionAsync } from "../adapters/openchamber/prompt";
+import { abortSession, compactSession, promptSession, runShell } from "../sessions/service";
+import { mimeFromPath } from "../sessions/prompt-input";
 import { generateSmallModelText } from "../adapters/openchamber/small-model";
 import { toV2FileAttachment } from "../adapters/openchamber/v2";
-import { Utility } from "../omp/utility";
 import { splitProviderPrefix } from "../providers/registry";
-import { emitOpenCodeV2Event, emitSessionCompacted } from "../shared/sse";
+import { emitOpenCodeV2Event } from "../shared/sse";
 import { logger } from "../shared/logger";
 import type { RouteContext } from "../http/router";
 import { asRecord, readJson } from "../http/response";
@@ -26,11 +26,10 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       if (!session) return jsonError("session not found", 404);
       if (!backend.capabilities.compact) return jsonError("summarize not supported by backend", 501);
       try {
-        await compactSession(session.id, session.directory, session.path);
+        await compactSession(session);
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "summarize failed", 409);
       }
-      emitSessionCompacted(session.id, session.directory);
       const body = asRecord(await readJson(req));
       const message = {
         id: typeof body?.id === "string" ? body.id : randomUUID(),
@@ -59,14 +58,14 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       const commandText = `/${command}${argumentsText ? ` ${argumentsText}` : ""}`.trim();
       const held = await refuseIfOpenElsewhere(openCodeId, session);
       if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
-      const result = await promptSessionAsync(openCodeId, session.directory, session.path, {
+      const result = await promptSession(session, {
         text: commandText,
         ...(typeof body?.id === "string" ? { id: body.id } : {}),
         ...(Array.isArray(body?.files) ? { files: body.files } : {}),
         ...(Array.isArray(body?.agents) ? { agents: body.agents } : {}),
         ...(Array.isArray(body?.skills) ? { skills: body.skills } : {}),
         ...(body?.delivery === "steer" || body?.delivery === "queue" ? { delivery: body.delivery } : {}),
-      }, session.model);
+      });
       if (result.queued) return noContent();
       return jsonError(result.error ?? "command failed", result.status ?? 400);
     } catch (err) {
@@ -99,7 +98,7 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       emitOpenCodeV2Event("session.shell.started", { sessionID: openCodeId, shell }, session.directory);
       let rawOutput: unknown;
       try {
-        rawOutput = await Utility.for(session.directory).bash(command);
+        rawOutput = await runShell(session, command);
       } catch (err) {
         rawOutput = String(err);
       }
@@ -203,7 +202,7 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       const held = await refuseIfOpenElsewhere(sessionID, session);
       if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
       await commitStagedRevert(sessionID, backend, session);
-      const result = await promptSessionAsync(sessionID, session.directory, session.path, body, session.model);
+      const result = await promptSession(session, body);
       if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
       if (promptMatch[2] !== "prompt") return json({ queued: true });
       const files = Array.isArray(input?.files) ? (input?.files as unknown[]).flatMap((entry) => {
@@ -244,8 +243,12 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
     try {
       const sessionID = decodeURIComponent(stopMatch[1]!);
       const { session } = await resolveSessionRoute(sessionID, dir);
-      const stopped = session ? await abortSession(sessionID, session.directory) : false;
-      return stopMatch[2] === "interrupt" ? json({ interrupted: stopped }) : json(stopped);
+      if (!session) return stopMatch[2] === "interrupt" ? json({ interrupted: false }) : json(false);
+      const { stopped, withdrawn } = await abortSession(session);
+      // `withdrawn`: queued input Esc took back from omp (D3), returned unsent.
+      return stopMatch[2] === "interrupt"
+        ? json({ interrupted: stopped, ...(withdrawn ? { withdrawn: { steering: withdrawn.steering, followUp: withdrawn.followUp } } : {}) })
+        : json(stopped);
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : `${stopMatch[2]} failed`, 500);
     }

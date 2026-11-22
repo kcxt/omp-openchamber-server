@@ -14,6 +14,9 @@
 //   - runs follow omp's activity-stretch model (docs/omp-protocol.md §4): steers and follow-ups join the
 //     live run, `abort` strands queued input, `session_settled` closes the stretch. test/contract/ asserts
 //     every behaviour here against the real omp.
+//   - the local branch's patches (docs/omp-protocol.md §11): `hostMessageId` on prompts (P1), `append_custom_entry` (P2),
+//     `switch_session{claimLease}` (P3), `get_state.idleMaintenance` + the `recap` frame (P4, OMP_STUB_RECAP_MS),
+//     `resume` (P5), and the one-shot CLI `omp session inspect|lease --json`, `omp models --json` (P6).
 //
 // No network, no credentials: replies come from a script.
 //
@@ -32,6 +35,9 @@
 //   OMP_STUB_RECORD  file that receives every inbound frame (JSONL)
 //   OMP_STUB_TICK_MS pause between streamed chunks (default 4)
 //   OMP_STUB_START_DELAY_MS  time before the first command is handled, like a slow-booting omp (default 0)
+//   OMP_STUB_RECAP_MS  idle recap delay (P4): this long after a stretch settles with a generated reply, `get_state.idleMaintenance`
+//                    reports `recapDueAt` and a `recap` frame follows. Default off (omp's own default is 240 s).
+//   OMP_STUB_NO_MODELS  1 = no models are available (only `omp session inspect` / `omp models` use it in practice)
 //   OMP_STUB_PROVIDER  provider id of the stub's models (default "stub")
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -55,7 +61,9 @@ const sessionsRoot = join(agentDir, "sessions");
 const leaseDir = process.env.PI_TEST_SESSION_OWNERS_DIR ?? join(dirname(agentDir), "run", "session-owners");
 const TICK = Number(process.env.OMP_STUB_TICK_MS ?? 4);
 const PROVIDER = process.env.OMP_STUB_PROVIDER ?? "stub";
-const MODELS = [
+const NO_MODELS = process.env.OMP_STUB_NO_MODELS === "1";
+const RECAP_MS = Number(process.env.OMP_STUB_RECAP_MS ?? 0);
+const MODELS = NO_MODELS ? [] : [
   { provider: PROVIDER, id: "fast", name: "Stub Fast", reasoning: false },
   { provider: PROVIDER, id: "smart", name: "Stub Smart", reasoning: true },
 ];
@@ -98,6 +106,11 @@ function claim(id: string): void {
   writeFileSync(leasePath(id), String(process.pid));
   owned.add(id);
 }
+/** Leaving a session (switch, new, fork) gives up its lease, as omp's session manager does when it closes. */
+function releaseLease(id: string): void {
+  if (!owned.delete(id)) return;
+  try { if (readFileSync(leasePath(id), "utf8") === String(process.pid)) unlinkSync(leasePath(id)); } catch { /* gone */ }
+}
 function releaseAll(): void {
   for (const id of owned) {
     try { if (readFileSync(leasePath(id), "utf8") === String(process.pid)) unlinkSync(leasePath(id)); } catch { /* gone */ }
@@ -127,10 +140,14 @@ let goalScheduled = false;
 let goalSuppressed = false;
 let lastTurnWasContinuation = false;
 let goalTurns = 0;
+// P4: idle recap armed after a settled stretch whose last message was generated (OMP_STUB_RECAP_MS)
+let recapPending = false;
+let recapDueAt: number | undefined;
+let recapTimer: ReturnType<typeof setTimeout> | undefined;
 const GOAL_CONTINUATION = "The session goal is still open. Take it through to the end in this run.";
 const goalEvent = () => out({ type: "goal_updated", goal, state: goal ? { enabled: goal.status === "active", mode: "active", goal } : undefined });
 function scheduleGoalContinuation(): void {
-  if (goalScheduled || goalSuppressed || busy || aborted || goal?.status !== "active") return;
+  if (goalScheduled || goalSuppressed || busy || aborted || asyncJobs > 0 || goal?.status !== "active") return; // omp holds a continuation back while background work runs
   goalScheduled = true;
   stretchActive = true; // a reported pending goal turn opens a stretch that still ends with session_settled
   setTimeout(() => {
@@ -256,7 +273,7 @@ let messageSeq = 0;
 let asyncJobs = 0; // background bash jobs and detached subagents
 let subLevel = "off";
 type Ticket = { id?: string; queued: boolean; run?: number };
-type QueueItem = { text: string; ticket?: Ticket; custom?: { customType: string; content: string } };
+type QueueItem = { text: string; ticket?: Ticket; custom?: { customType: string; content: string }; hostMessageId?: string };
 const steering: QueueItem[] = [];
 const followUps: QueueItem[] = [];
 const tickets = new Set<Ticket>();
@@ -308,6 +325,25 @@ function groupSteps(steps: any[]): Array<{ content: any[]; tools: any[] }> {
 /** Message lifecycle frames carry a `messageId` shared by start, updates and end (rpc-types.ts RpcMessageEventFrame). */
 const newMessageId = () => `msg-${++messageSeq}`;
 
+/** omp's recovery directive for `resume` (turn-recovery.ts manualContinuePrompt). */
+const CONTINUE_TEXT = "<system-notice>\nContinue.\n\nMUST resume most recent intent; complete unfinished work.\nIf interrupted mid-step: resume where stopped.\nNEVER pause to summarize progress, re-confirm plan, or ask whether to proceed; continue.\n</system-notice>\n";
+const developerMessage = (text: string) => ({ role: "developer", content: [{ type: "text", text }], attribution: "agent", timestamp: Date.now(), synthetic: true, userInitiated: true });
+
+/** The prompt `resume` answers again instead of adding a directive: the last user prompt (or `.` directive) when only cut-off assistant turns follow it. */
+function unansweredPrompt(): string | undefined {
+  const list = messages();
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]!;
+    if (m.role === "assistant") {
+      const cutOff = (m.stopReason === "aborted" || m.stopReason === "error") && !m.content?.some((b: any) => (b.type === "text" && b.text) || b.type === "toolCall");
+      if (!cutOff) return undefined;
+    } else if (m.role === "user" || (m.role === "developer" && m.userInitiated === true)) {
+      return String(m.content?.[0]?.text ?? "");
+    }
+  }
+  return undefined;
+}
+
 /** A wake source (finished background job or subagent): joins the live run as a follow-up, or starts one. */
 function wakeWith(custom: { customType: string; content: string }): void {
   if (busy) { followUps.push({ text: custom.content, custom }); queueUpdate(); }
@@ -320,6 +356,26 @@ function settleCheck(): void {
   if (!isSettled()) return;
   stretchActive = false;
   out({ type: "session_settled" });
+  armRecap();
+}
+
+// P4: omp arms its idle recap once the stretch has settled and the last message was generated; get_state reports the due time until it fires.
+function cancelRecap(): void {
+  clearTimeout(recapTimer);
+  recapTimer = undefined;
+  recapDueAt = undefined;
+  recapPending = false;
+}
+function armRecap(): void {
+  if (!(RECAP_MS > 0) || !recapPending || recapTimer) return;
+  recapDueAt = Date.now() + RECAP_MS;
+  recapTimer = setTimeout(() => {
+    recapTimer = undefined;
+    if (!isSettled()) { recapDueAt = undefined; return; } // a later settlement re-arms it
+    recapPending = false;
+    recapDueAt = undefined;
+    out({ type: "recap", recap: `Stub recap: ${messages().length} messages in context.`, createdAt: Date.now() });
+  }, RECAP_MS);
 }
 
 function reportTickets(runNo: number, outcome: { status: string; failure?: string }): void {
@@ -331,7 +387,18 @@ function reportTickets(runNo: number, outcome: { status: string; failure?: strin
   }
 }
 
-async function runAgent(ticket: Ticket | undefined, text: string, first: { steering?: boolean; custom?: QueueItem["custom"] } = {}): Promise<void> {
+type FirstOpts = {
+  steering?: boolean;
+  custom?: QueueItem["custom"];
+  hostMessageId?: string;
+  /** `resume`'s continue directive: journaled as a synthetic developer message, not a user message. */
+  synthetic?: boolean;
+  /** `resume` of an unanswered prompt: the run answers the journaled prompt again and journals no message. */
+  continueOnly?: boolean;
+  /** Called right after `agent_start`, before the first turn. */
+  onStart?: () => void;
+};
+async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOpts = {}): Promise<void> {
   // Like omp's extension commands: a notify frame and no agent turn at all.
   if (!first.custom) {
     const local = (): void => {
@@ -355,13 +422,15 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
   }
   const runNo = ++runCount;
   busy = true; aborted = false; stretchActive = true;
+  cancelRecap();
   if (ticket) ticket.run = runNo;
   out({ type: "agent_start" });
+  first.onStart?.();
   const newMessages: any[] = [];
   let turnOpen = false;
   let failure: string | undefined;
 
-  const deliver = (body: string, opts: { steering?: boolean; custom?: QueueItem["custom"] }) => {
+  const deliver = (body: string, opts: FirstOpts) => {
     out({ type: "turn_start" });
     turnOpen = true;
     const mid = newMessageId();
@@ -373,7 +442,9 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
       newMessages.push(message);
       return;
     }
-    const message = { role: "user", content: [{ type: "text", text: body }], ...(opts.steering ? { steering: true } : {}), attribution: "user", timestamp: Date.now() };
+    const message = opts.synthetic
+      ? developerMessage(body)
+      : { role: "user", content: [{ type: "text", text: body }], ...(opts.steering ? { steering: true } : {}), attribution: "user", timestamp: Date.now(), ...(opts.hostMessageId ? { hostMessageId: opts.hostMessageId } : {}) };
     out({ type: "message_start", message, messageId: mid });
     append("message", { message });
     out({ type: "message_end", message, messageId: mid });
@@ -475,7 +546,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
     out({ type: "turn_end", message: final, toolResults: results });
   };
 
-  deliver(text, first);
+  if (!first.continueOnly) deliver(text, first);
   let groups = groupSteps(pickSteps(text));
   let gi = 0;
   for (;;) {
@@ -485,7 +556,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
       const next = fromSteer ? steering.shift() : gi >= groups.length ? followUps.shift() : undefined;
       if (next) {
         queueUpdate();
-        deliver(next.text, { steering: fromSteer, custom: next.custom });
+        deliver(next.text, { steering: fromSteer, custom: next.custom, hostMessageId: next.hostMessageId });
         groups = groupSteps(pickSteps(next.text));
         gi = 0;
       }
@@ -496,13 +567,16 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
 
   const toolCalls = newMessages.filter((m) => m.role === "toolResult").length;
   if (lastTurnWasContinuation) goalSuppressed = toolCalls === 0; // no progress: omp stops continuing
+  if (first.custom && goal) goalSuppressed = toolCalls === 0; // a background wake that made no progress ends the goal's run of turns too (contract/parent-idle)
   lastTurnWasContinuation = text.startsWith(GOAL_CONTINUATION);
   if (goal) goal = { ...goal, tokensUsed: goal.tokensUsed + 110 };
   if (aborted && goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
   if (goal?.status === "complete") { const done = goal; goal = null; out({ type: "goal_updated", goal: done, state: { enabled: false, mode: "exiting", reason: "completed", goal: done } }); }
   else if (goal) goalEvent();
-  if (goal?.status === "active" && !aborted && !goalSuppressed) goalScheduled = true; // pending before settlement is reported
+  if (goal?.status === "active" && !aborted && !goalSuppressed && asyncJobs === 0) goalScheduled = true; // pending before settlement is reported
   const outcome = { status: aborted ? "aborted" : failure ? "error" : "completed", failure };
+  const lastMessage = newMessages.at(-1);
+  recapPending = lastMessage?.role === "assistant" && lastMessage.content.length > 0;
   busy = false;
   out({ type: "agent_end", messages: newMessages, isTerminal: true, yielded: true });
   // abort / abort_and_prompt answer once the run has yielded
@@ -520,7 +594,9 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: { steer
 // stream carries `subagent_lifecycle`, `subagent_progress` and (at level "events") `subagent_event`.
 let subIndex = 0;
 let asyncSeq = 0;
-const subagents = new Map<string, { snapshot: any; cancel: () => void }>();
+const subagents = new Map<string, { snapshot: any; cancel: () => void; resume: (hostMessageId?: string) => void }>();
+/** Finished subagents stay registered: `resume` revives them from their transcript, as omp's lifecycle manager does. */
+const finishedSubagents = new Map<string, { call: any; sessionFile: string; index: number }>();
 async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
   const args = call.arguments ?? {};
   const index = subIndex++;
@@ -532,14 +608,18 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
   const subHeader = { type: "session", version: 3, id: randomUUID(), timestamp: now(), cwd };
   const subEntries: Entry[] = [];
   let subLeaf: string | null = null;
-  const subAppend = (message: any) => {
-    const entry: Entry = { type: "message", id: hex8(), parentId: subLeaf, timestamp: now(), message };
+  const subJournal = (type: string, body: Record<string, any>) => {
+    const entry: Entry = { type, id: hex8(), parentId: subLeaf, timestamp: now(), ...body };
     subLeaf = entry.id; subEntries.push(entry);
     mkdirSync(dirname(sessionFile), { recursive: true });
     writeFileSync(sessionFile, titleSlot() + [JSON.stringify(subHeader), ...subEntries.map((e) => JSON.stringify(e))].join("\n") + "\n");
   };
+  const subAppend = (message: any) => subJournal("message", { message });
   const started = Date.now();
   let cancelled = false;
+  let resumeReq: { hostMessageId?: string } | undefined; // P5: interrupt the running turn and continue with the recovery directive
+  const interrupted = () => cancelled || resumeReq !== undefined;
+  const nap = async (ms: number) => { const end = Date.now() + ms; while (Date.now() < end && !interrupted()) await sleep(Math.min(25, end - Date.now())); };
   let toolCount = 0;
   const progress: any = { index, id, agent: "task", agentSource: "bundled", status: "running", task, assignment, recentTools: [], recentOutput: [], toolCount: 0, requests: 0, tokens: 0, cost: 0, durationMs: 0 };
   const snapshot = () => ({ id, index, agent: "task", agentSource: "bundled", description: assignment, status: progress.status, task, assignment, sessionFile, lastUpdate: Date.now(), progress: { ...progress }, parentToolCallId: call.id });
@@ -549,7 +629,14 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
     if (subLevel !== "off") out({ type: "subagent_progress", payload: { index, agent: "task", agentSource: "bundled", task, parentToolCallId: call.id, detached: true, assignment, progress: { ...progress }, sessionFile } });
   };
   const ev = (event: Record<string, unknown>) => { if (subLevel === "events") out({ type: "subagent_event", payload: { id, event } }); };
-  subagents.set(id, { snapshot: snapshot(), cancel: () => { cancelled = true; } });
+  subagents.set(id, {
+    snapshot: snapshot(),
+    cancel: () => { cancelled = true; },
+    resume: (hostMessageId) => {
+      resumeReq = { hostMessageId };
+      if (hostMessageId) subJournal("custom", { customType: "host-resume", data: { hostMessageId, text: "." } });
+    },
+  });
 
   lifecycle("started");
   ev({ type: "agent_start" });
@@ -561,15 +648,15 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
   let lastText = "";
   let first = true;
   for (const group of groupSteps(spec.steps ?? [{ text: "ok" }])) {
-    if (cancelled) break;
+    if (interrupted()) break;
     if (!first) ev({ type: "turn_start" });
     first = false;
     const blocks: any[] = [];
     const part = () => ({ role: "assistant", content: blocks.map((b) => ({ ...b })), api: "stub", provider: model.provider, model: model.id, usage: usage(0), stopReason: "stop", timestamp: Date.now() });
     ev({ type: "message_start", message: part() });
     for (const step of group.content) {
-      if (step.hang) { while (!cancelled) await sleep(25); break; }
-      if (step.sleep) { await sleep(step.sleep); continue; }
+      if (step.hang) { while (!interrupted()) await sleep(25); break; }
+      if (step.sleep) { await nap(step.sleep); continue; }
       const text = String(step.text ?? step.thinking ?? "");
       const kind = step.thinking !== undefined ? "thinking" : "text";
       const idx = blocks.push(kind === "thinking" ? { type: "thinking", thinking: text } : { type: "text", text }) - 1;
@@ -579,7 +666,7 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
     }
     const calls = group.tools.map((step: any) => ({ call: { type: "toolCall", id: `call_${hex8()}`, name: step.tool, arguments: step.args ?? {} }, step }));
     for (const { call: c } of calls) blocks.push(c);
-    const fin = { ...part(), usage: usage(blocks.length * 10), stopReason: cancelled ? "aborted" : calls.length ? "toolUse" : "stop", content: blocks };
+    const fin = { ...part(), usage: usage(blocks.length * 10), stopReason: interrupted() ? "aborted" : calls.length ? "toolUse" : "stop", content: blocks };
     ev({ type: "message_end", message: fin }); subAppend(fin); msgs.push(fin);
     const results: any[] = [];
     for (const { call: c, step } of calls) {
@@ -592,14 +679,49 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
     }
     ev({ type: "turn_end", message: fin, toolResults: results });
   }
+  if (resumeReq && !cancelled) {
+    // omp interrupted the turn above and now answers its recovery directive.
+    ev({ type: "turn_start" });
+    const directive = developerMessage(CONTINUE_TEXT);
+    ev({ type: "message_start", message: directive }); subAppend(directive); ev({ type: "message_end", message: directive }); msgs.push(directive);
+    const reply = { role: "assistant", content: [{ type: "text", text: "ok" }], api: "stub", provider: model.provider, model: model.id, usage: usage(10), stopReason: "stop", timestamp: Date.now() };
+    ev({ type: "message_start", message: { ...reply, content: [] } });
+    ev({ type: "message_end", message: reply }); subAppend(reply); msgs.push(reply);
+    ev({ type: "turn_end", message: reply, toolResults: [] });
+    lastText = "ok";
+  }
   ev({ type: "agent_end", messages: msgs, yielded: true });
   const status = cancelled ? "aborted" : "completed";
   progress.status = status; progress.requests = subEntries.filter((e) => e.message?.role === "assistant").length; progress.tokens = progress.requests * 110;
   report();
   subagents.delete(id);
+  finishedSubagents.set(id, { call, sessionFile, index });
   lifecycle(status);
   asyncJobs--;
   wakeWith({ customType: "async-result", content: `<system-notice>\nAgent ${id} has ${status}.\n${lastText}\n</system-notice>` });
+}
+
+/** `resume` on a finished subagent that is still registered: revived from its transcript, answered, finished again, and the parent woken. */
+async function reviveSubagent(id: string, rec: { call: any; sessionFile: string; index: number }, hostMessageId: string | undefined, ack: () => void): Promise<void> {
+  const lifecycle = (status: string) => { if (subLevel !== "off") out({ type: "subagent_lifecycle", payload: { id, agent: "task", parentToolCallId: rec.call.id, detached: true, agentSource: "bundled", status, sessionFile: rec.sessionFile, index: rec.index } }); };
+  asyncJobs++;
+  lifecycle("started");
+  ack();
+  await sleep(20);
+  let last: string | null = parseSessionFile(rec.sessionFile).entries.at(-1)?.id ?? null;
+  const lines: string[] = [];
+  const add = (type: string, body: Record<string, any>) => {
+    const entry: Entry = { type, id: hex8(), parentId: last, timestamp: now(), ...body };
+    last = entry.id;
+    lines.push(JSON.stringify(entry));
+  };
+  if (hostMessageId) add("custom", { customType: "host-resume", data: { hostMessageId, text: "." } });
+  add("message", { message: developerMessage(CONTINUE_TEXT) });
+  add("message", { message: { role: "assistant", content: [{ type: "text", text: "ok" }], api: "stub", provider: model.provider, model: model.id, usage: usage(10), stopReason: "stop", timestamp: Date.now() } });
+  appendFileSync(rec.sessionFile, lines.join("\n") + "\n");
+  lifecycle("completed");
+  asyncJobs--;
+  wakeWith({ customType: "async-result", content: `<system-notice>\nAgent ${id} has completed.\nok\n</system-notice>` });
 }
 
 // ---------------------------------------------------------------- commands
@@ -612,12 +734,30 @@ function stateData() {
     cwd, messageCount: messages().length, queuedMessageCount: queueSize(),
     queuedMessages: { steering: steering.map((q) => q.text), followUp: followUps.map((q) => q.text), liveSteered: 0 },
     todoPhases,
+    ...(recapDueAt !== undefined ? { idleMaintenance: { recapDueAt } } : {}), // P4: absent when nothing is owed
   };
 }
 const modelInfo = (m: typeof MODELS[number]) => ({
   provider: m.provider, id: m.id, name: m.name, reasoning: m.reasoning, input: ["text"],
   contextWindow: 100_000, maxTokens: 8_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 });
+const AVAILABLE_COMMANDS = [{ name: "pi-vcc", description: "Compact conversation with pi-vcc structured summary" }];
+/** omp's `/context` view as `omp session inspect` prints it (the RPC `get_context_breakdown` below keeps the two-category shape test/e2e/context.test.ts asserts). */
+function contextBreakdown(m: typeof MODELS[number], list: any[]) {
+  const window = 100_000;
+  const buffer = 16_384;
+  const messageTokens = Math.round(list.reduce((n, x) => n + JSON.stringify(x.content ?? "").length, 0) / 4);
+  const categories = [
+    { id: "systemPrompt", label: "System prompt", tokens: 1742 },
+    { id: "systemTools", label: "System tools", tokens: 4058 },
+    { id: "systemContext", label: "System context", tokens: 109 },
+    { id: "instructionFiles", label: "Instruction files", tokens: 0 },
+    { id: "skills", label: "Skills", tokens: 0 },
+    { id: "messages", label: "Messages", tokens: messageTokens },
+  ];
+  const used = categories.reduce((n, c) => n + c.tokens, 0);
+  return { model: { provider: m.provider, modelId: m.id }, contextWindow: window, categories, usedTokens: used, autoCompactBufferTokens: buffer, freeTokens: window - used - buffer, thresholdTokens: window - buffer };
+}
 function messageEntryOrThrow(entryId: string): Entry {
   const e = entries.find((x) => x.id === entryId);
   if (!e) throw Object.assign(new Error(`Entry ${entryId} not found`), { code: "entry_not_found" });
@@ -627,11 +767,13 @@ function messageEntryOrThrow(entryId: string): Entry {
 function moveToSiblingUpTo(upTo: string | null, extra?: Partial<Header>): void {
   const kept = pathTo(upTo);
   const parent = header.id;
+  cancelRecap();
   const parentFile = file;
   fresh(parent);
   header = { ...header, ...(parentFile ? { parentSession: parentFile } : {}), ...extra };
   entries = kept; leaf = upTo;
   claim(header.id); claimed = true;
+  releaseLease(parent); // omp's session manager gives up the parent's lease when it moves onto the fork
   file = newFilePath(header);
   writeWhole(file);
 }
@@ -660,13 +802,55 @@ function moveSessionTo(id: string | undefined, arg: string): void {
   out({ type: "session_info_update", sessionId: header.id });
   reply(`Moved to ${dest}.`);
 }
+/** P5: `resume` is the TUI's `.`: continue the session (or a subagent) without journaling a user message. */
+async function resumeCommand(id: string | undefined, frame: any): Promise<void> {
+  const { subagentId, hostMessageId } = frame;
+  if (subagentId !== undefined && (typeof subagentId !== "string" || !subagentId)) return fail(id, "resume", "`subagentId` must be a non-empty string.");
+  if (hostMessageId !== undefined && (typeof hostMessageId !== "string" || !hostMessageId)) return fail(id, "resume", "hostMessageId must be a non-empty string");
+  if (subagentId !== undefined) {
+    const running = subagents.get(subagentId);
+    if (running) { running.resume(hostMessageId); return respond(id, "resume"); }
+    const finished = finishedSubagents.get(subagentId);
+    if (!finished) return fail(id, "resume", `Unknown subagent or session file unavailable: ${subagentId}`);
+    void reviveSubagent(subagentId, finished, hostMessageId, () => respond(id, "resume"));
+    return;
+  }
+  // The marker goes in first and stays when nothing can be resumed; the model never sees it (a custom entry).
+  if (hostMessageId) append("custom", { customType: "host-resume", data: { hostMessageId, text: "." } });
+  if (busy) {
+    // A streaming session is interrupted as Esc would; input queued behind it continues the run in place of the directive.
+    const queued = queueSize() > 0;
+    aborted = true; wake?.();
+    await new Promise<void>((r) => abortWaiters.push(r));
+    if (queued) {
+      const fromSteer = steering.length > 0;
+      const head = (fromSteer ? steering.shift() : followUps.shift())!;
+      queueUpdate();
+      await runAgent(undefined, head.text, { steering: fromSteer, custom: head.custom, hostMessageId: head.hostMessageId });
+      return respond(id, "resume");
+    }
+  }
+  const unanswered = unansweredPrompt();
+  if (unanswered !== undefined) {
+    // An interrupt before any output: the prompt runs again as is; omp answers once the run has started.
+    void runAgent(undefined, unanswered, { continueOnly: true, onStart: () => respond(id, "resume") });
+    return;
+  }
+  if (!messages().some((m) => m.role === "user") && !entries.some((e) => e.type === "compaction")) return fail(id, "resume", "Nothing to resume");
+  await runAgent(undefined, CONTINUE_TEXT, { synthetic: true });
+  respond(id, "resume");
+}
 async function handle(frame: any): Promise<void> {
   const { id, type } = frame as { id?: string; type: string };
+  // P1: the host's own message id must be a non-empty string wherever it is accepted.
+  if ((type === "prompt" || type === "steer" || type === "follow_up" || type === "abort_and_prompt") && frame.hostMessageId !== undefined && (typeof frame.hostMessageId !== "string" || frame.hostMessageId.length === 0)) {
+    return fail(id, type, "hostMessageId must be a non-empty string");
+  }
   try {
     switch (type) {
       case "get_state": return respond(id, type, stateData());
       case "get_available_models": return respond(id, type, { models: MODELS.map(modelInfo) });
-      case "get_available_commands": return respond(id, type, { commands: [{ name: "pi-vcc", description: "Compact conversation with pi-vcc structured summary" }] });
+      case "get_available_commands": return respond(id, type, { commands: AVAILABLE_COMMANDS });
       case "get_available_thinking_levels": return respond(id, type, model.reasoning ? ["off", "low", "medium", "high"] : ["off"]);
       case "set_model": {
         const m = MODELS.find((x) => x.provider === frame.provider && x.id === frame.modelId);
@@ -712,24 +896,39 @@ async function handle(frame: any): Promise<void> {
         return respond(id, type, { held: ids.filter((s) => owned.has(s) || leaseHeldByOther(s)), unknown: [] });
       }
       case "switch_session": {
+        let claimedId: string | undefined;
+        if (frame.claimLease === true) {
+          // P3: the target's lease is taken before anything is torn down; a session another process owns is refused.
+          try { claimedId = parseSessionFile(frame.sessionPath).header.id; } catch { /* no readable header */ }
+          if (!claimedId) return fail(id, type, `No session found at ${frame.sessionPath}`);
+          if (leaseHeldByOther(claimedId)) return fail(id, type, "Session is owned by another omp process", "session_busy");
+        }
         if (busy) { aborted = true; wake?.(); }
+        const leaving = header.id;
+        cancelRecap();
         if (!existsSync(frame.sessionPath)) {
           // omp opens a missing path as a new, empty session that writes there (and holds its lease)
           fresh();
           file = frame.sessionPath;
           writeWhole(file);
           claim(header.id); claimed = true;
+          releaseLease(leaving);
           return respond(id, type, { cancelled: false });
         }
         load(frame.sessionPath);
+        if (claimedId) { claim(header.id); claimed = true; } // held from the open, before any write
+        if (header.id !== leaving) releaseLease(leaving);
         return respond(id, type, { cancelled: false });
       }
       case "new_session": {
         // omp forces the file into existence (header only) and takes the lease right away
+        const leaving = header.id;
+        cancelRecap();
         fresh(frame.parentSession);
         file = newFilePath(header);
         writeWhole(file);
         claim(header.id); claimed = true;
+        releaseLease(leaving);
         return respond(id, type, { cancelled: false });
       }
       case "get_messages": return respond(id, type, { messages: messages() });
@@ -752,19 +951,19 @@ async function handle(frame: any): Promise<void> {
         if (!text.trim() && !(frame.images?.length)) return respond(id, type, { agentInvoked: false }); // handled locally, no prompt_result
         if (busy) {
           if (!frame.streamingBehavior) return fail(id, type, "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.");
-          (frame.streamingBehavior === "steer" ? steering : followUps).push({ text, ticket: openTicket(id, true) });
+          (frame.streamingBehavior === "steer" ? steering : followUps).push({ text, ticket: openTicket(id, true), hostMessageId: frame.hostMessageId });
           queueUpdate();
           return respond(id, type);
         }
         respond(id, type);
-        void runAgent(openTicket(id, false), text);
+        void runAgent(openTicket(id, false), text, { hostMessageId: frame.hostMessageId });
         return;
       }
       case "steer": case "follow_up": {
         const text = String(frame.message ?? "");
         if (!text.trim()) return respond(id, type);
-        if (!busy) { respond(id, type); void runAgent(undefined, text, { steering: type === "steer" }); return; }
-        (type === "steer" ? steering : followUps).push({ text });
+        if (!busy) { respond(id, type); void runAgent(undefined, text, { steering: type === "steer", hostMessageId: frame.hostMessageId }); return; }
+        (type === "steer" ? steering : followUps).push({ text, hostMessageId: frame.hostMessageId });
         queueUpdate();
         return respond(id, type);
       }
@@ -806,7 +1005,7 @@ async function handle(frame: any): Promise<void> {
       }
       case "abort_and_prompt": {
         const text = String(frame.message ?? "");
-        const start = () => { respond(id, type); void runAgent(openTicket(id, false), text); };
+        const start = () => { respond(id, type); void runAgent(openTicket(id, false), text, { hostMessageId: frame.hostMessageId }); };
         if (!busy) return start();
         aborted = true; wake?.();
         abortWaiters.push(start);
@@ -846,12 +1045,116 @@ async function handle(frame: any): Promise<void> {
         moveToSiblingUpTo(upTo);
         return respond(id, type, { cancelled: false, ...(type === "branch" && target ? { text: target.message?.content?.[0]?.text ?? "" } : {}) });
       }
+      case "append_custom_entry": {
+        if (typeof frame.customType !== "string" || frame.customType.length === 0) return fail(id, type, "customType must be a non-empty string");
+        const entry = append("custom", { customType: frame.customType, ...(frame.data !== undefined ? { data: frame.data } : {}) });
+        return respond(id, type, { entryId: entry.id });
+      }
+      case "resume": return resumeCommand(id, frame);
       default: return fail(id, type, `Unknown command: ${type}`);
     }
   } catch (err: any) {
     fail(id, type, err?.message ?? String(err), err?.code);
   }
 }
+
+// ---------------------------------------------------------------- one-shot CLI (P6)
+// `omp session inspect --json <path|id>`, `omp session lease --json -- <ids>` and `omp models --json`: no RPC child,
+// no lease taken, nothing written (test/contract/cli.test.ts holds both binaries to that).
+const NO_DEFAULT_MODEL = "No default model selected. Use /login, set an API key environment variable, or select a local model with /model or --model.";
+
+function findSessionFile(source: string): string {
+  if (source.includes("/") || source.endsWith(".jsonl")) {
+    const path = resolve(process.cwd(), source);
+    if (!existsSync(path)) throw new Error(`Session file not found: ${path}`);
+    if (statSync(path).isDirectory()) throw new Error("Directories cannot be read like files");
+    return path;
+  }
+  const walk = (dir: string): string | undefined => {
+    if (!existsSync(dir)) return undefined;
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) { const hit = walk(p); if (hit) return hit; } else if (e.name.endsWith(`_${source}.jsonl`)) return p;
+    }
+    return undefined;
+  };
+  const hit = walk(sessionsRoot);
+  if (!hit) throw new Error(`Session not found: ${source}`);
+  return hit;
+}
+
+function inspectSession(path: string): Record<string, unknown> {
+  let parsed: { header: Header; entries: Entry[] };
+  try { parsed = parseSessionFile(path); } catch { throw new Error(`Cannot resume session "${path}": the session header is missing or malformed. The file was not modified.`); }
+  const journal = [...parsed.entries].reverse();
+  const requested = (() => {
+    for (const e of journal) {
+      if (e.type === "model_change") return String(e.model);
+      if (e.type === "message" && e.message?.role === "assistant") return `${e.message.provider}/${e.message.model}`;
+    }
+    return null;
+  })();
+  const found = requested ? MODELS.find((m) => `${m.provider}/${m.id}` === requested) : undefined;
+  const chosen = found ?? MODELS[0] ?? null;
+  // A saved model that cannot be restored does not fail the inspection: the model actually selected is reported with why.
+  const modelFallback = found || (!requested && chosen)
+    ? undefined
+    : { requested, reason: chosen ? `Could not restore model ${requested}. Using ${chosen.provider}/${chosen.id}` : requested ? `Could not restore model ${requested}. ${NO_DEFAULT_MODEL}` : NO_DEFAULT_MODEL };
+  const savedLevel = journal.find((e) => e.type === "thinking_level_change")?.thinkingLevel;
+  const thinkingLevel = !chosen ? "high" : chosen.reasoning ? (savedLevel ?? "high") : null;
+  const branchMessages = pathTo(parsed.entries.at(-1)?.id ?? null).filter((e) => e.type === "message").map((e) => e.message);
+  return {
+    sessionId: parsed.header.id,
+    title: parsed.header.title || null,
+    model: chosen ? { provider: chosen.provider, modelId: chosen.id } : null,
+    ...(modelFallback ? { modelFallback } : {}),
+    thinkingLevel,
+    contextBreakdown: chosen ? contextBreakdown(chosen, branchMessages) : null,
+    ...(chosen ? {} : { contextBreakdownReason: "no model is selected for this session" }),
+    availableCommands: AVAILABLE_COMMANDS,
+    todoPhases: [],
+    goal: null,
+    leaseHeld: leaseHeldByOther(parsed.header.id),
+  };
+}
+
+function runCli(): number {
+  const [command, action, ...rest] = argv;
+  const usage = (text: string) => { process.stderr.write(`error: ${text}\n`); return 1; };
+  try {
+    if (command === "models") {
+      if (!argv.includes("--json")) return usage("the stub prints models only with --json");
+      process.stdout.write(JSON.stringify({
+        models: MODELS.map((m) => ({
+          provider: m.provider, kind: "chat", id: m.id, selector: `${m.provider}/${m.id}`, name: m.name, contextWindow: 100_000, maxTokens: 8_000,
+          reasoning: m.reasoning, thinking: m.reasoning ? ["minimal", "low", "medium", "high", "xhigh"] : null, input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, pricingStatus: "unknown",
+        })),
+      }) + "\n");
+      return 0;
+    }
+    if (command === "session" && action === "lease") {
+      const dashes = rest.indexOf("--");
+      const ids = dashes >= 0 ? rest.slice(dashes + 1) : rest.filter((a) => !a.startsWith("-"));
+      if (ids.length === 0) return usage("Missing session id. Usage: omp session lease [--json] -- <session-id>...");
+      if (!rest.includes("--json")) return usage("the stub prints leases only with --json");
+      process.stdout.write(JSON.stringify({ held: ids.filter((s) => leaseHeldByOther(s)), unknown: [] }) + "\n");
+      return 0;
+    }
+    if (command === "session" && action === "inspect") {
+      const usageText = "omp session inspect --json <session>";
+      if (!rest.includes("--json")) return usage(`inspect only prints JSON. Usage: ${usageText}`);
+      const sources = rest.filter((a) => !a.startsWith("-"));
+      if (sources.length === 0) return usage(`Missing session. Usage: ${usageText}`);
+      process.stdout.write(JSON.stringify(inspectSession(findSessionFile(sources[0]!))) + "\n");
+      return 0;
+    }
+    return usage(`the stub does not implement: omp ${argv.join(" ")}`);
+  } catch (err: any) {
+    return usage(err?.message ?? String(err));
+  }
+}
+if (argv[0] === "session" || argv[0] === "models") process.exit(runCli());
 
 // ---------------------------------------------------------------- main loop
 const record = process.env.OMP_STUB_RECORD;

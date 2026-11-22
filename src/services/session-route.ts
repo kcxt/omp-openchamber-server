@@ -1,6 +1,7 @@
 /** Session-scoped route helpers: lookup, the "open elsewhere" refusal, staged-revert commit. */
 import { backendForSession } from "../providers/registry";
-import { discardSessionConnection, sessionOwnedElsewhere } from "../adapters/openchamber/prompt";
+import { discardSession } from "../sessions/service";
+import { sessionOwnedElsewhere } from "../sessions/status";
 import { emitOpenCodeV2Event } from "../shared/sse";
 
 /**
@@ -44,7 +45,7 @@ export async function commitStagedRevert(
 ): Promise<RevertCommitResult> {
   const target = session.revert?.messageID;
   if (!target) return "none";
-  await discardSessionConnection(sessionID, session.directory);
+  discardSession(sessionID, session.directory);
   const committed = await backend.store.commitRevert(sessionID, target, session.directory);
   if (!committed) {
     // A staged revert whose boundary message is no longer in the transcript can
