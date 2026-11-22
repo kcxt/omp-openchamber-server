@@ -258,6 +258,7 @@ The sidecar runs a patched omp (D2). Patches stay small, each one commit with it
 | P4 | `get_state.idleMaintenance: { recapDueAt?: number; compactionDueAt?: number }` (absent when nothing is owed), from `IdleMaintenance#pending` and its timers; plus a `recap` event frame `{ recap, createdAt }` from the existing `onRecap` hook. | Guessing omp's idle settings for child release (§3.2); `recap.ts` polling `history.db` for the recap. |
 | P5 | `resume { subagentId?, hostMessageId? }` → `AgentSession.resume()` on the session or subagent, journaling a `host-resume` custom entry when `hostMessageId` is given (§3.14). | `.` reaching the model as a literal message; synthetic restart text. |
 | P6 | `omp session inspect --json <sessionPath>`: normal startup, read-only session manager (no lease, every write path disabled), prints model, thinking level, context breakdown, commands, todos, goal, title, lease state. | The shared Utility child and its `switch_session` onto sessions it does not own (§3.11). |
+| P8 | `--auto-title`: an RPC session opts in to omp's title generation (`--mode rpc` turns it off). omp emits no event for it; the runtime publishes the title slot as `session.renamed`. | Sidecar title generation (D4 assumed omp titled RPC sessions; it does not without this). |
 
 **Agent tooling (P7, not sidecar-related; one commit each):** from this session's agent transcripts (3 wrong-checkout writes, ~100 `sed -n` range reads, 11 rejected edits).
 

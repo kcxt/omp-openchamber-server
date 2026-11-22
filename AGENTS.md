@@ -8,7 +8,7 @@ smoke run, or throwaway script.
 
 - Default verification stays offline: `bun test --timeout 90000 test/e2e` (headless OpenChamber UI ->
   sidecar -> `test/stub-omp/omp`) and `bun test test/contract` (stub; `CONTRACT_OMP=real` runs the
-  patched omp in /hdd/brute/projects/oh-my-pi-local under an isolated env with a fake provider).
+  patched omp in /hdd/brute/projects/oh-my-pi under an isolated env with a fake provider).
 - Note `.omp/config.yml` in this repo points `modelRoles` at `anthropic/*`: any real `omp` child started
   from this checkout will spend anthropic quota. Run real binaries only through the contract harness, or
   with an `env -i` allow-list and throwaway `HOME`/`PI_CODING_AGENT_DIR`/`XDG_*` dirs.

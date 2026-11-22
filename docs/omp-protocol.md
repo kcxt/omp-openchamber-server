@@ -2,7 +2,7 @@
 
 What the sidecar may rely on when it drives `omp --mode rpc`. Every statement here is pinned by `test/contract/` (run against the pinned real omp build and the stub) unless marked `[INFERENCE]` or `[source only]`. Evidence and omp source citations: `docs/research/R1.md` … `R7.md`, `R9-subagents.md`, `R10-parent-idle.md`. Command and frame names come from omp's `modes/rpc/rpc-mode.ts`, `rpc-types.ts` and `docs/rpc.md`.
 
-Pinned omp: the `local` branch of `oh-my-pi-local` (upstream dca23990ad + kept patches + P1–P6 of PLAN §3.13; protocol version 1 announced, versions 1 and 2 supported). The patches are §11; everything else in this file is stock omp.
+Pinned omp: the patched `main` branch of `/hdd/brute/projects/oh-my-pi` (upstream + kept patches + P1–P8 of PLAN §3.13; protocol version 1 announced, versions 1 and 2 supported). The patches are §11; everything else in this file is stock omp.
 
 ## 1. Process and transport
 
@@ -125,7 +125,7 @@ Order: parent yields (`prompt_result{sessionSettled:false}`), then `started`, ev
 
 ```
 bun test test/contract                         # stub (default)
-CONTRACT_OMP=real bun test test/contract       # real omp from /hdd/brute/projects/oh-my-pi-local
+CONTRACT_OMP=real bun test test/contract       # real omp from /hdd/brute/projects/oh-my-pi
 ```
 
 ## 10. Goal mode

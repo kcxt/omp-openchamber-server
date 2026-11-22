@@ -8,7 +8,7 @@
 //
 //   CONTRACT_OMP=stub (default)  test/stub-omp/omp
 //   CONTRACT_OMP=real            bun --preload ./packages/coding-agent/scripts/omp.ts packages/coding-agent/src/cli.ts
-//                                from CONTRACT_OMP_DIR (default /hdd/brute/projects/oh-my-pi-local)
+//                                from CONTRACT_OMP_DIR (default /hdd/brute/projects/oh-my-pi)
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -21,7 +21,7 @@ export const kind: OmpKind = process.env.CONTRACT_OMP === "real" ? "real" : "stu
 export const isReal = kind === "real";
 const REPO = resolve(import.meta.dir, "..", "..");
 const STUB = join(REPO, "test", "stub-omp", "omp");
-const OMP_DIR = process.env.CONTRACT_OMP_DIR ?? "/hdd/brute/projects/oh-my-pi-local";
+const OMP_DIR = process.env.CONTRACT_OMP_DIR ?? "/hdd/brute/projects/oh-my-pi";
 /** Everything a contract run creates lives under here, never under the real $HOME. */
 const TMP_BASE = process.env.CONTRACT_TMP ?? (existsSync("/hdd/brute/tmp") ? "/hdd/brute/tmp" : tmpdir());
 

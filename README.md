@@ -93,7 +93,7 @@ Anything unlisted that falls through returns `404 not implemented`.
 bun run check                            # type-check (tsc --noEmit), expected clean
 bun test --timeout 90000 test/e2e        # OpenChamber UI in headless Chromium -> sidecar -> stub omp, fully offline (same as `bun run test`)
 bun test test/contract                   # omp commands against the stub
-CONTRACT_OMP=real bun test test/contract # the same against the patched omp (default checkout /hdd/brute/projects/oh-my-pi-local)
+CONTRACT_OMP=real bun test test/contract # the same against the patched omp (default checkout /hdd/brute/projects/oh-my-pi)
 ```
 
 The e2e suite needs `openchamber` on `PATH` and Chromium (`CHROMIUM_PATH` overrides `/usr/bin/chromium`). Each run builds a throwaway `$HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR` and OpenChamber data dir with an explicit child environment, so it never reads `~/.omp` or any API key. `omp` is `test/stub-omp/omp`, a scripted stand-in that speaks omp's RPC protocol and persists sessions the way omp does (bucket naming, `id`/`parentId` tree, session leases, `navigate_tree`/`fork`); `test/e2e/stack.ts` documents its script format. `E2E_KEEP=1` keeps the run directory. The contract suite runs real omp only under an allow-listed environment and a local fake provider (no live credentials). See [`docs/testing.md`](./docs/testing.md).

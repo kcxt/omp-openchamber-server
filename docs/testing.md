@@ -28,7 +28,7 @@ The stub is kept honest by the contract suite: every behaviour it models (stretc
 
 ```
 bun test test/contract                         # stub (default)
-CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/projects/oh-my-pi-local
+CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/projects/oh-my-pi
 ```
 
 `CONTRACT_OMP_DIR` overrides the omp checkout, `CONTRACT_TMP` the scratch root (default `/hdd/brute/tmp`). Every child, real or stub, runs under an allow-listed environment (`PATH`, throwaway `HOME`/`PI_CODING_AGENT_DIR`/`XDG_*`/`TMPDIR`, `PI_SKIP_VERSION_CHECK`, `PI_TEST_SESSION_OWNERS_DIR`, `OMP_STUB_*`; never `process.env`), with a `models.yml` that declares only provider `fake` (a scripted local OpenAI-compatible server, `apiKey: dummy`). At spawn the harness asserts `get_available_models` lists only `fake/*` and aborts otherwise; the run prints `[contract:<kind>] get_available_models -> fake/fast, fake/smart`.
@@ -46,7 +46,7 @@ CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/p
 
 Stub knobs beyond the script: `OMP_STUB_RECAP_MS` (deterministic idle recap after N ms; off by default), `OMP_STUB_NO_MODELS` (start with no model, for fallback paths), `OMP_STUB_START_DELAY_MS` (slow boot), `OMP_STUB_PROVIDER`. The stub also answers the one-shot CLI: `omp session inspect --json <path>`, `omp session lease --json -- <ids>`, `omp models --json`.
 
-Last run: e2e 76/76 (17 files), contract on the stub 97/97 (14 files).
+Last run: e2e 78/78, contract on the stub 99/99.
 
 ## API coverage at a glance
 
