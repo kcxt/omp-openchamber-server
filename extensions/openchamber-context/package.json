@@ -1,0 +1,23 @@
+{
+  "name": "openchamber-context",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "OpenChamber extension: how full the context window of the open session is, like Claude Code's /context, in a sidebar tab. Vendored from MltStephane/openchamber-context and fed by the omp sidecar's /api/omp/context route.",
+  "scripts": {
+    "build": "bunx openchamber-guest-bundle status/main.ts status/main.js && bunx openchamber-guest-bundle --node service/main.ts service/main.js",
+    "check": "bunx openchamber-guest-check"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": { "openchamber": ">=2.7.0" },
+    "id": "omp-context",
+    "name": "Context",
+    "icon": "pie-chart",
+    "contributes": {
+      "panel": { "entry": "status/index.html" },
+      "service": { "entry": "service/main.js", "runtime": "host" }
+    }
+  },
+  "devDependencies": { "@openchamber/sdk": "2.7.2" }
+}

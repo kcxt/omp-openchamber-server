@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { startStack, type Stack } from "./stack";
-import { summarize } from "../../extensions/omp-context/service/src/summary.js";
 
 let stack: Stack;
 beforeAll(async () => { stack = await startStack(); });
@@ -53,13 +52,12 @@ describe("omp's context map", () => {
     expect(body.breakdown?.categories?.map((c: any) => c.id)).toEqual(["systemPrompt", "systemTools", "systemContext", "instructionFiles", "skills", "messages"]);
   });
 
-  test("the session record and its messages publish what the extension panel reads", async () => {
+  test("the session record and its messages still publish the context fields", async () => {
     const id = await createSession();
     await prompt(id, "hello");
     const session = (await stack.http(`/session/${id}?${dir()}`)).body.data;
     const messages = (await stack.http(`/session/${id}/message?${dir()}&limit=500`)).body.data;
-    const view = summarize(session, messages);
-    expect(view.current?.used).toBe(100);
-    expect(view.history).toHaveLength(1);
+    expect(session.metadata?.openchamber?.context?.used).toBe(100);
+    expect(messages.some((m: any) => m.metadata?.omp?.context?.used === 100)).toBe(true);
   });
 });

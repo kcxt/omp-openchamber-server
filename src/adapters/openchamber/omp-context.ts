@@ -20,8 +20,8 @@ import type { OpenCodeMessageRecord, OpenCodeSession } from "../../shared/types"
 export const OMP_CONTEXT_VERSION = 1;
 
 export interface OmpContextBreakdown {
-  /** omp's own categories: systemPrompt, systemTools, systemContext, instructionFiles, skills, messages. */
-  categories: Record<string, number>;
+  /** omp's own categories, in order: systemPrompt, systemTools, systemContext, instructionFiles, skills, messages. */
+  categories: Array<{ id: string; label: string; tokens: number }>;
   usedTokens?: number;
   contextWindow?: number;
   thresholdTokens?: number;

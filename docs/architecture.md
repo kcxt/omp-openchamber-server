@@ -21,7 +21,7 @@ src/adapters/openchamber/   OpenChamber/OpenCode compat that is not session core
                       queue, approvals, small model, omp config routes, v2 wire shapes, usage stats
 src/adapters/openchamber/extensions/   omp extensions loaded into every driven child (question, web, image budget)
 src/shared/           types.ts (OpenCode shapes), sse.ts (event bus + v2 encoding), logger, ids, blobs, tool normalisation
-extensions/           OpenChamber guest extensions (omp-settings, omp-context panels)
+extensions/           OpenChamber guest extensions (omp-settings, openchamber-context panels)
 test/                 e2e (UI -> sidecar -> stub omp), contract (stub and real omp), stub-omp
 ```
 
