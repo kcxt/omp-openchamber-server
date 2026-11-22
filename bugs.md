@@ -1,4 +1,4 @@
-Context-map wiring (openchamber-context) + sidecar architecture notes
+Context-map wiring (oh-my-pi extension) + sidecar architecture notes
 Sources read: oh-my-pi `dca23990ad12` (~/git/oh-my-pi), openchamber `115e09d65605` (~/git/openchamber), MltStephane/openchamber-context v1.0.1 (/tmp/ctx-ext). Code-reading only — no panel was run against the sidecar.
 
 **Status after the rewrite (Phase 4):** findings 2, 3, 5, 6, 7, 8 and 9 are resolved (one `Status:` line each below); 1 is resolved for the `opencode`-role panel; 4, 10 and 11 are reference notes; 12 is partly done. Paths below that named `src/providers/…` now live under `src/omp/` and `src/store/`.
@@ -7,7 +7,7 @@ FINDINGS
 
 1. the extension cannot see omp sessions at all
 `service/main.ts:54` tries `readClaudeCodeSession` then `readOpenCodeSession`: `~/.claude/projects/<cwd>/*.jsonl` and `~/.local/share/opencode/opencode.db`. omp writes `$PI_CODING_AGENT_DIR/sessions/<bucket>/<ts>_<uuid>.jsonl` (src/providers/omp/paths.ts). Against this sidecar the panel answers `{status:'not-found',reason:'no-data'}`. Its `ses_…` id lookup would also need the sidecar's id codec plus the transcript header's `openCodeId` (src/providers/omp/store.ts:932 `getOmpSessionByOpenCodeId` scans every bucket for it).
-Status: resolved, differently. The context tab is now `extensions/openchamber-context` (vendored upstream, adapted); it asks the sidecar's `GET /api/omp/context/:id?breakdown=1` through `<data dir>/omp-sidecar/endpoint.json`, so it needs no filesystem access and no `opencode` role. Id lookup is `getOmpSessionByOpenCodeId` in `src/store/sessions.ts`; the session directory layout is `src/omp/paths.ts`.
+Status: resolved, differently. The context tab is now the Context view of `extensions/oh-my-pi` (vendored upstream, adapted); it asks the sidecar's `GET /api/omp/context/:id?breakdown=1` through `<data dir>/omp-sidecar/endpoint.json`, so it needs no filesystem access and no `opencode` role. Id lookup is `getOmpSessionByOpenCodeId` in `src/store/sessions.ts`; the session directory layout is `src/omp/paths.ts`.
 
 2. omp's context map is not exposed out-of-process
 - `ContextBreakdown` (packages/tui/src/status-line/context-usage.ts:68): categories systemPrompt/systemTools/systemContext/instructionFiles/skills/messages + usedTokens, contextWindow, thresholdTokens, autoCompactBufferTokens, freeTokens, snapcompact. In-process only.
@@ -45,7 +45,7 @@ Status: done. `GET /api/omp/context/:sessionId?breakdown=1` (`src/routes/transcr
 
 9. extension-side change is a small third source, not a rewrite
 `service/omp.ts` selected when `OPENCHAMBER_OPENCODE_URL` is present: read `/api/session/:id` + `/api/session/:id/message`, take `metadata.omp.context` / `metadata.openchamber.context`, subscribe `contributes.sessionEvents: {events:["turn-finished"]}` instead of the current "refresh when the session changes" guesswork, and keep the Claude/OpenCode readers otherwise. Also fixes the extension's unstated assumption that session files sit next to OpenChamber.
-Status: superseded. The published fields are still served; the vendored `extensions/openchamber-context` reads the equivalent `GET /api/omp/context/:id` instead of the `opencode` role.
+Status: superseded. The published fields are still served; the vendored `extensions/oh-my-pi` reads the equivalent `GET /api/omp/context/:id` instead of the `opencode` role.
 
 10. panel features map to three tiers, and only tier 1 is free today
 - tier 1 (no upstream change): window bar, total, history curve, compaction threshold + growth, cache warm/expiry, largest items, subagents, message-kind split. Cache TTL is not recorded by omp; the extension's 5-min assumption stays flagged as an assumption.

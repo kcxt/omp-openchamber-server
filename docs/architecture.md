@@ -17,11 +17,11 @@ src/sessions/         SessionRuntime, Registry, TurnTranslator, status, service,
 src/omp/              everything that talks to or reads from omp (below)
 src/store/            sessions.ts (session catalogue), session-docs.ts (the one durable store), importer.ts
 src/panels/           git, terminal, project context, omp settings, browser control (moved, not rewritten)
-src/adapters/openchamber/   OpenChamber/OpenCode compat that is not session core: follow, goal mapping, message
+src/adapters/openchamber/   OpenChamber/OpenCode compat that is not session core: follow, goal-check answer, message
                       queue, approvals, small model, omp config routes, v2 wire shapes, usage stats
 src/adapters/openchamber/extensions/   omp extensions loaded into every driven child (question, web, image budget)
 src/shared/           types.ts (OpenCode shapes), sse.ts (event bus + v2 encoding), logger, ids, blobs, tool normalisation
-extensions/           OpenChamber guest extensions (omp-settings, openchamber-context panels)
+extensions/           OpenChamber guest extensions (omp-settings panel; oh-my-pi panel: context, goal, tasks)
 test/                 e2e (UI -> sidecar -> stub omp), contract (stub and real omp), stub-omp
 ```
 
@@ -115,7 +115,7 @@ An in-process bus encodes OpenCode events for SSE and WebSocket clients, includi
 
 ## Goals
 
-OpenChamber's goal record stays in `metadata.openchamber.goal` (in the `SessionDoc`). `adapters/openchamber/goal.ts` maps record changes to omp goal ops (create/resume/pause/drop) on the session's runtime, and the registry mirrors omp's `goal_updated` back (complete, budget limited, tokens used). omp keeps the stretch open while a continuation is pending, so the session stays busy for the whole goal with no sidecar loop. If a stretch settles with the goal still `active`, the record becomes `blocked`. The objective text is read from OpenChamber's objective file; the sidecar does not write `~/.omp/goals`.
+omp's goal mode is driven by the sidecar's `/goal` command (`service.ts`: create/pause/resume/drop on the session's runtime) and read back at `GET /api/omp/goal/:id` (`routes/goals.ts`: the live child's `get_state`, else `omp/goal.ts` reads the transcript's last `mode_change`/`goal-completed`). omp keeps the stretch open while a continuation is pending, so the session stays busy for the whole goal with no sidecar loop. OpenChamber's own Session goal is not served (switched off in its settings); its progress-check prompt is answered without a model (`adapters/openchamber/goal.ts`).
 
 ## omp patches
 

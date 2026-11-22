@@ -7,7 +7,8 @@
  * `{ "paths": [absolute folder, ...], "storageIds": {...} }`. A running
  * OpenChamber re-reads it within ~5 s and fills in missing storage ids itself,
  * so adding a path is all an install is; no server, login or API call needed.
- * Idempotent, and it leaves every other entry (and field) alone.
+ * Idempotent. It also drops entries pointing inside this checkout's extensions/ dir that no
+ * longer exist (renamed extensions) and leaves every other entry (and field) alone.
  *
  * Registering is not approving: an extension's local service still needs the
  * one-time "Allow" in Settings -> Extensions.
@@ -16,7 +17,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 
 const repo = join(import.meta.dir, "..");
 const dataDir = process.env.OPENCHAMBER_DATA_DIR || join(homedir(), ".config", "openchamber");
@@ -34,14 +35,19 @@ try {
   }
 }
 
-const paths = Array.isArray(store.paths) ? store.paths.filter((entry): entry is string => typeof entry === "string") : [];
+const allPaths = Array.isArray(store.paths) ? store.paths.filter((entry): entry is string => typeof entry === "string") : [];
 const extensionsDir = join(repo, "extensions");
+// OpenChamber persists the realpath of a folder install; entries may use either spelling of this checkout.
+const ownRoots = [extensionsDir, ...(existsSync(extensionsDir) ? [realpathSync(extensionsDir)] : [])].map((root) => root + sep);
+
+// Drop installs of this checkout's extensions that were renamed or removed; every other entry stays.
+const pruned = allPaths.filter((entry) => ownRoots.some((root) => entry.startsWith(root)) && !existsSync(entry));
+const paths = allPaths.filter((entry) => !pruned.includes(entry));
 const added: string[] = [];
 if (existsSync(extensionsDir)) {
   for (const name of readdirSync(extensionsDir).sort()) {
     const dir = join(extensionsDir, name);
     if (!existsSync(join(dir, "package.json"))) continue;
-    // OpenChamber persists the realpath of a folder install.
     const real = realpathSync(dir);
     if (paths.includes(real)) continue;
     paths.push(real);
@@ -49,10 +55,11 @@ if (existsSync(extensionsDir)) {
   }
 }
 
-if (added.length > 0) {
+if (added.length > 0 || pruned.length > 0) {
   mkdirSync(dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.tmp`;
   writeFileSync(temp, JSON.stringify({ ...store, paths }, null, 2) + "\n");
   renameSync(temp, file);
-  console.error(`register-extensions: registered ${added.join(", ")} (allow its service in Settings -> Extensions)`);
+  if (pruned.length > 0) console.error(`register-extensions: removed ${pruned.length} stale entr${pruned.length === 1 ? "y" : "ies"} (${pruned.join(", ")})`);
+  if (added.length > 0) console.error(`register-extensions: registered ${added.join(", ")} (allow its service in Settings -> Extensions)`);
 }

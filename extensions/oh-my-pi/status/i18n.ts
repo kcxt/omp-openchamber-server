@@ -1,4 +1,6 @@
 import type { CategoryId, NotFoundReason } from '../service/breakdown';
+import type { GoalNotFoundReason, GoalStatus } from '../service/goal';
+import type { TaskStatus, TasksNotFoundReason } from '../service/tasks';
 
 /** Every word the page shows, in one language. Functions take what the sentence needs. */
 export type Messages = {
@@ -35,6 +37,32 @@ export type Messages = {
     notFound: string;
     unreachable: string;
     reasons: Record<NotFoundReason, string>;
+  };
+  sections: { context: string; goal: string; tasks: string };
+  goal: {
+    loading: string;
+    status: Record<GoalStatus, string>;
+    live: string;
+    transcript: string;
+    liveHint: string;
+    transcriptHint: string;
+    tokens: (used: string, budget: string) => string;
+    tokensNoBudget: (used: string) => string;
+    budgetLeft: (left: string) => string;
+    objective: string;
+    emptyTitle: string;
+    emptyBody: string;
+    commands: string;
+    commandHelp: { pause: string; resume: string; drop: string };
+    reasons: Record<GoalNotFoundReason, string>;
+  };
+  tasks: {
+    loading: string;
+    title: string;
+    status: Record<TaskStatus, string>;
+    emptyTitle: string;
+    emptyBody: string;
+    reasons: Record<TasksNotFoundReason, string>;
   };
 };
 
@@ -89,14 +117,55 @@ const fr: Messages = {
     noSession: ['Aucune session ouverte', 'Ouvre une session pour voir son contexte.'],
     noTurn: ['Pas encore de réponse', "Le contexte apparaît après la première réponse de l'agent."],
     notFound: 'Contexte introuvable',
-    unreachable: "Le service Contexte ne répond pas. Vérifie qu'il est approuvé dans Réglages → Extensions.",
+    unreachable: "Le service Oh-My-Pi ne répond pas. Vérifie qu'il est approuvé, accès OpenCode compris, dans Réglages → Extensions.",
     reasons: {
       'bad-request': 'Demande illisible : rouvre la section.',
       'no-session': 'Ouvre une session pour voir son contexte.',
-      unreachable: "Le sidecar omp ne répond pas. Vérifie qu'il tourne.",
+      unreachable: "Le sidecar omp est injoignable. Vérifie qu'il tourne et que l'accès OpenCode de l'extension est approuvé.",
       'session-not-found': 'Le sidecar ne connaît pas cette session.',
+      'not-omp': "Cette session n'est pas servie par le sidecar omp.",
       'no-window': "La fenêtre du modèle est inconnue : ouvre une fois le sélecteur de modèle pour que le sidecar l'apprenne.",
       failed: 'Lecture du contexte impossible pour le moment.',
+    },
+  },
+  sections: { context: 'Contexte', goal: 'Objectif', tasks: 'Tâches' },
+  goal: {
+    loading: "Lecture de l'objectif…",
+    status: { active: 'Actif', paused: 'En pause', complete: 'Atteint', 'budget-limited': 'Budget épuisé', dropped: 'Abandonné' },
+    live: 'en direct',
+    transcript: 'journal',
+    liveHint: 'Statut lu depuis le processus omp qui pilote la session.',
+    transcriptHint: "Statut lu depuis le dernier enregistrement d'objectif du journal : aucun processus omp ne pilote la session maintenant.",
+    tokens: (used, budget) => `${used} / ${budget} tokens`,
+    tokensNoBudget: (used) => `${used} tokens · sans budget`,
+    budgetLeft: (left) => `${left} restants`,
+    objective: 'Objectif',
+    emptyTitle: 'Aucun objectif',
+    emptyBody: 'Lance-en un avec /goal <objectif>',
+    commands: 'Commandes',
+    commandHelp: { pause: "met l'objectif en pause", resume: 'le reprend', drop: "l'abandonne" },
+    reasons: {
+      'bad-request': 'Demande illisible : rouvre la section.',
+      'no-session': 'Ouvre une session pour voir son objectif.',
+      unreachable: "Le sidecar omp est injoignable. Vérifie qu'il tourne et que l'accès OpenCode de l'extension est approuvé.",
+      'session-not-found': 'Le sidecar ne connaît pas cette session.',
+      'not-omp': "Cette session n'est pas servie par le sidecar omp.",
+      failed: "Lecture de l'objectif impossible pour le moment.",
+    },
+  },
+  tasks: {
+    loading: 'Lecture des tâches…',
+    title: 'Tâches',
+    status: { pending: 'À faire', in_progress: 'En cours', completed: 'Terminée', cancelled: 'Annulée' },
+    emptyTitle: 'Aucune tâche',
+    emptyBody: "La liste de tâches de l'agent apparaît ici.",
+    reasons: {
+      'bad-request': 'Demande illisible : rouvre la section.',
+      'no-session': 'Ouvre une session pour voir ses tâches.',
+      unreachable: "Le sidecar omp est injoignable. Vérifie qu'il tourne et que l'accès OpenCode de l'extension est approuvé.",
+      'session-not-found': 'Le sidecar ne connaît pas cette session.',
+      'not-omp': "Cette session n'est pas servie par le sidecar omp.",
+      failed: 'Lecture des tâches impossible pour le moment.',
     },
   },
 };
@@ -152,14 +221,55 @@ const en: Messages = {
     noSession: ['No session open', 'Open a session to see its context.'],
     noTurn: ['No reply yet', "The context shows after the agent's first reply."],
     notFound: 'Context not found',
-    unreachable: 'The Context service does not answer. Check that it is approved in Settings → Extensions.',
+    unreachable: 'The Oh-My-Pi service does not answer. Check that it is approved, OpenCode access included, in Settings → Extensions.',
     reasons: {
       'bad-request': 'Unreadable request: reopen the section.',
       'no-session': 'Open a session to see its context.',
-      unreachable: 'The omp sidecar does not answer. Check that it is running.',
+      unreachable: "The omp sidecar cannot be reached. Check that it is running and that the extension's OpenCode access is approved.",
       'session-not-found': 'The sidecar does not know this session.',
+      'not-omp': 'This session is not served by the omp sidecar.',
       'no-window': "The model's window is unknown: open the model picker once so the sidecar learns it.",
       failed: 'The context cannot be read right now.',
+    },
+  },
+  sections: { context: 'Context', goal: 'Goal', tasks: 'Tasks' },
+  goal: {
+    loading: 'Reading the goal…',
+    status: { active: 'Active', paused: 'Paused', complete: 'Complete', 'budget-limited': 'Budget reached', dropped: 'Dropped' },
+    live: 'live',
+    transcript: 'transcript',
+    liveHint: 'Status read from the omp process driving the session.',
+    transcriptHint: "Status read from the transcript's last goal record: no omp process is driving the session right now.",
+    tokens: (used, budget) => `${used} / ${budget} tokens`,
+    tokensNoBudget: (used) => `${used} tokens · no budget`,
+    budgetLeft: (left) => `${left} left`,
+    objective: 'Objective',
+    emptyTitle: 'No goal',
+    emptyBody: 'Start one with /goal <objective>',
+    commands: 'Commands',
+    commandHelp: { pause: 'pause the goal', resume: 'resume it', drop: 'drop it' },
+    reasons: {
+      'bad-request': 'Unreadable request: reopen the section.',
+      'no-session': 'Open a session to see its goal.',
+      unreachable: "The omp sidecar cannot be reached. Check that it is running and that the extension's OpenCode access is approved.",
+      'session-not-found': 'The sidecar does not know this session.',
+      'not-omp': 'This session is not served by the omp sidecar.',
+      failed: 'The goal cannot be read right now.',
+    },
+  },
+  tasks: {
+    loading: 'Reading the tasks…',
+    title: 'Tasks',
+    status: { pending: 'Pending', in_progress: 'In progress', completed: 'Completed', cancelled: 'Cancelled' },
+    emptyTitle: 'No tasks',
+    emptyBody: "The agent's task list shows here.",
+    reasons: {
+      'bad-request': 'Unreadable request: reopen the section.',
+      'no-session': 'Open a session to see its tasks.',
+      unreachable: "The omp sidecar cannot be reached. Check that it is running and that the extension's OpenCode access is approved.",
+      'session-not-found': 'The sidecar does not know this session.',
+      'not-omp': 'This session is not served by the omp sidecar.',
+      failed: 'The tasks cannot be read right now.',
     },
   },
 };

@@ -285,7 +285,7 @@ function formatPercent(percent: number): string {
   return percentFormat.format(percent / 100);
 }
 
-function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text = '', children: Node[] = []): HTMLElementTagNameMap[K] {
+export function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', text = '', children: Node[] = []): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text) node.textContent = text;
@@ -357,6 +357,16 @@ export const STYLES = `
   .cx-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: 0.5rem; }
   .cx-fact { display: flex; flex-direction: column; gap: 0.05rem; }
   .cx-fact-value { font-variant-numeric: tabular-nums; }
+
+  .cx-tabs { display: flex; gap: 0.25rem; padding: 0.15rem; border-radius: 8px; background: color-mix(in srgb, var(--oc-muted) 8%, transparent); }
+  .cx-tab { display: inline-flex; flex: 1; align-items: center; justify-content: center; gap: 0.35rem; min-width: 0; padding: 0.3rem 0.4rem; border: 0; border-radius: 6px; background: transparent; color: var(--oc-muted); font: inherit; font-weight: 550; cursor: pointer; }
+  .cx-tab:hover { color: var(--oc-fg); }
+  .cx-tab[aria-selected="true"] { background: var(--oc-bg, transparent); color: var(--oc-fg); box-shadow: inset 0 0 0 1px var(--oc-border); }
+  .cx-tab:focus-visible { outline: 2px solid var(--oc-primary); outline-offset: 1px; }
+  .cx-tab-icon { width: 13px; height: 13px; flex: none; }
+  .cx-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cx-tab-count { font-size: 0.7rem; font-variant-numeric: tabular-nums; font-weight: 400; }
+  .cx-content { display: flex; flex-direction: column; gap: 0.75rem; }
 
   @media (prefers-reduced-motion: reduce) { .cx-chevron::before, .cx-block { transition: none; } }
 `;

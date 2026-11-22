@@ -1,3 +1,5 @@
+import type { SidecarReason } from './sidecar';
+
 // Reduction of the sidecar's `GET /api/omp/context/:sessionId?breakdown=1` answer
 // (src/adapters/openchamber/omp-context.ts) into what the tab draws.
 //
@@ -20,7 +22,7 @@ export type CategoryId =
 export type Category = { id: CategoryId; tokens: number };
 
 /** Why a session could not be read; the page words it. */
-export type NotFoundReason = 'bad-request' | 'no-session' | 'unreachable' | 'session-not-found' | 'no-window' | 'failed';
+export type NotFoundReason = SidecarReason | 'no-window';
 
 export type ContextReport =
   | {

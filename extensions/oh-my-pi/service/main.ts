@@ -1,49 +1,73 @@
 import http from 'node:http';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 
 import { buildReport } from './breakdown';
-import type { ContextReport, NotFoundReason, SidecarContext } from './breakdown';
+import type { ContextReport, SidecarContext } from './breakdown';
+import { buildGoalReport } from './goal';
+import type { GoalReport, SidecarGoal } from './goal';
+import { locateSidecar } from './sidecar';
+import type { SidecarReason } from './sidecar';
+import { buildTasksReport } from './tasks';
+import type { SidecarTodos, TasksReport } from './tasks';
 
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN;
-const CONTEXT_PATH = '/context';
 
-type ContextRequest = { sessionId?: unknown };
+type SessionRequest = { sessionId?: unknown; directory?: unknown };
+type NotFound = { status: 'not-found'; reason: SidecarReason };
 
-const notFound = (reason: NotFoundReason): ContextReport => ({ status: 'not-found', reason });
-
-// The service does not inherit the host environment: the sidecar publishes its address on start.
-function sidecarUrl(): string {
+function parseRequest(body: string): SessionRequest | null {
   try {
-    const dataDir = process.env.OPENCHAMBER_DATA_DIR || join(homedir(), '.config', 'openchamber');
-    const { url } = JSON.parse(readFileSync(join(dataDir, 'omp-sidecar', 'endpoint.json'), 'utf8')) as { url?: unknown };
-    if (typeof url === 'string' && url.startsWith('http://')) return url;
+    return JSON.parse(body || '{}') as SessionRequest;
   } catch {
-    // not published: fall back to the default port
+    return null;
   }
-  return 'http://127.0.0.1:4096';
 }
 
-async function readContext(body: string): Promise<ContextReport> {
-  let request: ContextRequest;
-  try {
-    request = JSON.parse(body || '{}') as ContextRequest;
-  } catch {
-    return notFound('bad-request');
-  }
-  if (typeof request.sessionId !== 'string' || request.sessionId === '') return notFound('no-session');
+/**
+ * One sidecar read for the open session: locate the sidecar through the host, GET `route`, build the
+ * report. Every problem is a `not-found` note, so the page never sees a 500.
+ */
+async function readSidecar<Report, Answer>(
+  body: string,
+  route: (sessionId: string, query: URLSearchParams) => string,
+  timeoutMs: number,
+  build: (answer: Answer) => Report,
+): Promise<Report | NotFound> {
+  const request = parseRequest(body);
+  if (!request) return { status: 'not-found', reason: 'bad-request' };
+  if (typeof request.sessionId !== 'string' || request.sessionId === '') return { status: 'not-found', reason: 'no-session' };
 
+  const located = await locateSidecar(request.sessionId);
+  if (!located.ok) return { status: 'not-found', reason: located.reason };
+
+  const query = new URLSearchParams();
+  if (typeof request.directory === 'string' && request.directory !== '') query.set('directory', request.directory);
   let response: Response;
   try {
-    response = await fetch(`${sidecarUrl()}/api/omp/context/${encodeURIComponent(request.sessionId)}?breakdown=1`, { signal: AbortSignal.timeout(30_000) });
+    response = await fetch(`${located.url}${route(encodeURIComponent(request.sessionId), query)}`, { signal: AbortSignal.timeout(timeoutMs) });
   } catch {
-    return notFound('unreachable');
+    return { status: 'not-found', reason: 'unreachable' };
   }
-  if (response.status === 404) return notFound('session-not-found');
-  if (!response.ok) return notFound('failed');
-  return buildReport((await response.json()) as SidecarContext);
+  if (response.status === 404) return { status: 'not-found', reason: 'session-not-found' };
+  if (!response.ok) return { status: 'not-found', reason: 'failed' };
+  return build((await response.json()) as Answer);
 }
+
+const withQuery = (path: string, query: URLSearchParams): string => (query.size > 0 ? `${path}?${query}` : path);
+
+const HANDLERS: Record<string, (body: string) => Promise<unknown>> = {
+  '/context': (body) =>
+    readSidecar<ContextReport, SidecarContext>(
+      body,
+      (id, query) => {
+        query.set('breakdown', '1');
+        return withQuery(`/api/omp/context/${id}`, query);
+      },
+      30_000,
+      buildReport,
+    ),
+  '/goal': (body) => readSidecar<GoalReport, SidecarGoal>(body, (id, query) => withQuery(`/api/omp/goal/${id}`, query), 10_000, buildGoalReport),
+  '/tasks': (body) => readSidecar<TasksReport, SidecarTodos>(body, (id, query) => withQuery(`/api/session-todos/${id}`, query), 10_000, buildTasksReport),
+};
 
 http
   .createServer((req, res) => {
@@ -61,13 +85,13 @@ http
       body += chunk;
     });
     req.on('end', () => {
-      if (path !== CONTEXT_PATH || req.method !== 'POST') {
+      const handler = req.method === 'POST' && Object.hasOwn(HANDLERS, path) ? HANDLERS[path] : undefined;
+      if (!handler) {
         res.writeHead(404, { 'Content-Type': 'application/json' }).end('{}');
         return;
       }
-      // readContext answers every problem with a note, so the page never sees a 500.
-      readContext(body)
-        .catch(() => notFound('failed'))
+      handler(body)
+        .catch((): NotFound => ({ status: 'not-found', reason: 'failed' }))
         .then((report) => {
           res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(report));
         });

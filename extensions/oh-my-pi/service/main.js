@@ -1,8 +1,5 @@
 // service/main.ts
 import http from "node:http";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
 // service/breakdown.ts
 var HISTORY_POINTS = 40;
@@ -66,40 +63,117 @@ function averageGrowth(used) {
   return Math.round(deltas.reduce((total, delta) => total + delta, 0) / deltas.length);
 }
 
-// service/main.ts
-var token = process.env.OPENCHAMBER_SERVICE_TOKEN;
-var CONTEXT_PATH = "/context";
-var notFound = (reason) => ({ status: "not-found", reason });
-function sidecarUrl() {
-  try {
-    const dataDir = process.env.OPENCHAMBER_DATA_DIR || join(homedir(), ".config", "openchamber");
-    const { url } = JSON.parse(readFileSync(join(dataDir, "omp-sidecar", "endpoint.json"), "utf8"));
-    if (typeof url === "string" && url.startsWith("http://"))
-      return url;
-  } catch {}
-  return "http://127.0.0.1:4096";
+// service/goal.ts
+var GOAL_STATUSES = ["active", "paused", "complete", "budget-limited", "dropped"];
+var finite = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+function buildGoalReport(answer) {
+  const live = answer.live === true;
+  const raw = answer.goal;
+  if (!raw || typeof raw !== "object")
+    return { status: "ok", live, goal: null };
+  const { status, objective, tokensUsed, tokenBudget } = raw;
+  if (!GOAL_STATUSES.includes(status))
+    return { status: "ok", live, goal: null };
+  const budget = finite(tokenBudget);
+  return {
+    status: "ok",
+    live,
+    goal: {
+      status,
+      objective: typeof objective === "string" ? objective : "",
+      tokensUsed: finite(tokensUsed) ?? 0,
+      tokenBudget: budget !== null && budget > 0 ? budget : null
+    }
+  };
 }
-async function readContext(body) {
-  let request;
-  try {
-    request = JSON.parse(body || "{}");
-  } catch {
-    return notFound("bad-request");
-  }
-  if (typeof request.sessionId !== "string" || request.sessionId === "")
-    return notFound("no-session");
+
+// service/sidecar.ts
+var asRecord = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : null;
+async function locateSidecar(sessionId) {
+  const base = process.env.OPENCHAMBER_OPENCODE_URL;
+  const token = process.env.OPENCHAMBER_SERVICE_TOKEN;
+  if (!base || !token)
+    return { ok: false, reason: "unreachable" };
   let response;
   try {
-    response = await fetch(`${sidecarUrl()}/api/omp/context/${encodeURIComponent(request.sessionId)}?breakdown=1`, { signal: AbortSignal.timeout(30000) });
+    response = await fetch(`${base}/api/session/${encodeURIComponent(sessionId)}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(1e4)
+    });
   } catch {
-    return notFound("unreachable");
+    return { ok: false, reason: "unreachable" };
   }
   if (response.status === 404)
-    return notFound("session-not-found");
+    return { ok: false, reason: "session-not-found" };
   if (!response.ok)
-    return notFound("failed");
-  return buildReport(await response.json());
+    return { ok: false, reason: "failed" };
+  const body = asRecord(await response.json().catch(() => null));
+  const session = asRecord(body?.data) ?? body;
+  const url = asRecord(asRecord(session?.metadata)?.omp)?.sidecarUrl;
+  if (typeof url !== "string" || !url.startsWith("http://"))
+    return { ok: false, reason: "not-omp" };
+  return { ok: true, url };
 }
+
+// service/tasks.ts
+var TASK_STATUSES = ["pending", "in_progress", "completed", "cancelled"];
+function buildTasksReport(answer) {
+  const tasks = [];
+  if (Array.isArray(answer.todos)) {
+    for (const item of answer.todos) {
+      if (!item || typeof item !== "object")
+        continue;
+      const { content, status } = item;
+      if (typeof content !== "string" || content === "")
+        continue;
+      tasks.push({ content, status: TASK_STATUSES.includes(status) ? status : "pending" });
+    }
+  }
+  return { status: "ok", tasks };
+}
+
+// service/main.ts
+var token = process.env.OPENCHAMBER_SERVICE_TOKEN;
+function parseRequest(body) {
+  try {
+    return JSON.parse(body || "{}");
+  } catch {
+    return null;
+  }
+}
+async function readSidecar(body, route, timeoutMs, build) {
+  const request = parseRequest(body);
+  if (!request)
+    return { status: "not-found", reason: "bad-request" };
+  if (typeof request.sessionId !== "string" || request.sessionId === "")
+    return { status: "not-found", reason: "no-session" };
+  const located = await locateSidecar(request.sessionId);
+  if (!located.ok)
+    return { status: "not-found", reason: located.reason };
+  const query = new URLSearchParams;
+  if (typeof request.directory === "string" && request.directory !== "")
+    query.set("directory", request.directory);
+  let response;
+  try {
+    response = await fetch(`${located.url}${route(encodeURIComponent(request.sessionId), query)}`, { signal: AbortSignal.timeout(timeoutMs) });
+  } catch {
+    return { status: "not-found", reason: "unreachable" };
+  }
+  if (response.status === 404)
+    return { status: "not-found", reason: "session-not-found" };
+  if (!response.ok)
+    return { status: "not-found", reason: "failed" };
+  return build(await response.json());
+}
+var withQuery = (path, query) => query.size > 0 ? `${path}?${query}` : path;
+var HANDLERS = {
+  "/context": (body) => readSidecar(body, (id, query) => {
+    query.set("breakdown", "1");
+    return withQuery(`/api/omp/context/${id}`, query);
+  }, 30000, buildReport),
+  "/goal": (body) => readSidecar(body, (id, query) => withQuery(`/api/omp/goal/${id}`, query), 1e4, buildGoalReport),
+  "/tasks": (body) => readSidecar(body, (id, query) => withQuery(`/api/session-todos/${id}`, query), 1e4, buildTasksReport)
+};
 http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     res.writeHead(401).end();
@@ -115,11 +189,12 @@ http.createServer((req, res) => {
     body += chunk;
   });
   req.on("end", () => {
-    if (path !== CONTEXT_PATH || req.method !== "POST") {
+    const handler = req.method === "POST" && Object.hasOwn(HANDLERS, path) ? HANDLERS[path] : undefined;
+    if (!handler) {
       res.writeHead(404, { "Content-Type": "application/json" }).end("{}");
       return;
     }
-    readContext(body).catch(() => notFound("failed")).then((report) => {
+    handler(body).catch(() => ({ status: "not-found", reason: "failed" })).then((report) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(report));
     });
   });

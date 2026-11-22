@@ -54,7 +54,7 @@ fi
 command -v openchamber >/dev/null 2>&1 ||
     echo "note: no openchamber on PATH; install @openchamber/web"
 
-# List the bundled OpenChamber extensions (omp settings, context). Writes to
+# List the bundled OpenChamber extensions (omp settings, Oh-My-Pi) and drop renamed ones. Writes to
 # OpenChamber's data dir only; a running OpenChamber notices within seconds.
 "$repo/bin/register-extensions" || true
 

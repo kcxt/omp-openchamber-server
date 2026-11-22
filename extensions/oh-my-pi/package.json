@@ -1,9 +1,9 @@
 {
-  "name": "openchamber-context",
-  "version": "1.0.1",
+  "name": "oh-my-pi",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenChamber extension: how full the context window of the open session is, like Claude Code's /context, in a sidebar tab. Vendored from MltStephane/openchamber-context and fed by the omp sidecar's /api/omp/context route.",
+  "description": "OpenChamber extension for the omp-backed session: context window map and /goal status in a sidebar panel; home for omp-only views that have no OpenChamber equivalent. Context view vendored from MltStephane/openchamber-context; fed by the omp sidecar's /api/omp routes.",
   "scripts": {
     "build": "bunx openchamber-guest-bundle status/main.ts status/main.js && bunx openchamber-guest-bundle --node service/main.ts service/main.js",
     "check": "bunx openchamber-guest-check"
@@ -11,12 +11,12 @@
   "openchamber": {
     "apiVersion": 1,
     "engines": { "openchamber": ">=2.7.0" },
-    "id": "omp-context",
-    "name": "Context",
+    "id": "oh-my-pi",
+    "name": "Oh-My-Pi",
     "icon": "pie-chart",
     "contributes": {
       "panel": { "entry": "status/index.html" },
-      "service": { "entry": "service/main.js", "runtime": "host" }
+      "service": { "entry": "service/main.js", "runtime": "host", "provides": ["opencode"] }
     }
   },
   "devDependencies": { "@openchamber/sdk": "2.7.2" }

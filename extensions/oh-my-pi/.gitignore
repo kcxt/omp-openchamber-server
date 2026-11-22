@@ -1,3 +1,4 @@
-node_modules/
+# Dev-only symlink to ../omp-settings/node_modules (the SDK's bundler and checker).
+node_modules
 # Screenshots the OpenChamber browser tool saves while checking the UI.
 .openchamber/
