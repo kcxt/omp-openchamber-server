@@ -9,9 +9,8 @@ import { dirname } from "node:path";
 import { credentialInputFingerprint, resolveBackendCredentials } from "../omp/credentials";
 import { withOmpRecapAssist } from "./recap";
 import { getOmpSessionByOpenCodeId, updateOmpSession } from "../store/sessions";
-import type { BackendCredentialInput, BackendGoalSnapshot } from "../shared/types";
-import { ocPatchForOmpGoal, withGoalPatch, type OcGoal } from "../adapters/openchamber/goal";
-import { emitOpenCodeV2Event, emitSessionError, emitSessionIdle, emitSessionStatus } from "../shared/sse";
+import type { BackendCredentialInput } from "../shared/types";
+import { emitOpenCodeV2Event, emitSessionIdle, emitSessionStatus } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import { SessionRuntime, type CloseReason, type RuntimeState, type SubagentInfo } from "./runtime";
 
@@ -32,33 +31,6 @@ const busyOf = (state: RuntimeState): boolean => state === "active" || state ===
 /** An omp subagent's transcript lives in its parent's artifact directory, next to `<parent>.jsonl`. */
 export function isSubagentTranscript(path: string): boolean {
   return existsSync(`${dirname(path)}.jsonl`);
-}
-
-/**
- * Mirrors omp's goal into OpenChamber's goal record. omp settles a goal itself
- * (the agent calls the `goal` tool); a stretch that settles with the goal still
- * active means omp stopped continuing it, which OpenChamber shows as blocked.
- *
- * The write is announced as OpenCode's `session.metadata.updated`, which
- * OpenChamber's UI applies directly, behind any OpenChamber server.
- */
-async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | null, stalled: boolean): Promise<void> {
-  const patch: Partial<OcGoal> = {
-    ...ocPatchForOmpGoal(goal),
-    ...(stalled
-      ? { status: "blocked", statusReason: "The agent made no progress on its last goal turn. Send a message or resume the goal to continue." }
-      : {}),
-  };
-  if (Object.keys(patch).length === 0) return;
-  try {
-    const session = await getOmpSessionByOpenCodeId(runtime.sessionId, runtime.cwd);
-    const metadata = withGoalPatch(session?.metadata, patch);
-    if (!metadata) return;
-    await updateOmpSession(runtime.sessionId, { metadata }, runtime.cwd);
-  } catch (err) {
-    promptLogger.warn({ err, sessionID: runtime.sessionId }, "[goal] could not mirror omp's goal into the session metadata");
-    emitSessionError(runtime.sessionId, { message: `could not record the goal's result: ${err instanceof Error ? err.message : String(err)}` }, runtime.cwd);
-  }
 }
 
 async function publishRecap(runtime: SessionRuntime, recap: string, createdAt: number, forMessageID: string | undefined): Promise<void> {
@@ -90,7 +62,6 @@ function adopt(key: string, runtime: SessionRuntime): void {
     emitSessionIdle(runtime.sessionId, runtime.cwd, aborted === true);
     void publishUsage(runtime);
   });
-  runtime.onGoalUpdate((goal, stalled) => void mirrorGoal(runtime, goal, stalled));
   runtime.onRecap((recap, createdAt, forMessageID) => void publishRecap(runtime, recap, createdAt, forMessageID));
 }
 

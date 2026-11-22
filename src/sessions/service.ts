@@ -3,7 +3,6 @@
  * routing), abort, compact, model, goal, shell, and session teardown. Each
  * resolves the session's runtime through the Registry; none keeps state.
  */
-import { goalChangeFor, ocGoalOf, type GoalChange } from "../adapters/openchamber/goal";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { SessionDocs } from "../store/session-docs";
 import { CredentialInputError } from "../omp/credentials";
@@ -12,7 +11,6 @@ import { locateMessage } from "../omp/messages";
 import { getOmpSessionByOpenCodeId, readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
 import { OmpCli } from "../omp/cli";
 import { RpcChild } from "../omp/rpc-child";
-import { sameDirectory } from "../omp/paths";
 import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../shared/types";
 import { emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
@@ -102,6 +100,8 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
   if (!isPromptBody(body)) return { queued: false, error: "invalid body", status: 400 };
   const question = asideQuestionOf(body);
   if (question !== undefined) return askAside(session, question);
+  const goalArgs = goalCommandOf(body);
+  if (goalArgs !== undefined) return runGoalCommand(session, goalArgs);
   const prepared = await preparePrompt(session.id, session.directory, body);
   if ("error" in prepared) return { queued: false, error: prepared.error, status: 400 };
   if (isSubagentTranscript(session.path)) return promptSubagent(session, prepared.message, prepared.messageID);
@@ -171,10 +171,6 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
     reportSessionProblem(session, err, "omp refused the prompt");
     return failure(err);
   }
-  // A goal armed for this message starts now that the message is admitted: omp
-  // folds the goal into this run instead of starting a run of its own ahead of it.
-  const armed = takeArmedGoal(runtime);
-  if (armed) await startOmpGoal(runtime, armed).catch((err) => reportSessionProblem(session, err, "could not start the goal"));
   return { queued: true, messageID: prepared.messageID };
 }
 
@@ -228,83 +224,64 @@ export async function applySessionModel(session: OpenCodeSession, model: ModelRe
   }
 }
 
+const GOAL_USAGE = "Usage: /goal <objective> | /goal pause | /goal resume | /goal drop";
+
+/** The arguments of a `/goal …` prompt (typed, or sent as the `goal` command); undefined for any other prompt. */
+function goalCommandOf(body: unknown): string | undefined {
+  if (!isPromptBody(body)) return undefined;
+  const text = extractPromptTextParts(body).filter((part) => part.synthetic !== true).map((part) => part.text).join("\n\n").trim();
+  const match = /^\/goal(?:\s+([\s\S]*))?$/i.exec(text);
+  return match ? (match[1] ?? "").trim() : undefined;
+}
+
 /**
- * Starts (or restarts) omp's goal from what OpenChamber armed. A goal omp still
- * holds from an earlier arming is dropped first: omp allows one goal at a time.
+ * `/goal`: omp's goal mode on the session's runtime, the RPC counterpart of
+ * omp's interactive `/goal` (one goal at a time; omp runs the continuations
+ * and the agent completes it with its `goal` tool). The goal's state is read
+ * from `GET /api/omp/goal/:sessionId`.
  */
-async function startOmpGoal(runtime: SessionRuntime, change: GoalStart): Promise<void> {
-  const held = await runtime.getGoal().catch(() => null);
-  if (change.op === "resume" && held) {
-    if (held.status === "active") await runtime.goal("pause").catch(() => {}); // re-arms continuation, which omp stopped
-    if (held.status === "active" || held.status === "paused") {
-      await runtime.goal("resume");
-      return;
+async function runGoalCommand(session: OpenCodeSession, args: string): Promise<PromptOutcome> {
+  if (isSubagentTranscript(session.path)) return { queued: false, status: 409, error: "A goal is set in the parent session." };
+  const [word = "", ...restWords] = args.split(/\s+/);
+  const sub = word.toLowerCase();
+  const refuse = (error: string, status = 409): PromptOutcome => ({ queued: false, status, error });
+  try {
+    const runtime = await Registry.ensure(session);
+    const held = await runtime.getGoal();
+    const current = held?.status === "active" || held?.status === "paused" ? held : null;
+    switch (sub) {
+      case "":
+      case "show":
+        return refuse(current ? `Goal ${current.status}: ${current.objective}. ${GOAL_USAGE}` : `No goal. ${GOAL_USAGE}`, current ? 409 : 400);
+      case "pause":
+        if (current?.status !== "active") return refuse("No active goal to pause.");
+        await runtime.goal("pause");
+        break;
+      case "resume":
+        if (!current) return refuse("No goal to resume.");
+        // An active goal omp stopped continuing (no progress) is re-armed by a pause and resume.
+        if (current.status === "active") await runtime.goal("pause");
+        await runtime.goal("resume");
+        break;
+      case "drop":
+        if (!current) return refuse("No goal to drop.");
+        await runtime.goal("drop");
+        break;
+      case "budget":
+        return refuse("omp's RPC cannot change a goal's budget; drop the goal and set it again.", 400);
+      default: {
+        const objective = (sub === "set" ? restWords.join(" ") : args).trim();
+        if (!objective) return refuse(GOAL_USAGE, 400);
+        if (current) return refuse(`A goal is already ${current.status}. Use /goal drop to start over.`);
+        await runtime.goal("create", { objective });
+      }
     }
+    return { queued: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof OwnedElsewhereError) return refuse(message);
+    return refuse(message, 500);
   }
-  if (held && held.status !== "complete" && held.status !== "dropped") await runtime.goal("drop").catch(() => {});
-  await runtime.goal("create", { objective: change.objective, tokenBudget: change.tokenBudget });
-}
-
-type GoalStart = Extract<GoalChange, { op: "start" | "resume" }>;
-
-/**
- * How long a goal armed on an idle session waits for the prompt that carries
- * its objective. OpenChamber writes the goal record and sends that prompt
- * back to back; creating the goal on an idle omp first would make omp start a
- * goal run of its own, and the user's message would queue behind it unanswered.
- */
-const GOAL_PROMPT_GRACE_MS = 1_500;
-
-/** A goal armed on an idle runtime, waiting for its prompt (a timer handle; dies with the runtime). */
-const armedGoals = new WeakMap<SessionRuntime, { change: GoalStart; timer: ReturnType<typeof setTimeout> }>();
-
-function takeArmedGoal(runtime: SessionRuntime): GoalStart | undefined {
-  const armed = armedGoals.get(runtime);
-  if (!armed) return undefined;
-  clearTimeout(armed.timer);
-  armedGoals.delete(runtime);
-  return armed.change;
-}
-
-/** Applies a change OpenChamber made to the session's goal record to omp's goal; omp runs the continuations. */
-export async function applyGoalChange(session: OpenCodeSession, prev: unknown, next: unknown): Promise<void> {
-  const change = await goalChangeFor(session.id, ocGoalOf({ openchamber: { goal: prev } }), ocGoalOf({ openchamber: { goal: next } }));
-  if (!change) return;
-  if (change.op === "pause" || change.op === "drop") {
-    const runtime = Registry.get(session.id, session.directory);
-    if (!runtime) return;
-    takeArmedGoal(runtime);
-    await runtime.goal(change.op);
-    return;
-  }
-  const runtime = await Registry.ensure(session);
-  takeArmedGoal(runtime);
-  if (runtime.state !== "idle") {
-    // A live run takes the goal as a steer; omp continues it after the run.
-    await startOmpGoal(runtime, change);
-    return;
-  }
-  // No prompt within the grace window (the goal dialog's Start): omp starts the goal run itself.
-  const timer = setTimeout(() => {
-    const armed = takeArmedGoal(runtime);
-    if (armed) void startOmpGoal(runtime, armed).catch((err) => reportSessionProblem(session, err, "could not start the goal"));
-  }, GOAL_PROMPT_GRACE_MS);
-  timer.unref?.();
-  armedGoals.set(runtime, { change, timer });
-}
-
-/**
- * Whether omp carries a goal with this objective in `directory`, or is about to:
- * armed and waiting for its prompt, or omp's own goal active.
- */
-export async function ompCarriesGoal(objective: string, directory: string | undefined): Promise<boolean> {
-  for (const runtime of Registry.all()) {
-    if (directory && !sameDirectory(runtime.cwd, directory)) continue;
-    if (armedGoals.get(runtime)?.change.objective === objective) return true;
-    const goal = await runtime.getGoal().catch(() => null);
-    if (goal?.status === "active" && goal.objective.trim() === objective) return true;
-  }
-  return false;
 }
 
 /** `/session/:id/shell`: through the session's runtime when it has one, else a plain shell in the session's directory. */

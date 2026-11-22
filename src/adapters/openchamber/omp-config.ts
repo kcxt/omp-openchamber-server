@@ -301,12 +301,15 @@ async function loadOmpSlashCommands(directory: string): Promise<SlashCommand[]> 
   return load;
 }
 
-/** `/aside` is the sidecar's name for omp's `/btw`. */
-const ASIDE_COMMAND: SlashCommand = { name: "aside", description: "Ask a side question without adding it to the conversation (omp /btw)" };
+/** Commands the sidecar runs itself (src/sessions/service.ts): `/aside` is omp's `/btw`, `/goal` omp's goal mode. */
+const SIDECAR_COMMANDS: SlashCommand[] = [
+  { name: "aside", description: "Ask a side question without adding it to the conversation (omp /btw)" },
+  { name: "goal", description: "omp goal mode: /goal <objective> | pause | resume | drop (status in the Oh-My-Pi panel)" },
+];
 
 export async function listOmpSlashCommands(directory: string): Promise<SlashCommand[]> {
   const commands = await loadOmpSlashCommands(directory);
-  return commands.some((command) => command.name === ASIDE_COMMAND.name) ? commands : [...commands, ASIDE_COMMAND];
+  return [...commands.filter((command) => !SIDECAR_COMMANDS.some((own) => own.name === command.name)), ...SIDECAR_COMMANDS];
 }
 
 // -------------------------------------------------------------- routes

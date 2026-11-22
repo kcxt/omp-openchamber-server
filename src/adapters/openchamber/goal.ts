@@ -1,131 +1,17 @@
 /**
- * OpenChamber's goal mode, served by omp's own goal.
- *
- * OpenChamber keeps a goal in session metadata (`openchamber.goal`) and runs a
- * server-side loop that, at every idle, asks a small model whether the goal is
- * done and re-prompts the session. omp has its own goal: the agent ends it by
- * calling the `goal` tool, and omp itself continues turns while it is active.
- * The sidecar maps OpenChamber's goal records onto omp's goal and keeps the
- * session busy until omp settles it, so OpenChamber's loop (which only acts on
- * an idle session with an active goal) never runs its audit or sends a prompt.
+ * OpenChamber's own "Session goal" is not served: omp's goal mode is, through
+ * the `/goal` command. Should OpenChamber's goal loop run anyway (the feature
+ * re-enabled in its settings), its progress check would spend a small-model
+ * call per idle; the sidecar answers it without a model instead.
  */
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import type { BackendGoalSnapshot } from "../../shared/types";
-
-export interface OcGoal {
-  id: string;
-  status: string;
-  objective?: string;
-  objectiveFile?: boolean;
-  tokenBudget?: number | null;
-  tokensUsed?: number;
-  statusReason?: string;
-}
-
-export type GoalChange =
-  | { op: "start"; objective: string; tokenBudget?: number }
-  | { op: "resume"; objective: string; tokenBudget?: number }
-  | { op: "pause" }
-  | { op: "drop" };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-}
-
-export function ocGoalOf(metadata: unknown): OcGoal | undefined {
-  const goal = asRecord(asRecord(asRecord(metadata)?.openchamber)?.goal);
-  if (!goal || typeof goal.id !== "string" || typeof goal.status !== "string") return undefined;
-  return goal as unknown as OcGoal;
-}
-
-/** What omp has to do for a metadata write that took the goal from `prev` to `next`. */
-export function goalTransition(prev: OcGoal | undefined, next: OcGoal | undefined): "start" | "resume" | "pause" | "drop" | undefined {
-  if (!next) return prev ? "drop" : undefined;
-  if (next.status === "paused") return prev?.status === "active" ? "pause" : undefined;
-  if (next.status !== "active") return undefined;
-  if (prev?.id !== next.id) return "start";
-  if (prev.status !== "active") return "resume";
-  // OpenChamber's Resume stamps `statusReason: "resumed"` on a goal that is still active here.
-  if (next.statusReason === "resumed" && prev.statusReason !== "resumed") return "resume";
-  return undefined;
-}
-
-/** OpenChamber's objective file for a session: `<data dir>/goals/<session id>.md` (server/lib/session-goal/objectives.js). */
-export function goalObjectivePath(sessionID: string): string {
-  const dataDir = process.env.OPENCHAMBER_DATA_DIR;
-  return join(dataDir ? resolve(dataDir) : join(process.env.HOME || homedir(), ".config", "openchamber"), "goals", `${sessionID}.md`);
-}
-
-/** The objective text: the file OpenChamber wrote for the session, else the inline copy. */
-export async function readGoalObjective(sessionID: string, goal: OcGoal): Promise<string> {
-  if (goal.objectiveFile) {
-    const text = await readFile(goalObjectivePath(sessionID), "utf8").catch(() => "");
-    if (text.trim()) return text.trim();
-  }
-  return (goal.objective ?? "").trim();
-}
-
-export async function goalChangeFor(
-  sessionID: string,
-  prev: OcGoal | undefined,
-  next: OcGoal | undefined,
-): Promise<GoalChange | undefined> {
-  const kind = goalTransition(prev, next);
-  if (!kind) return undefined;
-  if (kind === "pause" || kind === "drop") return { op: kind };
-  const objective = await readGoalObjective(sessionID, next!);
-  if (!objective) return undefined;
-  const budget = typeof next!.tokenBudget === "number" && next!.tokenBudget > 0 ? { tokenBudget: next!.tokenBudget } : {};
-  return { op: kind, objective, ...budget };
-}
 
 /**
- * The OpenChamber goal fields that mirror an omp goal change, or undefined when
- * the change does not settle or advance the goal. omp ending a goal (the agent
- * called the `goal` tool) is `complete`; omp has no "blocked" of its own.
+ * Whether `prompt` is OpenChamber's goal progress check
+ * (server/lib/session-goal/audit.js `buildSmallModelAuditPrompt`).
  */
-export function ocPatchForOmpGoal(goal: BackendGoalSnapshot | null): Partial<OcGoal> | undefined {
-  if (!goal) return undefined;
-  switch (goal.status) {
-    case "complete":
-      return { status: "complete", statusReason: "reported by agent", tokensUsed: goal.tokensUsed };
-    case "budget-limited":
-      return { status: "budgetLimited", statusReason: "token budget reached", tokensUsed: goal.tokensUsed };
-    case "active":
-      return { tokensUsed: goal.tokensUsed };
-    default:
-      return undefined;
-  }
+export function isGoalAuditPrompt(prompt: string): boolean {
+  return prompt.startsWith("You check the progress of an AI coding agent. Answer three yes/no questions");
 }
 
-/** `metadata` with the goal's fields replaced, or null when the session has no goal in a state to change. */
-export function withGoalPatch(metadata: Record<string, unknown> | undefined, patch: Partial<OcGoal>): Record<string, unknown> | null {
-  const goal = ocGoalOf(metadata);
-  if (!goal || (goal.status !== "active" && goal.status !== "paused")) return null;
-  const openchamber = asRecord(metadata?.openchamber) ?? {};
-  return { openchamber: { ...openchamber, goal: { ...goal, ...patch, updatedAt: Date.now() } } };
-}
-
-/**
- * The objective of OpenChamber's goal progress check, or undefined when `prompt`
- * is not one. Its loop asks the small model this (server/lib/session-goal/audit.js
- * `buildSmallModelAuditPrompt`) when a session with an active goal goes idle.
- */
-export function goalAuditObjective(prompt: string): string | undefined {
-  if (!prompt.startsWith("You check the progress of an AI coding agent. Answer three yes/no questions")) return undefined;
-  return prompt.match(/<objective>\n([\s\S]*?)\n<\/objective>\n\n<answer>\n/)?.[1]?.trim() ?? "";
-}
-
-/**
- * The progress check's answer, decided by omp instead of a model: a goal omp
- * carries (or is about to start) continues; one omp is not carrying waits for
- * the user. A goal omp finished is already `complete` in OpenChamber's record
- * (`ocPatchForOmpGoal`), which its loop re-reads before it writes a verdict.
- */
-export function goalAuditReply(ompCarriesGoal: boolean): string {
-  return JSON.stringify(ompCarriesGoal
-    ? { all_done: false, remaining: true, needs_user: false }
-    : { all_done: false, remaining: false, needs_user: true });
-}
+/** The check's answer: waiting for the user, so OpenChamber's loop parks its goal as blocked and sends nothing. */
+export const GOAL_AUDIT_REPLY = JSON.stringify({ all_done: false, remaining: false, needs_user: true });

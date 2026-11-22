@@ -151,7 +151,11 @@ let recapPending = false;
 let recapDueAt: number | undefined;
 let recapTimer: ReturnType<typeof setTimeout> | undefined;
 const GOAL_CONTINUATION = "The session goal is still open. Take it through to the end in this run.";
-const goalEvent = () => out({ type: "goal_updated", goal, state: goal ? { enabled: goal.status === "active", mode: "active", goal } : undefined });
+// Every goal change is journalled like omp's goal runtime does: a `mode_change` carrying the goal.
+const goalEvent = () => {
+  if (goal?.status === "active" || goal?.status === "paused") append("mode_change", { mode: goal.status === "active" ? "goal" : "goal_paused", data: { goal } });
+  out({ type: "goal_updated", goal, state: goal ? { enabled: goal.status === "active", mode: "active", goal } : undefined });
+};
 function scheduleGoalContinuation(): void {
   if (goalScheduled || goalSuppressed || busy || aborted || asyncJobs > 0 || goal?.status !== "active") return; // omp holds a continuation back while background work runs
   goalScheduled = true;
@@ -606,7 +610,13 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOp
   lastTurnWasContinuation = text.startsWith(GOAL_CONTINUATION);
   if (goal) goal = { ...goal, tokensUsed: goal.tokensUsed + 110 };
   if (aborted && goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
-  if (goal?.status === "complete") { const done = goal; goal = null; out({ type: "goal_updated", goal: done, state: { enabled: false, mode: "exiting", reason: "completed", goal: done } }); }
+  if (goal?.status === "complete") {
+    const done = goal; goal = null;
+    // Like omp's #journalCompletion: the mode ends, then the completion record.
+    append("mode_change", { mode: "none" });
+    append("custom", { customType: "goal-completed", data: { objective: done.objective, tokensUsed: done.tokensUsed, tokenBudget: done.tokenBudget } });
+    out({ type: "goal_updated", goal: done, state: { enabled: false, mode: "exiting", reason: "completed", goal: done } });
+  }
   else if (goal) goalEvent();
   if (goal?.status === "active" && !aborted && !goalSuppressed && asyncJobs === 0) goalScheduled = true; // pending before settlement is reported
   const outcome = { status: aborted ? "aborted" : failure ? "error" : "completed", failure };
@@ -1102,7 +1112,7 @@ async function handle(frame: any): Promise<void> {
           return respond(id, type, { goal, state: { enabled: true, mode: "active", goal } });
         }
         if (op === "pause") { if (goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); } return respond(id, type, { goal, state: null }); }
-        if (op === "drop") { const dropped = goal && { ...goal, status: "dropped" }; goal = null; if (dropped) out({ type: "goal_updated", goal: dropped, state: { enabled: false, mode: "active", goal: dropped } }); return respond(id, type, { goal: null, state: null }); }
+        if (op === "drop") { const dropped = goal && { ...goal, status: "dropped" }; goal = null; if (dropped) { append("mode_change", { mode: "none" }); out({ type: "goal_updated", goal: dropped, state: { enabled: false, mode: "active", goal: dropped } }); } return respond(id, type, { goal: null, state: null }); }
         return fail(id, type, `Unknown goal op: ${op}`);
       }
       case "abort": {

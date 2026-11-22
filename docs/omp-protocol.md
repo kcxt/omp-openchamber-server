@@ -130,7 +130,7 @@ CONTRACT_OMP=real bun test test/contract       # real omp from /hdd/brute/projec
 
 ## 10. Goal mode
 
-OpenChamber's goal record is served by omp's own goal: `goal{op:"create"|"resume"|"pause"|"drop"|"get", objective?, token_budget?}`; `goal_updated{goal,state}` frames mirror status (`complete`, `budgetLimited`, tokens). The child runs with `goal.continuationModes: [rpc]` so omp schedules continuation turns itself; the stretch stays open while one is pending (`isSettled:false`, §4). Continuation turns have no `prompt_result`; a turn with no new tool activity stops the sequence and the stretch settles with the goal still `active`. The agent completes the goal with its `goal` tool (`{op:"complete"}`); afterwards `get_state.goal` is `null`. Pinned by `test/contract/parent-idle.test.ts`.
+omp's goal is driven by the sidecar's `/goal` command: `goal{op:"create"|"resume"|"pause"|"drop"|"get", objective?, token_budget?}`. The child runs with `goal.continuationModes: [rpc]` so omp schedules continuation turns itself; the stretch stays open while one is pending (`isSettled:false`, §4). Continuation turns have no `prompt_result`; a turn with no new tool activity stops the sequence and the stretch settles with the goal still `active`. The agent completes the goal with its `goal` tool (`{op:"complete"}`); afterwards `get_state.goal` is `null`, and the transcript keeps the record: every change is a `mode_change` (`goal` / `goal_paused` with `data.goal`, `none`), a completion `none` then a `custom` `goal-completed` entry (`objective`, `tokensUsed`, `tokenBudget`). `goal_updated` frames are not read. Pinned by `test/contract/parent-idle.test.ts`.
 
 ## 11. The local branch's patches (P1–P6)
 

@@ -1,9 +1,8 @@
 /** Session lifecycle: create, list, get, update, delete, fork, status, view/move/model. */
-import { applyGoalChange, applySessionModel, forkSession, moveSession, removeSession, renameSession, reportSessionProblem, resumeAfterRestart, SessionOpError } from "../sessions/service";
+import { applySessionModel, forkSession, moveSession, removeSession, renameSession, resumeAfterRestart, SessionOpError } from "../sessions/service";
 import { addSessionSyntheticContext } from "../sessions/prompt-input";
 import { assertStatusesKnown, SessionStatusUnknownError, sessionStatusMap } from "../sessions/status";
 import { getPendingBlockingRequestsSnapshot, toOpenCodeFormRequest, toOpenCodePermissionRequest } from "../adapters/openchamber/approvals";
-import { ocGoalOf } from "../adapters/openchamber/goal";
 import { attachOmpSessionContext } from "../adapters/openchamber/omp-context";
 import { buildUsageStats } from "../adapters/openchamber/usage-stats";
 import { page, toV2Session } from "../adapters/openchamber/v2";
@@ -336,7 +335,6 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         } | undefined;
         const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const previousGoal = ocGoalOf(session.metadata);
         // A rename is omp's: `set_session_name` on the session's runtime.
         if (typeof body?.title === "string" && body.title !== session.title) await renameSession(session, body.title);
         const updated = await updateOmpSession(
@@ -345,17 +343,6 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
           dir,
         );
         if (!updated) return jsonError("session not found", 404);
-        // OpenChamber's goal record is served by omp's own goal, not OpenChamber's audit loop.
-        // Awaited: OpenChamber sends the goal's prompt right after this returns, and a failure
-        // must reach it (its goal button re-arms on an error) as well as the chat view.
-        if (body?.metadata && "openchamber" in body.metadata) {
-          try {
-            await applyGoalChange(updated, previousGoal, ocGoalOf(updated.metadata));
-          } catch (err) {
-            reportSessionProblem(updated, err, "could not apply the goal to omp");
-            throw err;
-          }
-        }
         return noContent();
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "update failed", err instanceof SessionOpError ? err.status : 500);

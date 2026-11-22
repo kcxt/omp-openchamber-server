@@ -1,3 +1,5 @@
+// omp's goal mode through the sidecar's `/goal` command. OpenChamber's own "Session goal" is switched off
+// (stack.ts settings); the goal's state is served at /api/omp/goal/:sessionId for the Oh-My-Pi panel.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Page } from "playwright-core";
 import { startStack, type Stack } from "./stack";
@@ -21,129 +23,71 @@ const sessionId = async () => {
   return list.reduce((newest, s) => (s.time.created > newest.time.created ? s : newest)).id;
 };
 const status = async (id: string) => (await stack.http(`/session/status?directory=${dir()}`)).body?.[id]?.type ?? "idle";
+const goalOf = async (id: string) => (await stack.http(`/api/omp/goal/${id}?directory=${dir()}`)).body;
+const goalCommand = (id: string, args: string) => stack.http(`/session/${id}/command?directory=${dir()}`, { json: { command: "goal", arguments: args } });
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const until = async (what: string, probe: () => Promise<boolean> | boolean, ms = 30_000) => {
+  const start = Date.now();
+  while (!(await probe())) {
+    if (Date.now() - start > ms) throw new Error(`timed out waiting for ${what}`);
+    await sleep(100);
+  }
+};
 
-describe("omp's own goal mode", () => {
-  test("the agent completes the goal with its tool; OpenChamber's audit loop never prompts", async () => {
+describe("omp's goal mode via /goal", () => {
+  test("typed in the composer: omp runs the goal to completion, and the endpoint follows it", async () => {
     stack.script([
-      { when: "(#3)", steps: [{ text: "all done" }, { goalComplete: true }] },
-      { when: "session goal", steps: [{ tool: "bash", args: { command: "ls" }, result: "file" }, { text: "working" }] },
+      { when: "(#2)", steps: [{ text: "all done" }, { goalComplete: true }] },
+      { when: "session goal", steps: [{ tool: "bash", args: { command: "ls" }, result: "file" }, { sleep: 1_500 }, { text: "working" }] },
     ]);
     await newSession(page);
     await send(page, "hello");
     await page.getByText("Echo: hello").waitFor();
     const id = await sessionId();
+    // OpenChamber's own goal feature is off: no goal button in the composer.
+    expect(await page.getByRole("button", { name: /goal/i }).count()).toBe(0);
+    expect((await goalOf(id)).goal).toBeNull();
 
-    // Armed the way OpenChamber's UI does it: through OpenChamber's metadata route, which stores the
-    // goal (PATCHing the sidecar) and broadcasts it to the UI.
-    const now = Date.now();
-    const goal = { id: "goal1", objective: "ship it", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
-    const res = await fetch(`${stack.ui}/api/openchamber/sessions/${id}/metadata`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ patch: { openchamber: { goal } }, directory: stack.project }),
-    });
-    expect(res.ok).toBe(true);
+    await send(page, "/goal ship it");
+    await until("omp's goal", () => stack.frames().some((f) => f.type === "goal" && f.op === "create" && f.objective === "ship it"));
+    await until("an active goal", async () => (await goalOf(id)).goal?.status === "active");
+    expect((await goalOf(id)).live).toBe(true);
 
-    // Between omp's goal turns the session must stay busy: an idle gap is what OpenChamber's loop acts on.
-    const samples: string[] = [];
-    const sampler = (async () => {
-      while (samples.length < 400 && !samples.includes("done")) {
-        samples.push(await status(id));
-        await sleep(60);
-      }
-    })();
-    // The UI shows the goal as running before omp finishes it.
-    const row = page.getByRole("group", { name: "Session goal — open details" });
-    await row.getByText(/^(Active|Evaluating…)$/).waitFor({ timeout: 15_000 });
     await page.getByText("all done").first().waitFor({ timeout: 30_000 });
-    expect(stack.frames().some((f) => f.type === "goal" && f.op === "create" && f.objective === "ship it")).toBe(true);
+    await until("the completed goal", async () => (await goalOf(id)).goal?.status === "complete");
+    expect((await goalOf(id)).goal).toMatchObject({ status: "complete", objective: "ship it" });
+    await until("idle", async () => (await status(id)) === "idle");
+    // The command was the only thing sent: omp ran the continuations, nothing prompted from OpenChamber.
+    expect(stack.frames().filter((f) => f.type === "prompt").map((f) => f.message)).toEqual(["hello"]);
 
-    // omp's goal is mirrored into OpenChamber's record, so its loop sees a settled goal.
-    let settled: any;
-    for (let i = 0; i < 40 && settled?.status !== "complete"; i++) {
-      settled = (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
-      await sleep(250);
-    }
-    expect(settled?.status).toBe("complete");
-    expect(settled?.statusReason).toBe("reported by agent");
-    // The UI learns of the settled goal live (OpenCode's `session.metadata.updated`): the row it already
-    // showed as running turns complete without a reload or refetch.
-    await row.getByText("Complete", { exact: true }).waitFor({ timeout: 15_000 });
-    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
-    expect(await status(id)).toBe("idle");
-    samples.push("done");
-    await sampler;
-    const firstBusy = samples.indexOf("busy");
-    expect(firstBusy).toBeGreaterThanOrEqual(0);
-    expect(samples.slice(firstBusy, samples.lastIndexOf("busy")).includes("idle")).toBe(false);
-
-    // Past OpenChamber's 3s idle window: its loop must not have sent a continuation prompt of its own.
-    await sleep(6_000);
-    const prompts = stack.frames().filter((f) => f.type === "prompt");
-    expect(prompts.map((f) => f.message)).toEqual(["hello"]);
+    // After a sidecar restart (no live omp), the transcript still says how the goal ended.
+    await stack.restartSidecar();
+    expect(await goalOf(id)).toMatchObject({ live: false, goal: { status: "complete", objective: "ship it" } });
   });
 
-  test("a goal omp stops continuing is blocked in OpenChamber instead of left active", async () => {
-    stack.script([{ when: "session goal", steps: [{ text: "pondering" }] }]);
+  test("pause, resume and drop; refusals explain themselves", async () => {
+    stack.script([{ when: "session goal", steps: [{ tool: "bash", args: { command: "sleep" }, result: "ok" }, { sleep: 400 }, { text: "step" }] }]);
     await newSession(page);
     await send(page, "start");
     await page.getByText("Echo: start").waitFor();
     const id = await sessionId();
-    const now = Date.now();
-    const goal = { id: "goal2", objective: "think", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
-    await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
-    });
-    let current: any;
-    for (let i = 0; i < 80 && current?.status !== "blocked"; i++) {
-      current = (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
-      await sleep(250);
-    }
-    expect(current?.status).toBe("blocked");
-    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
-    expect(await status(id)).toBe("idle");
-  });
 
-  test("resuming a blocked goal: OpenChamber's progress check is answered without asking a model", async () => {
-    stack.script([{ when: "session goal", steps: [{ text: "pondering" }] }]);
-    await newSession(page);
-    await send(page, "begin");
-    await page.getByText("Echo: begin").waitFor();
-    const id = await sessionId();
-    const record = async () => (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
-    const writeGoal = async (goal: Record<string, unknown>) => {
-      const res = await fetch(`${stack.ui}/api/openchamber/sessions/${id}/metadata`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ patch: { openchamber: { goal } }, directory: stack.project }),
-      });
-      expect(res.ok).toBe(true);
-    };
-    const now = Date.now();
-    await writeGoal({ id: "goal5", objective: "ponder", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now });
-    let current: any;
-    for (let i = 0; i < 80 && current?.status !== "blocked"; i++) {
-      current = await record();
-      await sleep(250);
-    }
-    expect(current?.status).toBe("blocked");
-    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
+    expect((await goalCommand(id, "pause")).status).toBe(409);
+    expect((await goalCommand(id, "")).body).toMatchObject({ error: expect.stringContaining("No goal") });
+    expect((await goalCommand(id, "set keep going")).status).toBe(204);
+    await until("an active goal", async () => (await goalOf(id)).goal?.status === "active");
+    expect((await goalCommand(id, "another one")).body).toMatchObject({ error: expect.stringContaining("already active") });
 
-    // OpenChamber's Resume: its loop ticks 250 ms later, while the session is still idle, and runs its progress check.
-    const resumesBefore = stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length;
-    await writeGoal({ ...current, status: "active", statusReason: "resumed", updatedAt: Date.now() });
-    for (let i = 0; i < 100 && !stack.log("openchamber").match(/\[session-goal(:diagnostic)?\] (progress check|ses_\S+ progress check unavailable)/); i++) await sleep(100);
-
-    // The check got a verdict, and no model was spawned for it.
-    expect(stack.frames().filter((f) => f.type === "print").map((f) => String(f.prompt).slice(0, 60))).toEqual([]);
-    expect(stack.log("openchamber")).toContain("[session-goal:diagnostic] progress check");
-    expect(stack.log("openchamber")).not.toContain("progress check unavailable");
-    // omp carries the resumed goal.
-    for (let i = 0; i < 80 && stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length === resumesBefore; i++) await sleep(100);
-    expect(stack.frames().filter((f) => f.type === "goal" && f.op === "resume").length).toBe(resumesBefore + 1);
+    expect((await goalCommand(id, "pause")).status).toBe(204);
+    expect((await goalOf(id)).goal).toMatchObject({ status: "paused", objective: "keep going" });
+    expect((await goalCommand(id, "resume")).status).toBe(204);
+    expect((await goalOf(id)).goal?.status).toBe("active");
+    expect((await goalCommand(id, "drop")).status).toBe(204);
+    expect((await goalOf(id)).goal).toBeNull();
+    await until("idle", async () => (await status(id)) === "idle");
+    // A fresh read of the transcript agrees: the goal was dropped.
+    await stack.restartSidecar();
+    expect(await goalOf(id)).toMatchObject({ live: false, goal: null });
   });
 
   test("goal with background work: the parent is idle while the job runs, the goal resumes after the wake", async () => {
@@ -156,14 +100,7 @@ describe("omp's own goal mode", () => {
     await send(page, "kickoff");
     await page.getByText("Echo: kickoff").waitFor();
     const id = await sessionId();
-    const now = Date.now();
-    const goal = { id: "goal3", objective: "run the job", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
-    await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
-    });
-    const record = async () => (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
+    expect((await goalCommand(id, "run the job")).status).toBe(204);
 
     // The job is running in the background: the parent run is over, so the parent is idle and the goal still active.
     await page.getByText("job started").first().waitFor({ timeout: 30_000 });
@@ -174,54 +111,20 @@ describe("omp's own goal mode", () => {
       await sleep(100);
     }
     expect(gap).toEqual(Array(8).fill("idle"));
-    expect((await record())?.status).toBe("active");
+    expect((await goalOf(id)).goal?.status).toBe("active");
     expect(await page.getByText("digested the result").first().isVisible()).toBe(false);
 
     // The job's result wakes the parent; it made progress, so omp continues the goal and the agent completes it.
     await page.getByText("goal reached").first().waitFor({ timeout: 30_000 });
-    let settled: any;
-    for (let i = 0; i < 40 && settled?.status !== "complete"; i++) {
-      settled = await record();
-      await sleep(250);
-    }
-    expect(settled?.status).toBe("complete");
-    expect(settled?.statusReason).toBe("reported by agent");
+    await until("the completed goal", async () => (await goalOf(id)).goal?.status === "complete");
     expect(await page.getByText("digested the result").first().isVisible()).toBe(true);
     expect(stack.frames().filter((f) => f.type === "prompt").map((f) => f.message).at(-1)).toBe("kickoff");
   });
 
-  test("a goal armed with its message: the message is answered first, then omp continues the goal", async () => {
-    stack.script([
-      { when: "(#1)", steps: [{ text: "objective met" }, { goalComplete: true }] },
-      { when: "build it", steps: [{ tool: "bash", args: { command: "make" }, result: "built" }, { text: "on it" }] },
-    ]);
-    await newSession(page);
-    await send(page, "warm up");
-    await page.getByText("Echo: warm up").waitFor();
-    const id = await sessionId();
-
-    // OpenChamber's armed send: the goal record is written, then the message carrying the objective follows at once.
-    const now = Date.now();
-    const goal = { id: "goal4", objective: "build it", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
-    const res = await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
-    });
-    expect(res.ok).toBe(true);
-    await send(page, "build it");
-
-    await page.getByText("on it").first().waitFor({ timeout: 30_000 });
-    await page.getByText("objective met").first().waitFor({ timeout: 30_000 });
-    // omp got the message before the goal: the goal joined that run instead of starting one ahead of it.
-    const frames = stack.frames();
-    const promptAt = frames.findIndex((f) => f.type === "prompt" && String(f.message).includes("build it"));
-    const goalAt = frames.findIndex((f) => f.type === "goal" && f.op === "create" && f.objective === "build it");
-    expect(promptAt).toBeGreaterThanOrEqual(0);
-    expect(goalAt).toBeGreaterThan(promptAt);
-    // Past OpenChamber's 5 s "unanswered" check: the message has its reply.
-    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
-    await sleep(6_000);
-    expect(await page.getByText("OpenCode did not start a reply to this message.").count()).toBe(0);
+  test("OpenChamber's goal progress check, should its goal loop run, is answered without a model", async () => {
+    const prompt = "You check the progress of an AI coding agent. Answer three yes/no questions and return exactly one JSON object.\n\n<objective>\nx\n</objective>\n\n<answer>\ny\n</answer>";
+    const res = await stack.http(`/experimental/generate/text?directory=${dir()}`, { json: { prompt, model: { providerID: "stub", id: "fast" } } });
+    expect(JSON.parse(res.body.text)).toEqual({ all_done: false, remaining: false, needs_user: true });
+    expect(stack.frames().filter((f) => f.type === "print")).toEqual([]);
   });
 });

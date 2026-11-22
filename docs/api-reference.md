@@ -518,22 +518,28 @@ its own session (`cancel_subagent`). A session with no live runtime answers
 
 Revert, fork, move and rename on a session another omp owns are refused (`409`).
 
-### Goals
-OpenChamber's goal record lives in the session's metadata
-(`metadata.openchamber.goal`; `PATCH /session/:id`). The sidecar translates the
-record's changes into omp goal operations on the session's runtime: a new or
-resumed active goal creates/resumes omp's goal (the objective text is read from
-OpenChamber's objective file, `GET|PUT|DELETE /goals/objective/:id`), a paused
-goal pauses it, a removed goal drops it. omp runs the continuations itself, and
-the session stays busy through them, so OpenChamber's idle-driven goal loop never
-finds an idle session with an active goal to audit or re-prompt.
+### Goals (`/goal`)
+omp's goal mode, run by the sidecar like `/aside` (typed, or sent as the `goal`
+command): `/goal <objective>` (or `/goal set <objective>`) creates omp's goal on
+the session's runtime, started when none is live; `/goal pause`, `/goal resume`
+(also re-arms an active goal omp stopped continuing) and `/goal drop` change it.
+Refusals are `409` (no goal, one already set) or `400` (usage, `/goal budget`:
+omp's RPC cannot change a budget) with the reason in `error`; a bare `/goal`
+answers with the goal's state that way. omp runs the continuations itself and
+the session stays busy through them; the agent completes the goal with its
+`goal` tool.
 
-omp's goal changes are mirrored back into the record: `complete` (the agent
-called the `goal` tool), `budgetLimited` (token budget reached), and
-`tokensUsed` while active. If a stretch settles with the goal still `active`
-(omp stopped continuing after a turn with no tool progress) the record becomes
-`blocked` with a reason, and a message or Resume continues it. The sidecar does
-not write `~/.omp/goals`.
+`GET /api/omp/goal/:sessionId?directory=` →
+`{ sessionId, live, goal: null | { status: "active"|"paused"|"complete"|"budget-limited"|"dropped", objective, tokensUsed, tokenBudget? } }`:
+the live omp's goal when one drives the session (`live: true`), else the last
+goal the transcript journalled (`mode_change` `goal`/`goal_paused`, `none`, and
+the `goal-completed` record). The Oh-My-Pi extension reads it.
+
+OpenChamber's own "Session goal" (`metadata.openchamber.goal` and its
+idle-driven small-model loop) is not served: switch it off in OpenChamber
+(Settings → Chat → Session goal). Should its loop run anyway, its progress check
+on `/experimental/generate/text` is answered without a model (`needs_user`, so it
+parks its goal as blocked).
 
 ### Side questions (`/aside`)
 A prompt `/aside <question>` (typed, or sent as the `aside` command) runs omp's

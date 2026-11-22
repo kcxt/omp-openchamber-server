@@ -16,6 +16,7 @@ import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
 import { readTranscriptSummary } from "../omp/transcript-reader";
 import { extractTodosFromOmpDetails } from "../omp/todo";
+import { parseGoal } from "../omp/goal";
 import type { BackendCredentials, BackendGoalOp, BackendGoalSnapshot, ImageContent, ModelRef } from "../shared/types";
 import { logger, promptLogger } from "../shared/logger";
 import {
@@ -154,18 +155,6 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function parseGoal(value: unknown): BackendGoalSnapshot | null {
-  const goal = record(value);
-  const status = goal?.status;
-  if (status !== "active" && status !== "paused" && status !== "complete" && status !== "budget-limited" && status !== "dropped") return null;
-  return {
-    status,
-    objective: typeof goal!.objective === "string" ? goal!.objective : "",
-    tokensUsed: typeof goal!.tokensUsed === "number" ? goal!.tokensUsed : 0,
-    ...(typeof goal!.tokenBudget === "number" ? { tokenBudget: goal!.tokenBudget } : {}),
-  };
-}
-
 function texts(value: unknown): string[] {
   return Array.isArray(value) ? value.flatMap((item) => typeof record(item)?.text === "string" ? [record(item)!.text as string] : []) : [];
 }
@@ -204,7 +193,6 @@ export class SessionRuntime {
   #publishedTitle?: string;
   #unsubscribe: () => void;
   #stateListeners = new Set<(change: StateChange) => void>();
-  #goalListeners = new Set<(goal: BackendGoalSnapshot | null, stalled: boolean) => void>();
   #recapListeners = new Set<(recap: string, createdAt: number, forMessageID: string | undefined) => void>();
   #subagents = new Map<string, SubagentEntry>();
 
@@ -271,12 +259,6 @@ export class SessionRuntime {
   onStateChange(fn: (change: StateChange) => void): () => void {
     this.#stateListeners.add(fn);
     return () => this.#stateListeners.delete(fn);
-  }
-
-  /** omp's goal changed (`goal_updated`), or a stretch settled with the goal still active (`stalled`). */
-  onGoalUpdate(fn: (goal: BackendGoalSnapshot | null, stalled: boolean) => void): () => void {
-    this.#goalListeners.add(fn);
-    return () => this.#goalListeners.delete(fn);
   }
 
   /** omp produced an idle recap (P4 `recap` frame). */
@@ -689,11 +671,6 @@ export class SessionRuntime {
       case "subagent_event":
         this.#onSubagentFrame(frame);
         return;
-      case "goal_updated": {
-        const goal = parseGoal(frame.goal);
-        for (const listener of this.#goalListeners) listener(goal, false);
-        return;
-      }
       case "btw_record":
         this.#aside.onRecord(frame.record as BtwTopic);
         return;
@@ -744,7 +721,6 @@ export class SessionRuntime {
           this.#due = false;
           this.#dueGeneration++;
           for (const entry of this.#subagents.values()) if (entry.status === "running") this.#endChild(entry, "completed");
-          void this.#checkStalledGoal();
         }
         break;
     }
@@ -766,13 +742,6 @@ export class SessionRuntime {
       if (this.#awaitingRun && state.isStreaming !== true && state.isSettled === true) this.#awaitingRun = false;
     }
     this.#recompute();
-  }
-
-  async #checkStalledGoal(): Promise<void> {
-    const state = await this.#getState();
-    const goal = parseGoal(record(state?.goal)?.goal);
-    if (state?.isSettled !== true || goal?.status !== "active") return;
-    for (const listener of this.#goalListeners) listener(goal, true);
   }
 
   #recompute(): void {

@@ -1,19 +1,10 @@
-/** Goal objective files and todo lists. */
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import { goalObjectivePath } from "../adapters/openchamber/goal";
+/** Todo lists and omp's goal. */
 import { readSessionTodos } from "../omp/todo";
+import { readTranscriptGoal } from "../omp/goal";
+import { Registry } from "../sessions/registry";
 import { nextSessionTodosRevision } from "../shared/sse";
 import type { RouteContext } from "../http/router";
-import { readJson } from "../http/response";
 import { resolveSessionRoute } from "../services/session-route";
-
-// OpenChamber's own objective-file semantics (server/lib/session-goal/objectives.js):
-// one `<session id>.md` under its data dir, trimmed and clamped, invalid ids rejected.
-const OBJECTIVE_CHAR_LIMIT = 5_000;
-const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{4,128}$/;
-
-const clamp = (content: unknown): string => String(content ?? "").trim().slice(0, OBJECTIVE_CHAR_LIMIT);
 
 export async function handleGoals(ctx: RouteContext): Promise<Response | undefined> {
   const { req, p, dir, json, jsonError } = ctx;
@@ -37,43 +28,21 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
     }
   }
 
-  // Goal objective endpoints
-  const goalObjMatch = p.match(/^\/(?:api\/)?goals\/objective\/([^/]+)$/);
-  if (goalObjMatch) {
-    const sessionId = decodeURIComponent(goalObjMatch[1]!);
-    const valid = SESSION_ID_PATTERN.test(sessionId);
-    const file = valid ? goalObjectivePath(sessionId) : "";
-
-    if (req.method === "PUT") {
-      if (!valid) return jsonError("invalid session id", 400);
-      const body = (await readJson(req).catch(() => undefined)) as { content?: unknown } | undefined;
-      const text = clamp(body?.content);
-      if (!text) return jsonError("objective content is required", 400);
-      try {
-        await mkdir(dirname(file), { recursive: true });
-        await writeFile(file, text, "utf8");
-        return json({ ok: true });
-      } catch (err) {
-        return jsonError(err instanceof Error ? err.message : "failed to write objective", 500);
-      }
-    }
-
-    if (req.method === "GET") {
-      if (!valid) return jsonError("objective not found", 404);
-      try {
-        return json({ content: clamp(await readFile(file, "utf8")) });
-      } catch {
-        return jsonError("objective not found", 404);
-      }
-    }
-
-    if (req.method === "DELETE") {
-      if (valid) await unlink(file).catch(() => undefined);
-      return json({ ok: true });
+  // omp's goal for the Oh-My-Pi extension: the live child's state, else what the transcript last journalled.
+  const ompGoalMatch = p.match(/^\/omp\/goal\/([^/]+)$/);
+  if (ompGoalMatch && req.method === "GET") {
+    try {
+      const sessionId = decodeURIComponent(ompGoalMatch[1]!);
+      const { session } = await resolveSessionRoute(sessionId, dir);
+      if (!session) return jsonError("session not found", 404);
+      const runtime = Registry.get(session.id, session.directory);
+      // A completed goal leaves omp's state; its record stays in the transcript.
+      const goal = (runtime && await runtime.getGoal()) ?? await readTranscriptGoal(runtime?.transcriptPath ?? session.path);
+      return json({ sessionId: session.id, live: runtime !== undefined, goal });
+    } catch (err) {
+      return jsonError(err instanceof Error ? err.message : "goal lookup failed", 500);
     }
   }
-
-  // Session todos
   const todoMatch = p.match(/^\/session\/([^/]+)\/todo$/);
   if (todoMatch && req.method === "GET") {
     try {

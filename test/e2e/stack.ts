@@ -84,6 +84,8 @@ export async function startStack(options: { env?: Record<string, string>; binary
     activeProjectId: "proj",
     // Keep the first-run chrome (what's-new, tips, update prompts) out of the way.
     lastSeenVersion: "999.0.0",
+    // OpenChamber's own goal loop is not served; omp's goal is, through `/goal` (as the live install is set up).
+    sessionGoalEnabled: false,
   }));
 
   const sidecarPort = await freePort();
