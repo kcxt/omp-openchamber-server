@@ -4,7 +4,7 @@
  * message whose text streams and is finalised by the terminal record. A side
  * question is an ephemeral turn: it opens no run, so nothing here touches the
  * session's busy/idle status. Ids derive from omp's topic id
- * (`providers/omp/btw-history.ts`), so a later transcript read lands on the
+ * (`omp/btw-history.ts`), so a later transcript read lands on the
  * same messages.
  */
 import {
@@ -15,7 +15,7 @@ import {
   type AsideIds,
   type BtwTopic,
   type BtwTurn,
-} from "../providers/omp/btw-history";
+} from "../omp/btw-history";
 import { emitMessagePartDelta, emitMessagePartUpdated, emitMessageUpdated, emitOpenCodeV2Event } from "../shared/sse";
 
 const ZERO_TOKENS = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };

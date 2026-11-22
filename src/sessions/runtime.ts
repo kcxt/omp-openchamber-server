@@ -13,9 +13,9 @@
 import { RpcChild } from "../omp/rpc-child";
 import { readOmpConfigSmallModel } from "../adapters/openchamber/small-model";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
-import { readSessionIdSync, toOpenCodeSessionId } from "../providers/omp/store";
-import { extractTodosFromOmpDetails } from "../providers/omp/todo";
-import type { BackendCredentials, BackendGoalOp, BackendGoalSnapshot, ImageContent, ModelRef } from "../providers/types";
+import { readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
+import { extractTodosFromOmpDetails } from "../omp/todo";
+import type { BackendCredentials, BackendGoalOp, BackendGoalSnapshot, ImageContent, ModelRef } from "../shared/types";
 import { logger, promptLogger } from "../shared/logger";
 import {
   emitSessionCreated,
@@ -26,7 +26,7 @@ import {
 } from "../shared/sse";
 import { TurnTranslator, type OmpFrame } from "./turn-translator";
 import { AsideStream } from "./aside";
-import type { BtwTopic } from "../providers/omp/btw-history";
+import type { BtwTopic } from "../omp/btw-history";
 
 export type RuntimeState = "starting" | "idle" | "active" | "aborting" | "closed";
 export type CloseReason = "idle" | "deleted" | "shutdown" | "crash" | "abort" | "replaced";

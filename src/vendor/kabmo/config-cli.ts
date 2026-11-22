@@ -21,7 +21,7 @@
  *
  *   Run 'omp config list' to see available keys
  */
-import { resolveOmpBinary } from "../../providers/omp/binary";
+import { resolveOmpBinary } from "../../omp/binary";
 
 export interface ConfigEntry {
   value?: unknown;

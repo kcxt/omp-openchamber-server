@@ -2,7 +2,7 @@
  * Tool-call state assembly from raw omp frames (`toolcall_*` assistant events,
  * `tool_execution_*`). Pure helpers used by the TurnTranslator.
  */
-import type { ToolPartState } from "../providers/types";
+import type { ToolPartState } from "../shared/types";
 import { editToolMetadata } from "../shared/edit-diff";
 import { normalizeToolInput, normalizeToolOutput } from "../shared/tool-normalize";
 

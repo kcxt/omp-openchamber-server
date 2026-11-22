@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { backendForSession } from "../../providers/registry";
+import { getOmpSessionByOpenCodeId } from "../../store/sessions";
 import { promptSession } from "../../sessions/service";
 import { sessionOwnedElsewhere, sessionStatusMap } from "../../sessions/status";
 import { emitOpenCodeEvent, subscribeOpenCodeEvents } from "../../shared/sse";
@@ -381,7 +381,7 @@ export function createMessageQueueRuntime(): MessageQueueRuntime {
       return;
     }
 
-    const session = await backendForSession(sessionId).store.get(sessionId, entry.directory);
+    const session = await getOmpSessionByOpenCodeId(sessionId, entry.directory);
     if (!session) return;
 
     const item = entry.items[0];

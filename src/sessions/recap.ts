@@ -17,10 +17,10 @@ import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { loadSessionMessages } from "./messages";
-import { ompAgentDir } from "./paths";
-import { Registry } from "../../sessions/registry";
-import type { OpenCodeSession } from "../types";
+import { loadSessionMessages } from "../omp/messages";
+import { ompAgentDir } from "../omp/paths";
+import { Registry } from "./registry";
+import type { OpenCodeSession } from "../shared/types";
 
 const RECAP_TTL_MS = 30_000;
 /** OpenChamber's own assist caps a recap at this many characters. */
@@ -232,13 +232,4 @@ export async function withOmpRecapAssist(
       },
     },
   };
-}
-
-/** Test seam: drop the cached recaps and the database handle. */
-export function resetOmpRecapCache(): void {
-  cache.clear();
-  openchamberGate = undefined;
-  db?.close();
-  db = undefined;
-  dbUnavailable = false;
 }

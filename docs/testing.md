@@ -1,6 +1,6 @@
 # Testing and coverage
 
-Two layers. `bun run test` (`bun test --timeout 90000 test/e2e`) drives the real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp`, with a throwaway `$HOME`, `PI_CODING_AGENT_DIR` and `TMPDIR`. `bun test test/contract` runs omp commands directly against the stub and, with `CONTRACT_OMP=real`, against the pinned real omp build, so stub drift is caught (below). No network, no credentials in either layer; the old unit suites, the mock omp and the Jarvis adapter are gone.
+Two layers. `bun run test` (`bun test --timeout 90000 test/e2e`) drives the real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp`, with a throwaway `$HOME`, `PI_CODING_AGENT_DIR` and `TMPDIR`. `bun test test/contract` runs omp commands directly against the stub and, with `CONTRACT_OMP=real`, against the patched real omp (the `local` branch), so stub drift is caught (below). `bun run check` (`tsc --noEmit`) is clean and is part of verification. No network, no credentials in either layer; the old unit suites, the mock omp, the Jarvis adapter and the fake backend are gone.
 
 The stub is kept honest by the contract suite: every behaviour it models (stretch frames, queues, abort, lease, tree, fork, compaction, subagents, journaling) is asserted identically against the real omp. What it still does not model is listed at the bottom of `docs/research/R7.md`. Script format (`when`, text/thinking/tool/sleep/hang/fail/crash steps, `tool:"bash"` with `args.async`, `tool:"task"` with `subagent:{steps}`) is documented at the top of the stub and in `test/e2e/stack.ts`.
 
@@ -16,6 +16,13 @@ The stub is kept honest by the contract suite: every behaviour it models (stretc
 | `follow` | A session a terminal omp owns is followed read-only: its appended messages arrive as events bracketed by busy/idle; nothing is written or forked. |
 | `panels` | Git (branch, change), Changes, Files, Terminal (runs a command in the project), Project knowledge notes (survive reload), Context/Walkthrough/Browser open; Stats, Issues and PRs, Scheduled tasks, Archive, Integrations catalog, Settings open; the sidecar served every request those made. |
 | `failures` | Model API error (shown, idle, next turn works, survives reload); omp child dying mid-turn (error shown, idle, fresh child); sidecar SIGTERM and SIGKILL (history kept, open tab keeps working, reload consistent); sidecar killed mid-turn (ends idle). |
+| `continuity` | History survives a respawned omp child after a model switch and the view/metadata markers a turn leaves behind. |
+| `runtime` | One busy period per omp run (a steer and a follow-up sent during a run join it: one busy, one idle); Esc with queued input (withdrawn text returned unsent, idle); Esc with a background subagent running (parent idle, child session busy); `.` continues through omp's `resume`; each reasoning delta streams on its own. |
+| `session-ops` | Revert is durable in the transcript and redo survives the child going away; a prompt after a revert continues from the reverted branch; rename goes through `set_session_name`; `/move` keeps the session and refusals move nothing. |
+| `goal` | omp's own goal mode: the agent completes the goal with its tool and OpenChamber's audit loop never prompts; a goal omp stops continuing is blocked; goal with background work (parent idle while the job runs, goal resumes after the wake). |
+| `aside` | `/aside` during a busy turn streams an answer, leaves the status alone, survives a reload and stays out of the main context; typed on an idle session; listed among the commands; an empty question is refused. |
+| `context` | Commands that start no turn answer (declined compaction explained, builtin output as the reply); `GET /api/omp/context/:id` reports the provider-recorded prompt size, `?breakdown=1` adds categories; the session record and messages publish what the extension panel reads. |
+| `inspect-prefetch` | The first read of an undriven session prefetches omp's inspection, so the context breakdown answers from the memo. |
 
 ## Contract suite (`test/contract/`)
 
@@ -39,29 +46,32 @@ CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/p
 
 Stub knobs beyond the script: `OMP_STUB_RECAP_MS` (deterministic idle recap after N ms; off by default), `OMP_STUB_NO_MODELS` (start with no model, for fallback paths), `OMP_STUB_START_DELAY_MS` (slow boot), `OMP_STUB_PROVIDER`. The stub also answers the one-shot CLI: `omp session inspect --json <path>`, `omp session lease --json -- <ids>`, `omp models --json`.
 
-Last run: stub 93/93, real 93/93.
+Last run: e2e 76/76 (17 files), contract on the stub 97/97 (14 files).
 
 ## API coverage at a glance
 
 | Surface | Level |
 |---|---|
-| Session list / get / create / delete / archive | e2e (delete and rename not asserted) |
+| Session list / get / create / delete / archive | e2e (delete not asserted) |
 | Message list + paging, export | e2e |
-| Prompt (`prompt`, `prompt_async`, `message`), model pick | e2e (text, tools, model); steer/queue, images, files, goals not covered |
-| Abort | e2e; `interrupt` route not covered |
-| Revert stage / Redo / implicit commit before prompt | e2e; explicit `/revert/commit` not covered |
-| Fork (`/session/:id/fork`) | e2e (from here) |
+| Prompt (`prompt`, `prompt_async`, `message`), model pick | e2e (text, tools, model; steer/follow-up in one run; `.` resume); images, files not covered |
+| Abort, `interrupt`, withdrawn queue | e2e (`runtime`) |
+| Revert stage / Redo / implicit commit before prompt | e2e (`session-ops`, `edit`); explicit `/revert/commit` not covered |
+| Fork (`/session/:id/fork`), move, rename | e2e |
 | Refusing to prompt a session another omp owns | e2e |
 | SSE event stream translated to UI state | e2e implicitly (text, reasoning, tool, todo, status, usage, reconnect after restart); websocket events not covered |
+| Status (`/session/status`, `/session/active`), lease-first followed sessions | e2e (`follow`, `runtime`, `goal`); the `503` unknown case not covered |
 | Todos, Stats (`/experimental/session/stats`) | e2e |
 | Providers / models | e2e (catalog, pick); credentials / `credentialRef` not covered |
 | Git, files, terminal websocket, project notes | e2e through the panels |
 | Provider errors, child crash, sidecar restart | e2e |
-| Subagents / children and their lifecycle events | contract suite (frames, wake, cancel) on stub and real; not covered end to end through the UI |
+| Subagents / children and their lifecycle events | e2e (parent idle while the child runs); frames, wake, cancel, steer in the contract suite |
 | Permissions and questions (approvals bridge, `question` extension) | not covered |
-| Compaction, shell (`/session/:id/shell`), slash commands | compaction frames and refusal in the contract suite; shell, slash commands not covered end to end |
-| Message queue / inbox, steering mid-turn | contract suite (queue, steer, follow-up, abort and restore) on stub and real; not covered through the UI |
-| Goals, plans, session knowledge | not covered |
+| Compaction, shell (`/session/:id/shell`), slash commands | compaction refusal in e2e (`context`) and frames in the contract suite; builtin command output in e2e; shell not covered |
+| Message queue / inbox, steering mid-turn | e2e (`runtime`) and contract suite (queue, steer, follow-up, abort and restore) |
+| Goals | e2e (`goal`); plans, session knowledge not covered |
+| `/aside` side questions | e2e (`aside`), contract suite (`btw`) |
+| Context map (`/api/omp/context`, session metadata) | e2e (`context`, `inspect-prefetch`) |
 | Settings routes, omp settings panel | Settings dialog opens; routes not asserted |
 | Image attachments / blobs | not covered |
 | Auth / passkey / UI password | stub, not covered |
@@ -70,10 +80,9 @@ Last run: stub 93/93, real 93/93.
 ## Where more attention is likely to pay off
 
 1. **Stub fidelity.** Now diffed against the real omp by `test/contract` (`docs/research/R7.md` lists what differed and was fixed). Remaining differences: goal continuations, auto-compaction, retries, approval round trips and image prompts are modelled from source or not at all; `session_exit` records written when a child is SIGTERMed are not asserted.
-2. **Ownership probe cost.** Every first prompt of a session without a live child spawns a probe omp (`get_session_lease`). A terminal omp that has the session open but has not written yet holds no lease and cannot be detected.
-3. **Concurrent prompts, approvals** during a turn: steering/queued prompts are in the contract suite, not in the UI suite; approvals have no coverage.
-4. **Compaction, shell, slash commands, images, goals.**
-5. **The `alias` path** (omp moves the session after the sidecar's check): implemented, no longer exercised since ownership is refused up front.
-6. **OpenChamber-owned failures** seen in panels and deliberately ignored: `/api/source-control/binding` (422, no GitHub binding) and `/api/git/worktrees/archives` (500) come from OpenChamber's own web server, not the sidecar.
-7. Deleting and renaming sessions from the UI, large or compacted histories.
-8. Known TypeScript errors in `bun run check` (about 16, unrelated to the tests) are untouched.
+2. **Ownership probe cost.** Status of an undriven session runs `omp session lease` (batched, ~0.2 s) and the first transcript read starts an `inspect` prefetch (~2 s). A terminal omp that has the session open but has not written yet holds no lease and cannot be detected; the driven path is safe because the child claims the lease on open (P3).
+3. **Approvals** during a turn, images, files and `credentialRef` have no coverage.
+4. **Importer** (`src/store/importer.ts`): `bun test test/importer.test.ts` covers a transcript with interleaved legacy lines plus a `.jsonl.oc`, a clean transcript, an orphan `.jsonl.oc`, dry run and a second run. Not covered: title-DB message ids (`history.db`), a transcript changing during the rewrite.
+5. **OpenChamber-owned failures** seen in panels and deliberately ignored: `/api/source-control/binding` (422, no GitHub binding) and `/api/git/worktrees/archives` (500) come from OpenChamber's own web server, not the sidecar.
+6. Deleting sessions from the UI, large or compacted histories.
+7. Websocket event delivery and the `503` unknown-status path.

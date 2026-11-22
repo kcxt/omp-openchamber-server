@@ -1,4 +1,4 @@
-import type { OpenCodeTodo } from "../types";
+import type { OpenCodeTodo } from "../shared/types";
 
 export function isTodoTool(toolName: string | undefined): boolean {
   if (!toolName) return false;

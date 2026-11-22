@@ -9,9 +9,9 @@
 import { basename, dirname } from "node:path";
 import { followedStatuses, unknownFollowed } from "../adapters/openchamber/follow";
 import { OmpCli } from "../omp/cli";
-import { readSessionIdSync } from "../providers/omp/store";
-import { backendForSession } from "../providers/registry";
-import type { OpenCodeMessageRecord } from "../providers/types";
+import { readSessionIdSync } from "../store/sessions";
+import { loadSessionMessages } from "../omp/messages";
+import type { OpenCodeMessageRecord } from "../shared/types";
 import { isSubagentTranscript, Registry } from "./registry";
 import type { BackgroundJob, RuntimeState } from "./runtime";
 
@@ -80,7 +80,7 @@ export async function statusOf(sessionId: string, cwd: string, transcriptPath: s
   const held = await leaseHeld(transcriptPath);
   if (held === undefined) return "unknown";
   if (!held) return "idle";
-  const records = await backendForSession(sessionId).store.transcript(sessionId, cwd).catch(() => null);
+  const records = await loadSessionMessages(sessionId, cwd).catch(() => null);
   return records ? (isMidTurn(records) ? "busy" : "idle") : "unknown";
 }
 

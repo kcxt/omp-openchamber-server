@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { BrowserControlRequest } from "./contracts";
 import { toV2Session } from "../adapters/openchamber/v2";
-import { backendForSession, isMultiBackend } from "../providers/registry";
 
 export interface OpenCodeEvent {
   type: string;
@@ -36,7 +35,6 @@ const durableEventVersions: Record<string, number> = {
   "session.created": 1,
   "session.agent.selected": 1,
   "session.model.selected": 1,
-  "session.moved": 1,
   "session.revert.staged": 1,
   "session.revert.cleared": 1,
   "session.revert.committed": 1,
@@ -75,9 +73,6 @@ const durableEventVersions: Record<string, number> = {
   "session.compaction.started": 1,
   "session.compaction.ended": 1,
   "session.compaction.failed": 1,
-  "session.revert.staged": 1,
-  "session.revert.cleared": 1,
-  "session.revert.committed": 1,
   "session.usage.recorded": 1,
   "session.message.content.updated": 1,
 };
@@ -218,9 +213,8 @@ function messageOrdinal(partID: unknown): number {
   return match ? Number(match[1]) : 0;
 }
 
-function v2ProviderID(sessionID: string | undefined, providerID: unknown): string {
-  const native = typeof providerID === "string" ? providerID : "omp";
-  return sessionID && isMultiBackend() ? `${backendForSession(sessionID).id}/${native}` : native;
+function v2ProviderID(providerID: unknown): string {
+  return typeof providerID === "string" ? providerID : "omp";
 }
 
 function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown> {
@@ -265,7 +259,7 @@ function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown
           sessionID: info.id ?? sessionID,
           model: {
             id: model.modelID ?? model.id,
-            providerID: v2ProviderID(sessionID, model.providerID),
+            providerID: v2ProviderID(model.providerID),
             variant: model.variant,
           },
         });
@@ -341,7 +335,7 @@ function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown
           started: asRecord(info.time).created ?? Date.now(),
           model: {
             id: model.modelID ?? model.id ?? "omp",
-            providerID: v2ProviderID(sessionID, model.providerID),
+            providerID: v2ProviderID(model.providerID),
             variant: model.variant ?? "default",
           },
         });
@@ -526,10 +520,6 @@ export function emitBrowserControlRequest(request: BrowserControlRequest): numbe
   }
 
   return delivered;
-}
-
-export function getActiveSseClientCount(): number {
-  return activeClients.size;
 }
 
 export function createOpenCodeEventStream(

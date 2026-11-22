@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { getExplicitOmpBinary } from "../../providers/omp/binary";
+import { getExplicitOmpBinary } from "../../omp/binary";
 import { homedir } from "node:os";
 import { join } from "node:path";
 

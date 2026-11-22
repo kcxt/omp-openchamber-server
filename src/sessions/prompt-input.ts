@@ -5,7 +5,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
-import type { BackendCredentialInput, ImageContent, ModelRef, OpenCodePromptTextPart } from "../providers/types";
+import type { BackendCredentialInput, ImageContent, ModelRef, OpenCodePromptTextPart } from "../shared/types";
 import { isBlobRef, readBlobBufferSync } from "../shared/blobs";
 import { promptLogger } from "../shared/logger";
 import { randomIdSuffix, timeSortableHex } from "../shared/message-id";

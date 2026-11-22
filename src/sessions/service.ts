@@ -6,12 +6,13 @@
 import { goalChangeFor, ocGoalOf, type GoalChange } from "../adapters/openchamber/goal";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { SessionDocs } from "../store/session-docs";
-import { CredentialInputError } from "../providers/omp/credentials";
-import { asideMessageIds } from "../providers/omp/btw-history";
-import { locateMessage } from "../providers/omp/messages";
-import { readSessionIdSync, toOpenCodeSessionId } from "../providers/omp/store";
-import { allBackends, backendById, backendForSession, nativeProviderID, splitProviderPrefix } from "../providers/registry";
-import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../providers/types";
+import { CredentialInputError } from "../omp/credentials";
+import { asideMessageIds } from "../omp/btw-history";
+import { locateMessage } from "../omp/messages";
+import { getOmpSessionByOpenCodeId, readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
+import { OmpCli } from "../omp/cli";
+import { RpcChild } from "../omp/rpc-child";
+import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../shared/types";
 import { emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import {
@@ -94,17 +95,12 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
   if ("error" in prepared) return { queued: false, error: prepared.error, status: 400 };
   if (isSubagentTranscript(session.path)) return promptSubagent(session, prepared.message, prepared.messageID);
 
-  // D1: a namespaced model prefix must match the backend that owns this session.
-  const requestedPrefix = splitProviderPrefix(body.model?.providerID ?? "").backendId;
-  if (requestedPrefix && backendById(requestedPrefix) !== backendForSession(session.id)) {
-    return { queued: false, status: 400, error: "model provider does not belong to this session's backend" };
-  }
   // OpenCode's v2 prompt body carries no model: the pick lives on the session
   // record (set at create, or by POST /session/:id/model).
   const pick: ModelPick | undefined = body.model?.providerID && body.model?.modelID
-    ? { providerID: nativeProviderID(body.model.providerID), modelID: body.model.modelID, variant: body.variant ?? "default" }
+    ? { providerID: body.model.providerID, modelID: body.model.modelID, variant: body.variant ?? "default" }
     : hasRealModel(session.model)
-      ? { providerID: nativeProviderID(session.model.providerID), modelID: session.model.modelID, variant: session.model.variant ?? "default" }
+      ? { providerID: session.model.providerID, modelID: session.model.modelID, variant: session.model.variant ?? "default" }
       : undefined;
   if (body.credentials !== undefined && body.credentialRef !== undefined) {
     return { queued: false, error: "provide exactly one of credentials or credentialRef", status: 400 };
@@ -211,7 +207,7 @@ export async function compactSession(session: OpenCodeSession): Promise<void> {
 export async function applySessionModel(session: OpenCodeSession, model: ModelRef): Promise<{ applied: boolean; error?: string }> {
   try {
     const runtime = await Registry.ensure(session);
-    await runtime.setModel({ providerID: nativeProviderID(model.providerID), modelID: model.modelID, variant: model.variant });
+    await runtime.setModel({ providerID: model.providerID, modelID: model.modelID, variant: model.variant });
     return { applied: true };
   } catch (err) {
     return { applied: false, error: err instanceof Error ? err.message : String(err) };
@@ -364,7 +360,7 @@ export async function forkSession(session: OpenCodeSession, before?: string): Pr
     if (parentDoc.legacyMessageIds) draft.legacyMessageIds = { ...parentDoc.legacyMessageIds };
     if (parentDoc.visibleParts) draft.visibleParts = { ...parentDoc.visibleParts };
   });
-  const created = await backendForSession(session.id).store.get(toOpenCodeSessionId(forked.sessionId), session.directory);
+  const created = await getOmpSessionByOpenCodeId(toOpenCodeSessionId(forked.sessionId), session.directory);
   if (!created) throw new SessionOpError("the forked session was not found", 500);
   return created;
 }
@@ -377,7 +373,7 @@ export async function moveSession(session: OpenCodeSession, directory: string): 
   } catch (err) {
     asConflict(err);
   }
-  const moved = await backendForSession(session.id).store.get(session.id);
+  const moved = await getOmpSessionByOpenCodeId(session.id);
   if (!moved) throw new SessionOpError("the moved session was not found", 500);
   return moved;
 }
@@ -388,7 +384,7 @@ export async function renameSession(session: OpenCodeSession, title: string): Pr
   if (!clean) throw new SessionOpError("title required", 400);
   const runtime = await runtimeFor(session);
   await runtime.setName(clean);
-  const updated = (await backendForSession(session.id).store.get(session.id, session.directory)) ?? { ...session, title: clean };
+  const updated = (await getOmpSessionByOpenCodeId(session.id, session.directory)) ?? { ...session, title: clean };
   emitSessionUpdated(updated as unknown as Record<string, unknown>, updated.directory);
   emitOpenCodeV2Event("session.renamed", { sessionID: session.id, title: clean }, updated.directory);
   return updated;
@@ -401,14 +397,9 @@ export function removeSession(sessionId: string, cwd: string): void {
   clearSessionApprovals(sessionId);
 }
 
-/** Process shutdown: every runtime and backend child. */
+/** Process shutdown: every runtime and omp child. */
 export function shutdownSessions(): void {
   Registry.shutdown();
-  for (const backend of allBackends()) {
-    try {
-      backend.shutdownAll();
-    } catch {
-      /* ignore */
-    }
-  }
+  OmpCli.shutdown();
+  RpcChild.killAll();
 }

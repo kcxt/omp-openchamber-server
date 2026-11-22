@@ -1,10 +1,5 @@
-import type { OpenCodeMessageRecord, OpenCodeSession, OpenCodePart } from "../../providers/types";
-import { openCodeToolName } from "../../providers/omp/todo";
-import { backendForSession, isMultiBackend } from "../../providers/registry";
-
-export interface V2Location {
-  directory: string;
-}
+import type { OpenCodeMessageRecord, OpenCodeSession, OpenCodePart, OpenCodeTextPart } from "../../shared/types";
+import { openCodeToolName } from "../../omp/todo";
 
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -44,7 +39,6 @@ export function toV2FileAttachment(file: {
 
 export function toV2Session(session: OpenCodeSession) {
   const providerID = session.model.providerID;
-  const v2ProviderID = isMultiBackend() ? `${backendForSession(session.id).id}/${providerID}` : providerID;
   return withoutUndefined({
     id: session.id,
     parentID: session.parentID,
@@ -52,7 +46,7 @@ export function toV2Session(session: OpenCodeSession) {
     agent: session.agent,
     model: session.model ? {
       id: session.model.modelID || session.model.id,
-      providerID: v2ProviderID,
+      providerID,
       variant: session.model.variant,
     } : undefined,
     cost: session.cost,
@@ -178,7 +172,7 @@ export function toV2Message(message: OpenCodeMessageRecord) {
   };
 
   if (info.role === "user") {
-    const text = parts.filter((part): part is Extract<OpenCodePart, { type: "text" }> => part.type === "text")
+    const text = parts.filter((part): part is OpenCodeTextPart => part.type === "text")
       .map((part) => part.text).join("\n");
     const files = parts.filter((part): part is Extract<OpenCodePart, { type: "file" }> => part.type === "file")
       .map(fileAttachment);
@@ -186,17 +180,15 @@ export function toV2Message(message: OpenCodeMessageRecord) {
   }
 
   if (info.role === "synthetic") {
-    const text = parts.filter((part): part is Extract<OpenCodePart, { type: "text" }> => part.type === "text")
+    const text = parts.filter((part): part is OpenCodeTextPart => part.type === "text")
       .map((part) => part.text).join("\n");
     return withoutUndefined({ type: "synthetic", ...base, text, description: info.summary ? "Context" : undefined });
   }
 
   const model = record(info.model);
-  const sessionID = info.sessionID;
-  const modelProviderID = typeof model.providerID === "string" ? model.providerID : "omp";
-  const v2ProviderID = isMultiBackend() ? `${backendForSession(sessionID).id}/${modelProviderID}` : modelProviderID;
+  const v2ProviderID = typeof model.providerID === "string" ? model.providerID : "omp";
   if (info.summary === true || info.mode === "compaction") {
-    const summary = parts.filter((part): part is Extract<OpenCodePart, { type: "text" }> => part.type === "text")
+    const summary = parts.filter((part): part is OpenCodeTextPart => part.type === "text")
       .map((part) => part.text).join("\n");
     return withoutUndefined({
       type: "compaction",

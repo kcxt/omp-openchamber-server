@@ -2,8 +2,9 @@
  * OpenChamber's Stats page (`GET /experimental/session/stats`), computed from the
  * session transcripts omp wrote: one pass over every session active in the range.
  */
-import { backendForSession, listSessionsAcrossBackends } from "../../providers/registry";
-import type { OpenCodeMessageRecord, OpenCodeSession } from "../../providers/types";
+import { loadSessionMessages } from "../../omp/messages";
+import { listOmpSessions } from "../../store/sessions";
+import type { OpenCodeMessageRecord, OpenCodeSession } from "../../shared/types";
 
 type Tokens = { input: number; output: number; reasoning: number; cache: { read: number; write: number } };
 const zero = (): Tokens => ({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } });
@@ -26,7 +27,7 @@ function dayKey(ms: number, timezone: string): string {
 
 export async function buildUsageStats(params: { from?: number; to?: number; timezone: string; tools: "none" | "detail" }) {
   const to = params.to ?? Date.now();
-  const sessions = await listSessionsAcrossBackends(null, { all: true });
+  const sessions = await listOmpSessions(null, { all: true });
   const inRange = sessions.filter((s: OpenCodeSession) => (params.from === undefined || s.time.updated >= params.from) && s.time.created <= to);
   const tokens = zero();
   let cost = 0, prompts = 0, steps = 0, subagents = 0;
@@ -38,7 +39,7 @@ export async function buildUsageStats(params: { from?: number; to?: number; time
     if (session.parentID) subagents++;
     let records: OpenCodeMessageRecord[] = [];
     try {
-      records = (await backendForSession(session.id).store.transcript(session.id, session.directory)) ?? [];
+      records = (await loadSessionMessages(session.id, session.directory)) ?? [];
     } catch {
       continue;
     }

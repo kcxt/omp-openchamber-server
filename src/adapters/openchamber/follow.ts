@@ -17,8 +17,8 @@
  * sidecar itself drives (it has a live child) is never emitted from here.
  */
 import { OmpCli } from "../../omp/cli";
-import { backendForSession } from "../../providers/registry";
-import type { OpenCodeMessageRecord } from "../../providers/types";
+import { loadSessionMessages } from "../../omp/messages";
+import type { OpenCodeMessageRecord } from "../../shared/types";
 import { logger } from "../../shared/logger";
 import {
   emitMessagePartUpdated,
@@ -152,7 +152,7 @@ async function tick(entry: Followed): Promise<void> {
     let evaluate = false;
     if (stamp !== entry.stamp || !entry.seen) {
       entry.stamp = stamp;
-      const records = await backendForSession(entry.id).store.transcript?.(entry.id, entry.cwd);
+      const records = await loadSessionMessages(entry.id, entry.cwd);
       if (records) emitted = applyTranscript(entry, records, Date.now());
       evaluate = true;
     } else if (entry.status !== "idle" && Date.now() - entry.evaluatedAt >= RECHECK_MS) {

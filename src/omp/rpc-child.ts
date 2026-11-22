@@ -1,5 +1,5 @@
-import { resolveOmpBinary } from "../providers/omp/binary";
-import { createOmpCredentialRuntime, type OmpCredentialRuntime } from "../providers/omp/credential-runtime";
+import { resolveOmpBinary } from "./binary";
+import { createOmpCredentialRuntime, type OmpCredentialRuntime } from "./credential-runtime";
 import {
   assertWorkingDirectory,
   embeddedOmpConfigOverlay,
@@ -7,7 +7,7 @@ import {
   type OmpRpcEvent,
   type OmpRpcSpawnOptions,
   type OmpRpcTransport,
-} from "../providers/omp/rpc";
+} from "./rpc";
 
 /** Minimal surface of the spawned process the transport needs. */
 interface RpcProcess {

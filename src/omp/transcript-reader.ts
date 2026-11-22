@@ -17,8 +17,8 @@
  * the life of the process, as the session list needs one per file.
  */
 import { stat } from "node:fs/promises";
-import { isLowSignalTitleInput } from "../providers/omp/title";
-import type { TokenBreakdown } from "../providers/types";
+import { isLowSignalTitleInput } from "./title";
+import type { TokenBreakdown } from "../shared/types";
 
 export interface UsageMappingResult {
   tokens: TokenBreakdown;

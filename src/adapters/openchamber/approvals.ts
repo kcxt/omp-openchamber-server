@@ -1,4 +1,4 @@
-import type { QuestionInfo, QuestionOption } from "../../shared/contracts";
+import type { QuestionInfo } from "../../shared/contracts";
 
 export type { QuestionInfo, QuestionOption } from "../../shared/contracts";
 
@@ -238,15 +238,4 @@ export function clearSessionApprovals(sessionID: string): void {
       pendingQuestions.delete(id);
     }
   }
-}
-
-export function resetApprovals(): void {
-  for (const entry of pendingPermissions.values()) {
-    entry.resolve({ cancelled: true });
-  }
-  for (const entry of pendingQuestions.values()) {
-    entry.resolve({ cancelled: true });
-  }
-  pendingPermissions.clear();
-  pendingQuestions.clear();
 }

@@ -1,6 +1,31 @@
 # Sidecar core rewrite
 
-Status: proposed. Owner of this document: the integration lead. Agents implementing a slice read only their slice plus §1–§4.
+Status: implemented (Phases 0–4 done; see "Status" below). Owner of this document: the integration lead. Agents implementing a slice read only their slice plus §1–§4. The text below is the plan as written; where the build differs, the Status section says so.
+
+## Status
+
+**Built (all on `main`).**
+
+- Phase 0/1: omp patches P1–P6 and the contract suite (`test/contract`, stub and real omp), `docs/omp-protocol.md`, `docs/research/R1–R10`; `RpcChild`, the memoised `TranscriptReader`, `SessionDocs` + importer, the route table (`src/http`, `src/routes`, `src/services`), panels moved to `src/panels`.
+- Phase 2/3: `SessionRuntime`, `Registry`, `TurnTranslator`, `statusOf` (parent's own work; lease first, tail second); turn routes, revert/redo/fork/move through omp RPC, titles and notices from omp, lease-first follower, goals on the runtime, `OmpCli` (lease/models/inspect with inspect prefetch). Deleted: `prompt.ts`, `events.ts`, `utility.ts`, `withOmpRpc`, `oc-records.ts`, `title-db.ts`, sidecar title generation, the goal loop, the file surgery for revert/fork/move.
+- `/aside` (omp's `/btw`), not in the original plan.
+- Phase 4: D1 done: `src/providers/` is gone (registry, `AgentBackend`, `SessionStore`, capabilities, namespaced provider ids, `ses_<backend>_` ids). omp code lives in `src/omp/`, the session catalogue in `src/store/sessions.ts`, the recap publisher in `src/sessions/recap.ts`, shared OpenCode types in `src/shared/types.ts`. Dead exports and the `bun run check` errors are removed (`bun run check` is clean). `docs/architecture.md`, `docs/api-reference.md` (status, turn, goal, aside, credentials), `docs/testing.md`, README and `bugs.md` are rewritten or annotated; `docs/providers.md` is deleted.
+- Verification at the end of Phase 4: `bun run check` clean, e2e 76/76, contract (stub) 97/97.
+
+**Deviations from the plan (already in the code and docs).**
+
+- `Utility` (shared child per cwd) was replaced by the one-shot, read-only `OmpCli` (§3.11 and Phase 3F describe this).
+- No `events/` directory: the event bus and v2 wire encoding stay in `src/shared/sse.ts`. The follower is `src/adapters/openchamber/follow.ts` and goal mapping is `src/adapters/openchamber/goal.ts`, not under `sessions/`. `Registry` is a module-level object, not a class.
+- `SessionDoc` also holds `visibleParts` (typed text of a prompt that carried synthetic context) and `legacyNotices` (importer only), besides the §3.10 fields.
+- The sidecar still creates a new session's transcript (title slot + header, before any omp has it open) and unlinks it on delete; every other transcript change goes through omp.
+- `credentialRef` resolution keeps only the HTTP resolver (`OC_CREDENTIAL_RESOLVER_URL`); the unused in-process `setCredentialResolver` hook was removed.
+
+**Left.**
+
+- §10 Later: bash tool rendering; low-latency reasoning streaming (the per-delta, no-batching property is asserted in `test/e2e/runtime.test.ts`, but SSE vs WebSocket delivery has not been measured).
+- Not built: omp `get_context_view` (per-item context attribution, `bugs.md` #7); upstreaming the `local` branch patches.
+- Test gaps (`docs/testing.md`): the importer test does not cover title-DB message ids; approvals, images, files, `credentialRef` and the `/session/active` 503 path are untested.
+- `/api/info` still advertises OpenChamber 2.0.14 (`bugs.md` #12).
 
 ## 1. Why
 

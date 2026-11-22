@@ -87,8 +87,3 @@ export function isSessionBucketOf(name: string, buckets: Set<string>): boolean {
   }
   return false;
 }
-
-/** The bucket directory name a session file sits in. */
-export function bucketOfSessionPath(sessionPath: string): string {
-  return relative(ompSessionsRoot(), sessionPath).split("/")[0] ?? "";
-}

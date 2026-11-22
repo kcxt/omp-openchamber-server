@@ -6,9 +6,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { getExplicitOmpBinary } from "../../providers/omp/binary";
+import { getExplicitOmpBinary } from "../../omp/binary";
 import { OmpCli } from "../../omp/cli";
-import { defaultBackend } from "../../providers/registry";
+import { listOmpSessions } from "../../store/sessions";
 import { listAvailableCommands } from "./discovery";
 
 type Json = Record<string, unknown>;
@@ -279,7 +279,7 @@ async function loadOmpSlashCommands(directory: string): Promise<SlashCommand[]> 
   if (pending) return pending;
   const load = (async () => {
     try {
-      const sessions = await defaultBackend().store.list(directory);
+      const sessions = await listOmpSessions(directory);
       const newest = sessions.filter((session) => session.path && !session.parentID).sort((a, b) => b.time.updated - a.time.updated)[0];
       if (!newest) throw new Error("no session in this directory to inspect");
       // Fresh: a plugin or MCP change alters the commands without touching the transcript the memo is keyed on.

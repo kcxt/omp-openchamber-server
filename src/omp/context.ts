@@ -7,7 +7,7 @@
  * attribution (skills, tools, …) is not in the transcript; it needs omp's
  * `get_context_breakdown` RPC (see `breakdown`).
  */
-import type { OpenCodeMessageRecord, OpenCodeProvidersResponse, TokenBreakdown } from "../types";
+import type { OpenCodeMessageRecord, OpenCodeProvidersResponse, TokenBreakdown } from "../shared/types";
 
 /** One point on a session's context curve: the prompt omp sent for one assistant message. */
 export interface OmpContextPoint {

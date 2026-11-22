@@ -1,5 +1,5 @@
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, basename, dirname } from "node:path";
+import { readdir, readFile } from "node:fs/promises";
+import { join, basename } from "node:path";
 import { existsSync } from "node:fs";
 
 export interface OpenCodeCommand {

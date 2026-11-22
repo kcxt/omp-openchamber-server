@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { handleProjectContextRequest } from "../panels/project-context";
 import { BrowserControlError } from "../panels/browser-control";
-import { getOmpRuntimeInfo } from "../providers/omp/binary";
+import { getOmpRuntimeInfo } from "../omp/binary";
 import { apiOrGet, type RouteContext } from "../http/router";
 import { readJson } from "../http/response";
 import { emptyProjectSetup, projectPathFromId } from "../services/projects";

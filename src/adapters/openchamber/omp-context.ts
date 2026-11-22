@@ -12,9 +12,10 @@ import {
   sessionContextOf,
   type OmpContextPoint,
   type OmpSessionContext,
-} from "../../providers/omp/context";
+} from "../../omp/context";
 import { OmpCli } from "../../omp/cli";
-import type { AgentBackend, OpenCodeMessageRecord, OpenCodeSession } from "../../providers/types";
+import { loadSessionMessages } from "../../omp/messages";
+import type { OpenCodeMessageRecord, OpenCodeSession } from "../../shared/types";
 
 export const OMP_CONTEXT_VERSION = 1;
 
@@ -91,18 +92,17 @@ async function readBreakdown(session: OpenCodeSession): Promise<OmpContextBreakd
 }
 
 export async function loadOmpContext(
-  backend: AgentBackend,
   session: OpenCodeSession,
   options: { breakdown: boolean },
 ): Promise<OmpContextResponse> {
-  const records = (await backend.store.transcript(session.id, session.directory)) ?? [];
-  const breakdown = options.breakdown && backend.id === "omp" ? await readBreakdown(session) : null;
+  const records = (await loadSessionMessages(session.id, session.directory)) ?? [];
+  const breakdown = options.breakdown ? await readBreakdown(session) : null;
   return buildOmpContext(session.id, records, breakdown);
 }
 
 /** `metadata.openchamber.context` for a single session; sessions with no context point are returned unchanged. */
-export async function attachOmpSessionContext(backend: AgentBackend, session: OpenCodeSession): Promise<OpenCodeSession> {
-  const records = (await backend.store.transcript(session.id, session.directory).catch(() => null)) ?? [];
+export async function attachOmpSessionContext(session: OpenCodeSession): Promise<OpenCodeSession> {
+  const records = (await loadSessionMessages(session.id, session.directory).catch(() => null)) ?? [];
   const context = sessionContextOf(contextHistory(records));
   if (!context) return session;
   const metadata = (session.metadata ?? {}) as Record<string, unknown>;

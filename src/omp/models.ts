@@ -1,5 +1,5 @@
-import { OmpCli, type OmpCliModel } from "../../omp/cli";
-import type { BackendCredentials, OpenCodeProvidersResponse } from "../types";
+import { OmpCli, type OmpCliModel } from "./cli";
+import type { BackendCredentials, OpenCodeProvidersResponse } from "../shared/types";
 import { rememberModelWindows } from "./context";
 import { mapRpcModelsToOpenCodeProviders, type OmpRpcModel } from "./rpc";
 

@@ -1,7 +1,7 @@
 // Pure reduction of what the sidecar publishes onto the OpenCode routes guests
 // may read (`GET /api/session/:id` and `/message`) into the panel's view model.
 // The sidecar writes `metadata.omp.context` per assistant message and
-// `metadata.openchamber.context` per session (src/providers/omp/context.ts).
+// `metadata.openchamber.context` per session (src/omp/context.ts).
 // Messages are OpenCode v2 messages: `{ type, id, time: { created }, metadata, ... }`.
 
 const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : undefined);

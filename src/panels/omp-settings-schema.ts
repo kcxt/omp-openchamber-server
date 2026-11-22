@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { getOmpRuntimeInfo, probeOmpVersion } from "../providers/omp/binary";
+import { getOmpRuntimeInfo, probeOmpVersion } from "../omp/binary";
 import staticSchema from "./omp-settings-schema.json";
 
 type Schema = { ompVersion?: string };

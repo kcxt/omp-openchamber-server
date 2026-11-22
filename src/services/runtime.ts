@@ -5,10 +5,10 @@ import { parseCliArgs, printHelp } from "../adapters/openchamber/cli";
 import { resolveProviderConnection, resolveSmallModel } from "../adapters/openchamber/small-model";
 import { shutdownSessions } from "../sessions/service";
 import { stopFollowingAll } from "../adapters/openchamber/follow";
-import { allBackends, defaultBackend, listSessionsAcrossBackends } from "../providers/registry";
-import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBinary } from "../providers/omp/binary";
-import { getSidecarExtensionPaths } from "../providers/omp/rpc";
-import { startOmpUpdateChecker } from "../providers/omp/update-check";
+import { listOmpSessions } from "../store/sessions";
+import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBinary } from "../omp/binary";
+import { getSidecarExtensionPaths } from "../omp/rpc";
+import { startOmpUpdateChecker } from "../omp/update-check";
 import { logger } from "../shared/logger";
 import { browserControlBroker, messageQueueRuntime, terminalRuntime } from "./instances";
 import { openChamberDataDir } from "./settings-file";
@@ -59,9 +59,6 @@ export async function resolveSidecarConfig(): Promise<SidecarConfig> {
 
 function logStartupBanner(sidecarHost: string, port?: number): void {
   const effectivePort = port ?? 4096;
-  const backendList = allBackends()
-    .map((b) => `${b.id}${b.id === defaultBackend().id ? " (default)" : ""}`)
-    .join(", ");
   const extPaths = getSidecarExtensionPaths();
   const extensions = extPaths.length > 0 ? extPaths.map((p) => basename(p)).join(", ") : "none";
   const ompRuntime = getOmpRuntimeInfo();
@@ -77,7 +74,6 @@ function logStartupBanner(sidecarHost: string, port?: number): void {
   logger.info(`[sidecar] Listening on http://${sidecarHost}:${effectivePort}`);
   logger.info(`[sidecar] Configuration:`);
   logger.info(`  • Working directory : ${process.cwd()}`);
-  logger.info(`  • Active adapters   : ${backendList}`);
   logger.info(`  • OMP version       : ${ompRuntime.version ?? "unknown"} (${ompRuntime.source})`);
   if (ompRuntime.binary) {
     logger.info(`  • OMP binary        : ${ompRuntime.binary}`);
@@ -119,7 +115,7 @@ export function startRuntime(server: { port?: number; stop(closeActiveConnection
   // Parse every session header once, in the background, so OpenChamber's first
   // global session list (its goal recovery runs one on connect and gives up
   // after a few seconds) is a cache hit instead of a multi-second cold scan.
-  void listSessionsAcrossBackends(null, { all: true }).catch(() => {});
+  void listOmpSessions(null, { all: true }).catch(() => {});
 
   // Keepalive interval so Bun's event loop wakes up frequently to process POSIX signals
   // (SIGINT/SIGTERM) immediately even when Bun.serve has no pending I/O.

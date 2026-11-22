@@ -1,124 +1,140 @@
 # Server Architecture
 
-`omp-openchamber-server` is a lightweight proxy server written in TypeScript for [Bun](https://bun.sh). It translates [OpenChamber](https://github.com/OpenChamber/OpenChamber) OpenCode HTTP/SSE client requests into [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) stdio RPC commands without requiring modifications to either project.
+`omp-openchamber-server` is a sidecar written in TypeScript for [Bun](https://bun.sh). It serves the OpenCode v2 HTTP/SSE API that [OpenChamber](https://github.com/OpenChamber/OpenChamber) speaks, and drives [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) through its stdio RPC. Neither project is modified in place: the sidecar needs the patched omp from the `local` branch (see "omp patches" below).
 
-## Source layout
+The design rule is in `PLAN.md` §2: **omp owns every piece of live state** (busy, model, effort, queue, goal, todos, context usage, transcript, tree) and the sidecar asks omp instead of keeping a copy. The sidecar never edits omp's transcripts: tree changes go through omp RPC. The only file operations on an omp transcript are the two lifecycle ones, creating the file for a new session (title slot + header, before any omp has it open) and unlinking it on `DELETE /session/:id`.
 
-The process entrypoint is intentionally separate from adapter code:
+## Layout
 
 ```text
-src/main.ts                         stable process entrypoint
-src/server.ts                       Bun HTTP/WebSocket composition
-src/adapters/openchamber/           OpenCode/OpenChamber compatibility adapter
-src/adapters/openchamber/extensions/  OpenChamber-facing OMP extensions
-src/providers/omp/                  OMP RPC, JSONL session, and model provider
-src/providers/fake/                 deterministic test backend
-src/shared/                         protocol types, event bus, logging, utilities
+src/main.ts           process entrypoint
+src/server.ts         Bun.serve, WebSocket upgrades, dispatch into the route table
+src/http/             Request context and the ordered route dispatcher (router.ts), response helpers, access log
+src/routes/           one module per resource; handlers parse, call a service, serialise (no state)
+src/services/         startup/shutdown (runtime.ts), session lookup + "open elsewhere" refusal (session-route.ts),
+                      process-lifetime runtimes (instances.ts), settings file, projects
+src/sessions/         SessionRuntime, Registry, TurnTranslator, status, service, aside, prompt input, recap
+src/omp/              everything that talks to or reads from omp (below)
+src/store/            sessions.ts (session catalogue), session-docs.ts (the one durable store), importer.ts
+src/panels/           git, terminal, project context, omp settings, browser control (moved, not rewritten)
+src/adapters/openchamber/   OpenChamber/OpenCode compat that is not session core: follow, goal mapping, message
+                      queue, approvals, small model, omp config routes, v2 wire shapes, usage stats
+src/adapters/openchamber/extensions/   omp extensions loaded into every driven child (question, web, image budget)
+src/shared/           types.ts (OpenCode shapes), sse.ts (event bus + v2 encoding), logger, ids, blobs, tool normalisation
+extensions/           OpenChamber guest extensions (omp-settings, omp-context panels)
+test/                 e2e (UI -> sidecar -> stub omp), contract (stub and real omp), stub-omp
 ```
 
-The two adapters share the OMP provider runtime but do not share route
-contracts. OpenChamber-specific compatibility logic stays under its adapter;
-
-
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     OpenChamber Frontend                    │
-│           (Web UI, Desktop App, VSCode Extension)           │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ HTTP / SSE (/api/*)
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   omp-openchamber-server                    │
-│                                                             │
-│  ┌─────────────────┐ ┌──────────────────┐ ┌──────────────┐  │
-│  │   HTTP Router   │ │ Provider Registry│ │ SSE Producer │  │
-│  │   (server.ts)   │ │    (registry)    │ │ shared/sse.ts │  │
-│  └────────┬────────┘ └────────┬─────────┘ └──────▲───────┘  │
-│           │                   │                  │          │
-│  ┌────────▼────────┐ ┌────────▼─────────┐ ┌──────┴───────┐  │
-│  │ Adapters         │ │ JSONL Fast-Path  │ │ Event Bridges│  │
-│  │ OpenChamber     │ │ providers/omp/*  │ │ prompt +     │  │
-│  │ adapters/*       │ │                  │ │ adapters/*   │  │
-│  └────────┬────────┘ └────────┬─────────┘ └──────────────┘  │
-└───────────┼───────────────────┼─────────────────────────────┘
-            │ stdio NDJSON      │ Direct FS Read
-            ▼                   ▼
-┌───────────────────────┐ ┌───────────────────────────────────┐
-│   project-owned OMP   │ │         Session JSONL             │
-│       CLI binary      │ │  (~/.omp/agent/sessions/*/*.jsonl) │
-│ (omp --mode rpc ...)  │ │                                  │
-└───────────────────────┘ └───────────────────────────────────┘
+                 OpenChamber (UI + its server)
+                          │ HTTP / SSE / WS
+ ┌────────────────────────▼──────────────────────────────────────────┐
+ │ http/ + routes/   ordered table of handlers, first answer wins     │
+ ├────────────────────────────────────────────────────────────────────┤
+ │ sessions/   service ─ Registry ─ SessionRuntime (one per driven    │
+ │             session) ─ TurnTranslator; status.ts: statusOf         │
+ │ adapters/openchamber/follow.ts   read-only sessions another omp owns│
+ ├────────────────────────────────────────────────────────────────────┤
+ │ omp/   RpcChild (NDJSON transport)   OmpCli (one-shot, read-only)   │
+ │        TranscriptReader (JSONL → entries, memoised)                 │
+ │        messages.ts (entries → OpenCode records)                     │
+ ├────────────────────────────────────────────────────────────────────┤
+ │ store/ SessionDocs (JSON per session)   sessions.ts (catalogue)     │
+ │ shared/sse.ts  event bus + OpenCode v2 wire encoding                │
+ └────────────────────────────────────────────────────────────────────┘
+        │ stdio NDJSON                      │ read-only
+  omp --mode rpc children            ~/.omp/agent/sessions/*.jsonl
 ```
 
----
+## HTTP layer (`src/server.ts`, `src/http/`, `src/routes/`)
 
-## Subsystems
+`server.ts` is `Bun.serve` plus WebSocket upgrades (events, terminal). Every request goes through `dispatch` in `http/router.ts` over the table in `routes/index.ts`: `platform, fs, git, config, omp-settings, events, interactions, sessions, goals, revert, turns, transcript, providers, terminal`. The first handler that returns a `Response` wins and `undefined` falls through, so order is behaviour: broad matchers stay behind the modules whose exact routes they would shadow. `?directory=` (or the `x-opencode-directory` header) scopes a request to a project. Startup (CLI parse, omp binary check, importer, banner, endpoint file, signal handling) and shutdown live in `services/runtime.ts`.
 
-### 1. Process Entry & HTTP Composition (`src/main.ts`, `src/server.ts`)
-- `src/main.ts` is the stable process entrypoint used by package scripts and
-  external launchers.
-- `src/server.ts` composes the Bun HTTP/WebSocket server and mounts the
-  OpenChamber adapter.
-- Implements the OpenCode HTTP API surface expected by OpenChamber.
-- Supports multi-directory workspaces via `?directory=<path>` query parameters.
-- Dispatches requests for sessions, transcripts, prompts, provider configs, and real-time event streams.
-- Manages clean shutdown on `SIGINT` and `SIGTERM` signals.
+## Sessions (`src/sessions/`)
 
-### 2. Session Management & Fast Path (`src/providers/omp/store.ts`, `src/providers/omp/messages.ts`)
-- **Session Discovery**: Scans `~/.omp/agent/sessions/<cwd-slug>/` for session JSONL files without spawning OMP subprocesses.
-- **Transcript Fast Path**: Reads session JSONL records directly from disk (`loadMessagesFromFile`), mapping entries into OpenCode `{info, parts}` structures.
-- **Deterministic ID Translation**: Reversibly maps OMP UUIDs (`8-4-4-4-12`) to OpenCode format (`ses_<32hex>`).
-- **Session Creation**: Pre-allocates session header JSONL files for immediate UI visibility and navigation.
+**`SessionRuntime`** (`runtime.ts`) is one driven session: an `omp --mode rpc` child that holds the session's lease, a state machine `starting | idle | active | aborting | closed` driven only by omp frames and child exit, a serial command queue, and the `TurnTranslator`s for the session's stream. The child opens its session with `switch_session { claimLease: true }` (P3), so omp never moves it to a sibling transcript; a refusal is the "owned elsewhere" error (HTTP 409/400, see `docs/api-reference.md`). Nothing about model, effort, goal or queue is cached: `setModel` always pushes `set_model` (when `get_state.model` differs) and `set_thinking_level`, and omp journals both.
 
-### 3. OpenChamber context compatibility (`src/adapters/openchamber/project-context.ts`)
-- Owns notes, project todos, and plan markdown when the UI connects directly to the sidecar.
-- Stores context under `$OPENCHAMBER_DATA_DIR/projects/<projectId>/context.json` and plan files under the matching `plans/` directory.
+**`Registry`** (`registry.ts`) is the only map of live runtimes (`sessionId + cwd` → runtime) with single-flight creation. It creates runtimes for root sessions only: a subagent session is driven through its parent's runtime (`steer_subagent`, `cancel_subagent`, `resume { subagentId }`), never by a second omp child writing the parent's artifact file. It also wires runtime events to OpenChamber: busy/idle publication, usage after a run, the goal mirror, and omp's idle recap into `metadata.openchamber.assist`.
 
-### 4. Provider Registry (`src/providers/registry.ts`)
+**`TurnTranslator`** (`turn-translator.ts`) turns omp frames into OpenCode events (message, part, tool, reasoning, usage, `session.inbox.delivered`). Its state is output assembly for one stretch only. Every text/thinking delta becomes one `message.part.delta`, never batched; subagent streams arrive as full-form snapshots and the translator derives deltas.
 
-The adapter seam that lets the sidecar serve multiple agent backends behind one unchanged OpenCode HTTP/SSE surface. Full adapter contract: [providers.md](providers.md).
-- **AgentBackend contract**: each backend supplies a stable `id`, a provider catalog, a `SessionStore` (create/list/get/transcript), and a turn-connection factory. Capabilities (`todo`, `summarize`, `shell`, ...) gate the corresponding HTTP routes.
-- **Session-ID codec**: legacy `ses_<32hex>` ids remain the default omp backend; non-default backends encode as `ses_<backendId>_<native>`. Routing is derived from the id alone — no registry file, restart-safe.
-- **Model-picker routing**: with a single backend registered, provider IDs pass through byte-identical. With 2+, provider IDs are namespaced `<backendId>/<nativeProviderID>` and a new session's backend is chosen from the requested prefix.
-- **Registration**: backends register at startup via `registerBackend`; the bundled fake backend (`src/providers/fake/backend.ts`) is gated behind `OC_FAKE_BACKEND=1` for testing.
+**`service.ts`** holds the operations the routes call: prompt (delivery `start | steer | followUp`, `.` as omp's resume), abort, compact, model, goal, shell, revert/redo/fork/move/rename, teardown. **`aside.ts`** maps omp's `/btw` frames to messages (see `docs/api-reference.md`, "Side questions"). **`recap.ts`** publishes omp's idle recap. **`prompt-input.ts`** turns an OpenChamber prompt body into omp's message, images and client message id.
 
-### 5. OMP RPC Process Manager (`src/providers/omp/rpc.ts`)
-- Spawns and manages `omp --mode rpc` child processes communicating via newline-delimited JSON (NDJSON) over standard I/O.
-- Ensures the project-owned `resources/omp` binary matches the `ompVersion` pin before the HTTP server starts, downloading that exact platform-specific release when it is missing or stale.
-- Resolves `OMP_BIN` only as an explicit test/development override; otherwise it uses the staged project-owned binary and never searches PATH or common install directories.
-- **Persistent Children**: Maintained per `(sessionID, directory)` pair for conversational prompt turns.
-- **Ephemeral Children**: Spawned on-demand with automatic teardown for one-shot commands (e.g. `/config/providers`).
-- **Caller-owned credentials**: When a prompt or `POST /config/providers` includes `credentials` or `credentialRef`, the sidecar creates a private temporary `PI_CODING_AGENT_DIR` containing only that child's generated `models.yml`; the normal no-auth path inherits the existing OMP environment unchanged.
-- **Resilience & Gating**:
-  - Gated on the first successful RPC response to a `get_state` probe rather than the `ready` frame, avoiding stalls caused by third-party LSP or MCP initialization.
-  - Spawns children in detached process groups so parent termination cleanly tears down all descendant processes.
-  - Overlays `mcp.enableProjectConfig: false` for the embedded instance to prevent project-level MCP deadlock.
-  - Passes `PI_SKIP_VERSION_CHECK=1` to eliminate update check network delays.
-  - Performs a non-blocking OMP release check after startup and every four hours; it reports newer releases but does not replace the running pinned binary. Bumping `ompVersion` in `package.json` is the explicit opt-in, and the next startup stages that exact version automatically.
+### The busy model
 
-### 6. Event Translation & SSE Stream (`src/adapters/openchamber/prompt.ts`, `src/shared/sse.ts`)
-- Subscribes to OMP internal turn events (`message_update`, `tool_execution_*`, `turn_end`, `agent_end`).
-- Synthesizes contract-compliant OpenCode SSE frames:
-  - `message.updated` (creation / finalization)
-  - `message.part.updated` & `message.part.delta` (live text, thinking/reasoning blocks, tool invocations)
-  - `session.status` (`busy` / `idle`)
-  - `server.connected` and periodic `server.heartbeat`
-- Emits standard data-only SSE payloads compatible with OpenChamber's client pipeline (`resolveEventPayload`).
+`status.ts` computes status when asked (`PLAN.md` §3.5, `docs/omp-protocol.md` §4):
 
-### 8. Approvals & Custom Extensions (`src/adapters/openchamber/approvals.ts`, `src/adapters/openchamber/extensions/`)
-- Surfaces interactive tool-call permissions and question requests to the OpenChamber frontend.
-- Supports confirmation, rejection, and custom user write-ins.
+| Session | Status |
+|---|---|
+| Driven (a live runtime) | `starting`, `active`, `aborting` → busy; `idle` → idle |
+| Starting (runtime being spawned) | busy |
+| Subagent of a driven parent | busy while the parent's `get_subagents` snapshot says `pending`/`running` |
+| Not driven | **lease first, tail second**: no lease holder → idle; a holder → busy iff the transcript tail is mid-turn; probe failure → `unknown` |
 
-### 9. Title Generation (`src/providers/omp/title.ts`)
-- Generates descriptive session titles from the first turn using model output normalization.
-- Injects titles directly into the fixed 256-byte session JSONL header slot matching OMP conventions.
+Busy is the **parent's own work**: `active` from an accepted prompt or `agent_start` until the run's terminal `agent_end`, and through the gap before a run omp already decided to start (a goal continuation: `get_state.isSettled === false`, no pending async work, nothing queued). Background subagents and async jobs leave the parent idle; their child sessions are busy, and `/experimental/job` lists them. A queued steer/follow-up, goal continuation, or background result that wakes the parent arrives as a new `agent_start`, so OpenChamber can see several busy → idle pairs inside one omp stretch. `unknown` makes `/session/active` return `503` and is never reported as idle. There is no sidecar loop following goal turns, no settle poll and no busy lock.
 
----
+`runtime.state` and `statusOf` are the only inputs to status. A transition emits `session.status` (+ `session.idle`) only when the busy/idle value changes (output dedupe).
 
-## Core Invariants
+### Abort
 
-1. **Zero Upstream Modifications**: Neither OpenChamber nor oh-my-pi source repositories are modified.
-2. **Stable URLs**: Session IDs are deterministically mapped and survive proxy restarts.
-3. **No Polling Overhead**: Fast-path transcript reads eliminate the process churn associated with polling active sessions.
-4. **Clean Concurrency**: Session locks enforce `409 Conflict` on concurrent prompts to the same session while permitting parallel turns in separate sessions.
-5. **Backend-Agnostic Surface**: The HTTP/SSE contract and session URL stability hold for every registered backend; routing is derived from session ids and model prefixes only.
+Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagents stop, queued steer/follow-up text is withdrawn and returned in the `/interrupt` response (`withdrawn`), and its inbox bubbles are cancelled. The runtime then waits for the run to stop (`agent_end`, or `get_state.isStreaming === false`), bounded by `ABORT_DEADLINE_MS` (5 s); past the deadline the child's process group is killed, state becomes `closed` and idle is published with `aborted: true`. The next prompt starts a fresh child on the same transcript. Background subagents keep running by design.
+
+### Child lifetime
+
+A child is released after `OC_CHILD_IDLE_MS` once it is `idle`, `get_state.isSettled === true`, and omp owes no idle maintenance (`get_state.idleMaintenance` absent, P4), so omp's idle recap and idle compaction always run first. Unreadable state keeps the child. A crash ends the active stretch with an error turn and goes idle.
+
+## omp layer (`src/omp/`)
+
+- **`rpc-child.ts` (`RpcChild`)**: spawn in a detached process group, NDJSON framing, request/response with per-request timeout, event fan-out, death detection. Gated on the first `get_state` reply. Overlays `mcp.enableProjectConfig: false` and passes `PI_SKIP_VERSION_CHECK=1`. Caller-owned credentials (`credentials` / `credentialRef`) get a private temporary `PI_CODING_AGENT_DIR` with a generated `models.yml` (`credentials.ts`, `credential-runtime.ts`); otherwise the child inherits omp's normal auth.
+- **`cli.ts` (`OmpCli`)**: stateless one-shot subprocesses for sessions that are not driven, all read-only (no lease, no writes): `omp session lease --json -- <ids…>` (batched ownership probe), `omp models --json` (cached until omp's config changes), `omp session inspect --json <path>` (P6: model, effort, context breakdown, commands, todos, goal; memoised by transcript stamp and prefetched on the first transcript read of an undriven session). It deliberately never starts a runtime opportunistically, which would claim the lease and block a terminal omp.
+- **`transcript-reader.ts`**: the single JSONL parser. Reads only. Memoised by `(path, size, mtimeMs)`; the active branch is the path from omp's leaf to the root, abandoned branches stay in the file. Full parses sit in a byte-bounded LRU, the small per-file summary (header, title, leaf, model, usage) is kept for the life of the process because the session list needs one per file.
+- **`messages.ts`**: entries → OpenCode `{info, parts}` records (message ids come from `hostMessageId`, P1; `host-resume` and `custom` entries become messages; legacy ids from `SessionDoc.legacyMessageIds`). `context.ts`, `todo.ts`, `btw-history.ts`, `title.ts`: transcript-derived context figures, todo/tool-name mapping, read-only `/btw` store, the title slot written when a session file is created.
+- **`binary.ts`, `rpc.ts`, `models.ts`, `paths.ts`, `update-check.ts`**: binary resolution (`--binary`/`OMP_BIN`, else the staged `resources/omp`), child config overlay and model catalogue mapping, omp directory layout, release check (reports, never replaces the pinned binary).
+
+## Persistence
+
+| Data | Source of truth |
+|---|---|
+| Transcript, tree, title, model, effort, todos, goal state, queue, context usage, recap | omp (transcript, `get_state`, `get_entries`, `session inspect`) |
+| Client message ids | omp transcript, via P1 `hostMessageId` |
+| Command replies / notices | omp transcript, via P2 `append_custom_entry` |
+| Staged revert | omp transcript (`host-revert` entry) + `SessionDoc.revert` for the redo leaf |
+| OpenChamber metadata (goal record, assist, pins, timings), archived, viewed | `SessionDoc` |
+
+`store/session-docs.ts` (`SessionDocs`) is the one durable store: `$OPENCHAMBER_DATA_DIR/omp-sessions/<omp uuid>.json` (default data dir `~/.config/openchamber`), written by temp file + rename, serialised per session, one writer, no SQLite. Fields: `metadata`, `archivedAt`, `viewedAt`, `revert`, and the pre-migration `legacyMessageIds`, `visibleParts` (the typed text of a prompt that carried synthetic context) and `legacyNotices`.
+
+`store/importer.ts` is the one-time, idempotent migration from the old sidecar state (`<session>.jsonl.oc` records, id-less lines inside transcripts, the title DB's message ids). It runs at startup before any child is spawned, moves the old data into the doc, and renames old files with a `.migrated` suffix. `store/sessions.ts` builds the OpenCode session list/get/create/update/delete from transcript summaries overlaid with the doc. Session ids: an omp UUID maps to `ses_<32hex>` and back; OpenChamber's client-minted `ses_<nanoid>` ids are stored verbatim as `openCodeId` in the transcript header. Ids are omp-only: there is no backend prefix.
+
+## Followed sessions
+
+`adapters/openchamber/follow.ts` serves a session another omp (typically a terminal) owns, read-only: it polls the transcript stamp from the moment a client reads the session's messages, turns each growth into the events a live turn would have produced, and re-evaluates `statusOf` on change (and at a slow interval while not idle, since the lease can drop without the file changing). Tokens stream only to the owning process, so updates arrive per completed message. It stops after 30 minutes without reads once the lease is free. A session the sidecar drives is never emitted from here, and nothing is written or forked.
+
+## Events (`src/shared/sse.ts`)
+
+An in-process bus encodes OpenCode events for SSE and WebSocket clients, including the v2 envelope (`session.*`, `message.part.*`, `session.inbox.*`, `session.execution.*`). What was last published is output dedupe and never an input to a decision.
+
+## Goals
+
+OpenChamber's goal record stays in `metadata.openchamber.goal` (in the `SessionDoc`). `adapters/openchamber/goal.ts` maps record changes to omp goal ops (create/resume/pause/drop) on the session's runtime, and the registry mirrors omp's `goal_updated` back (complete, budget limited, tokens used). omp keeps the stretch open while a continuation is pending, so the session stays busy for the whole goal with no sidecar loop. If a stretch settles with the goal still `active`, the record becomes `blocked`. The objective text is read from OpenChamber's objective file; the sidecar does not write `~/.omp/goals`.
+
+## omp patches
+
+The sidecar runs the `local` branch of omp (upstream plus the patches below, one commit each), passed with `--binary` or `OMP_BIN`. The wire-level contract for each is in `docs/omp-protocol.md` §11; tests are in `test/contract/`.
+
+| Patch | What it adds | Doc |
+|---|---|---|
+| P1 | `hostMessageId` on `prompt`/`steer`/`follow_up`/`abort_and_prompt`, stored on the user entry and echoed in its frames | §11.1 |
+| P2 | `append_custom_entry { customType, data }` | §11.2 |
+| P3 | `switch_session { claimLease: true }`, refusal as `session_busy` | §11.3 |
+| P4 | `get_state.idleMaintenance` and the `recap` event frame | §11.4 |
+| P5 | `resume { subagentId?, hostMessageId? }` | §11.5 |
+| P6 | `omp session inspect --json <path>` (read-only) | §11.6 |
+| — | `get_context_breakdown`, RPC sessions opting into idle maintenance, local config tweaks | `docs/omp-protocol.md` |
+
+## Core invariants
+
+1. **omp is the source of truth** for anything live; sidecar state is a resource handle, output dedupe, or the `SessionDoc`.
+2. **Status is a function**: runtime state for driven sessions, lease + transcript tail otherwise. Unknown is neither idle nor busy.
+3. **Stable URLs**: `ses_<32hex>` ids map to the same omp UUID across restarts; client-minted ids are stored in the header.
+4. **No polling for driven sessions**: state comes from omp frames. Followed sessions poll a file stamp.
+5. **One module per concern, one writer per piece of data**; no module imports `server.ts`.

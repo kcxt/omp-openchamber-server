@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BackendCredentials } from "../types";
+import type { BackendCredentials } from "../shared/types";
 
 export interface OmpCredentialRuntime {
   /** Isolated OMP agent directory containing the generated models.yml. */

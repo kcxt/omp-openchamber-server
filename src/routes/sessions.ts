@@ -7,8 +7,8 @@ import { ocGoalOf } from "../adapters/openchamber/goal";
 import { attachOmpSessionContext } from "../adapters/openchamber/omp-context";
 import { buildUsageStats } from "../adapters/openchamber/usage-stats";
 import { page, toV2Session } from "../adapters/openchamber/v2";
-import { attachOmpRecapAssist } from "../providers/omp/recap";
-import { backendById, backendForSession, defaultBackend, listSessionsAcrossBackends, splitProviderPrefix } from "../providers/registry";
+import { attachOmpRecapAssist } from "../sessions/recap";
+import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId, listOmpChildSessions, listOmpSessions, updateOmpSession } from "../store/sessions";
 import { emitOpenCodeV2Event, emitSessionCreated, emitSessionDeleted } from "../shared/sse";
 import { logger } from "../shared/logger";
 import type { RouteContext } from "../http/router";
@@ -51,18 +51,14 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       const location = asRecord(body.location);
       const model = asRecord(body.model);
       const sessionDirectory = typeof location?.directory === "string" ? location.directory : dir;
-      // D1: a namespaced model prefix selects the backend for the new
-      // session; absent or unknown prefix falls through to the default.
       const requestedProvider = typeof model?.providerID === "string" ? model.providerID : "";
-      const prefix = splitProviderPrefix(requestedProvider);
-      const backend = (prefix.backendId ? backendById(prefix.backendId) : undefined) ?? defaultBackend();
       const modelID = typeof model?.id === "string" ? model.id : typeof model?.modelID === "string" ? model.modelID : undefined;
-      const session = await backend.store.create(sessionDirectory, {
+      const session = await createOmpSession(sessionDirectory, {
         id: typeof body.id === "string" ? body.id : undefined,
         title: typeof body.title === "string" ? body.title : undefined,
         parentID: typeof body.parentID === "string" ? body.parentID : undefined,
         model: modelID && requestedProvider ? {
-          providerID: prefix.native,
+          providerID: requestedProvider,
           modelID,
           variant: typeof model?.variant === "string" ? model.variant : "default",
         } : undefined,
@@ -84,7 +80,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       const limit = url.searchParams.get("limit");
       const search = url.searchParams.get("search") || url.searchParams.get("query") || url.searchParams.get("q") || undefined;
       const all = roots || url.searchParams.get("all") === "true" || !dir;
-      const sessions = await listSessionsAcrossBackends(all ? null : dir, {
+      const sessions = await listOmpSessions(all ? null : dir, {
         all,
         archived,
         limit: limit != null ? parseInt(limit, 10) : undefined,
@@ -129,7 +125,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       const limit = url.searchParams.get("limit");
       const search = url.searchParams.get("search") || url.searchParams.get("query") || url.searchParams.get("q") || undefined;
       const all = roots || url.searchParams.get("all") === "true" || !dir;
-      const sessions = await listSessionsAcrossBackends(all ? null : dir, {
+      const sessions = await listOmpSessions(all ? null : dir, {
         all,
         archived,
         search,
@@ -201,11 +197,11 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   const sessionViewMatch = p.match(/^\/sessions?\/([^/]+)\/view$/);
   if (sessionViewMatch && req.method === "POST") {
     const sessionId = decodeURIComponent(sessionViewMatch[1]!);
-    const { backend, session } = await resolveSessionRoute(sessionId, dir);
+    const { session } = await resolveSessionRoute(sessionId, dir);
     if (!session) return jsonError("session not found", 404);
     const body = asRecord(await readJson(req));
     const idle = typeof body?.idle === "number" && Number.isFinite(body.idle) ? body.idle : Date.now();
-    await backend.store.update(sessionId, { time: { viewed: idle } }, session.directory);
+    await updateOmpSession(sessionId, { time: { viewed: idle } }, session.directory);
     return p.startsWith("/sessions/")
       ? json({ success: true, sessionId, viewed: true })
       : noContent();
@@ -271,19 +267,15 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   if (sessionModelMatch && req.method === "POST") {
     try {
       const sessionID = decodeURIComponent(sessionModelMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
       const body = asRecord(await readJson(req));
       const model = asRecord(body?.model);
       const providerID = typeof model?.providerID === "string" ? model.providerID : "";
       const modelID = typeof model?.id === "string" ? model.id : "";
       if (!providerID || !modelID) return jsonError("model providerID and id are required", 400);
-      const prefix = splitProviderPrefix(providerID);
-      if (prefix.backendId && backendById(prefix.backendId) !== backend) {
-        return jsonError("model provider does not belong to this session's backend", 400);
-      }
       const modelRef = {
-        providerID: prefix.native,
+        providerID,
         modelID,
         variant: typeof model?.variant === "string" ? model.variant : "default",
       };
@@ -295,7 +287,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         // or the picker would show a model the session never runs.
         return jsonError(applied.error, 502);
       }
-      if (!(await backend.store.get(sessionID, session.directory))) return jsonError("session not found", 404);
+      if (!(await getOmpSessionByOpenCodeId(sessionID, session.directory))) return jsonError("session not found", 404);
       emitOpenCodeV2Event("session.model.selected", {
         sessionID,
         model: { id: modelID, providerID, variant: modelRef.variant },
@@ -312,9 +304,9 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
     const openCodeId = sMatch[1];
     if (req.method === "GET") {
       try {
-        const { backend, session } = await resolveSessionRoute(openCodeId, dir);
+        const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const withContext = await attachOmpSessionContext(backend, (await attachOmpRecapAssist([session]))[0] ?? session);
+        const withContext = await attachOmpSessionContext((await attachOmpRecapAssist([session]))[0] ?? session);
         return json({ data: toV2Session(withContext) });
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "lookup failed", 500);
@@ -323,9 +315,9 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
 
     if (req.method === "DELETE") {
       try {
-        const { backend, session } = await resolveSessionRoute(openCodeId, dir);
+        const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const ok = await backend.store.delete(openCodeId, dir);
+        const ok = await deleteOmpSession(openCodeId, dir);
         removeSession(openCodeId, session.directory);
         emitSessionDeleted(openCodeId);
         return ok ? noContent() : jsonError("session not found", 404);
@@ -341,19 +333,19 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
           metadata?: Record<string, unknown>;
           time?: { archived?: number | null };
         } | undefined;
-        const { backend, session } = await resolveSessionRoute(openCodeId, dir);
+        const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
         const previousGoal = ocGoalOf(session.metadata);
         // A rename is omp's: `set_session_name` on the session's runtime.
         if (typeof body?.title === "string" && body.title !== session.title) await renameSession(session, body.title);
-        const updated = await backend.store.update(
+        const updated = await updateOmpSession(
           openCodeId,
           { metadata: body?.metadata, time: body?.time },
           dir,
         );
         if (!updated) return jsonError("session not found", 404);
         // OpenChamber's goal record is served by omp's own goal, not OpenChamber's audit loop.
-        if (body?.metadata && "openchamber" in body.metadata && backend.capabilities.goals) {
+        if (body?.metadata && "openchamber" in body.metadata) {
           void applyGoalChange(updated, previousGoal, ocGoalOf(updated.metadata))
             .catch((err) => logger.warn({ err, sessionID: openCodeId }, "[goal] could not apply the goal change to omp"));
         }
@@ -368,7 +360,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   const childrenMatch = p.match(/^\/session\/([^/]+)\/children$/);
   if (childrenMatch && req.method === "GET") {
     try {
-      const children = await backendForSession(childrenMatch[1]).store.children(childrenMatch[1], dir);
+      const children = await listOmpChildSessions(childrenMatch[1], dir);
       return json(children);
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "children failed", 500);

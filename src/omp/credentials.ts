@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { BackendCredentialInput, BackendCredentials } from "../types";
+import type { BackendCredentialInput, BackendCredentials } from "../shared/types";
 
 export interface CredentialResolverContext {
   cwd: string;
@@ -7,11 +7,6 @@ export interface CredentialResolverContext {
   providerID?: string;
   modelID?: string;
 }
-
-export type CredentialResolver = (
-  credentialRef: string,
-  context: CredentialResolverContext,
-) => Promise<BackendCredentials | null>;
 
 /** Errors caused by the opt-in credential path, mapped to an HTTP status. */
 export class CredentialInputError extends Error {
@@ -22,17 +17,6 @@ export class CredentialInputError extends Error {
     this.name = "CredentialInputError";
     this.statusCode = statusCode;
   }
-}
-
-let credentialResolver: CredentialResolver | undefined;
-
-/** Install a process-local resolver for embedded/test hosts. */
-export function setCredentialResolver(resolver: CredentialResolver | undefined): void {
-  credentialResolver = resolver;
-}
-
-export function resetCredentialResolver(): void {
-  credentialResolver = undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -181,7 +165,7 @@ async function resolveOverHttp(
   const url = resolverUrl();
   if (!url) {
     throw new CredentialInputError(
-      "credentialRef was supplied, but no credential resolver is configured; set OC_CREDENTIAL_RESOLVER_URL or install a resolver",
+      "credentialRef was supplied, but no credential resolver is configured; set OC_CREDENTIAL_RESOLVER_URL",
       424,
     );
   }
@@ -239,22 +223,6 @@ async function resolveOverHttp(
   return normalizeBackendCredentials(rawCredentials, context.providerID);
 }
 
-async function resolveCredentialRef(
-  credentialRef: string,
-  context: CredentialResolverContext,
-): Promise<BackendCredentials | null> {
-  if (!credentialResolver) return resolveOverHttp(credentialRef, context);
-  try {
-    return await credentialResolver(credentialRef, context);
-  } catch (error) {
-    if (error instanceof CredentialInputError) throw error;
-    throw new CredentialInputError(
-      `credential resolver failed: ${error instanceof Error ? error.message : String(error)}`,
-      502,
-    );
-  }
-}
-
 /**
  * Resolve the opt-in request envelope into the provider config OMP needs.
  * `undefined` is intentionally a no-op: callers without credentials retain
@@ -289,7 +257,7 @@ export async function resolveBackendCredentials(
   }
 
   const ref = nonEmptyString(input.credentialRef, "credentialRef")!;
-  const resolved = await resolveCredentialRef(ref, resolutionContext);
+  const resolved = await resolveOverHttp(ref, resolutionContext);
   if (!resolved) throw new CredentialInputError("credentialRef did not resolve to credentials", 401);
   const normalized = normalizeBackendCredentials(resolved, resolutionContext.providerID);
   if (resolutionContext.providerID && normalized.providerID !== resolutionContext.providerID) {

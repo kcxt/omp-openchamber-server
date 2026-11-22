@@ -6,10 +6,10 @@
  */
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
-import { credentialInputFingerprint, resolveBackendCredentials } from "../providers/omp/credentials";
-import { withOmpRecapAssist } from "../providers/omp/recap";
-import { backendForSession } from "../providers/registry";
-import type { BackendCredentialInput, BackendGoalSnapshot } from "../providers/types";
+import { credentialInputFingerprint, resolveBackendCredentials } from "../omp/credentials";
+import { withOmpRecapAssist } from "./recap";
+import { getOmpSessionByOpenCodeId, updateOmpSession } from "../store/sessions";
+import type { BackendCredentialInput, BackendGoalSnapshot } from "../shared/types";
 import { ocPatchForOmpGoal, withGoalPatch, type OcGoal } from "../adapters/openchamber/goal";
 import { emitOpenCodeV2Event, emitSessionIdle, emitSessionStatus } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
@@ -48,10 +48,9 @@ async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | n
   };
   if (Object.keys(patch).length === 0) return;
   try {
-    const store = backendForSession(runtime.sessionId).store;
-    const session = await store.get(runtime.sessionId, runtime.cwd);
+    const session = await getOmpSessionByOpenCodeId(runtime.sessionId, runtime.cwd);
     const metadata = withGoalPatch(session?.metadata, patch);
-    if (metadata) await store.update(runtime.sessionId, { metadata }, runtime.cwd);
+    if (metadata) await updateOmpSession(runtime.sessionId, { metadata }, runtime.cwd);
   } catch (err) {
     promptLogger.warn({ err, sessionID: runtime.sessionId }, "[goal] could not mirror omp's goal into the session metadata");
   }
@@ -59,17 +58,16 @@ async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | n
 
 async function publishRecap(runtime: SessionRuntime, recap: string, createdAt: number, forMessageID: string | undefined): Promise<void> {
   try {
-    const store = backendForSession(runtime.sessionId).store;
-    const session = await store.get(runtime.sessionId, runtime.cwd);
+    const session = await getOmpSessionByOpenCodeId(runtime.sessionId, runtime.cwd);
     const metadata = session ? await withOmpRecapAssist(session, recap, createdAt, forMessageID) : null;
-    if (metadata) await store.update(runtime.sessionId, { metadata }, runtime.cwd);
+    if (metadata) await updateOmpSession(runtime.sessionId, { metadata }, runtime.cwd);
   } catch (err) {
     promptLogger.warn({ err, sessionID: runtime.sessionId }, "[recap] could not publish omp's recap");
   }
 }
 
 async function publishUsage(runtime: SessionRuntime): Promise<void> {
-  const session = await backendForSession(runtime.sessionId).store.get(runtime.sessionId, runtime.cwd).catch(() => null);
+  const session = await getOmpSessionByOpenCodeId(runtime.sessionId, runtime.cwd).catch(() => null);
   if (session) emitOpenCodeV2Event("session.usage.updated", { sessionID: runtime.sessionId, cost: session.cost, tokens: session.tokens }, runtime.cwd);
 }
 

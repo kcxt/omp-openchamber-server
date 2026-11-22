@@ -1,7 +1,7 @@
 /** Providers, models, the agent catalog and the small-model description. */
-import { backendById, defaultBackend, listProviders, splitProviderPrefix } from "../providers/registry";
-import type { BackendCredentialInput, OpenCodeProvidersResponse } from "../providers/types";
-import { CredentialInputError } from "../providers/omp/credentials";
+import type { BackendCredentialInput, OpenCodeProvidersResponse } from "../shared/types";
+import { CredentialInputError, resolveBackendCredentials } from "../omp/credentials";
+import { listOmpModels } from "../omp/models";
 import { describeSmallModel, readOmpConfigSmallModel } from "../adapters/openchamber/small-model";
 import type { RouteContext } from "../http/router";
 import { asRecord, numberOr, readJson } from "../http/response";
@@ -94,7 +94,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
   if (p === "/provider" && req.method === "GET") {
     try {
       const cwd = dir ?? process.cwd();
-      const providersData = await listProviders(cwd);
+      const providersData = await listOmpModels(cwd);
       const providers = providersData.providers.map((provider) => ({
         id: provider.id,
         name: provider.name,
@@ -112,7 +112,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
     try {
       const cwd = dir ?? process.cwd();
       const providerID = decodeURIComponent(providerMatch[1]!);
-      const providersData = await listProviders(cwd);
+      const providersData = await listOmpModels(cwd);
       const provider = providersData.providers.find((entry) => entry.id === providerID);
       if (!provider) return jsonError("provider not found", 404);
       return json({
@@ -127,7 +127,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
   if (p === "/providers" && req.method === "GET") {
     try {
       const cwd = dir ?? process.cwd();
-      const providersData = await listProviders(cwd);
+      const providersData = await listOmpModels(cwd);
       return json({
         all: providersData.providers.map((provider) => ({ id: provider.id, name: provider.name })),
         default: providersData.default,
@@ -143,7 +143,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
   if (p === "/config/providers" && req.method === "GET") {
     try {
       const cwd = dir ?? process.cwd();
-      const response = await listProviders(cwd);
+      const response = await listOmpModels(cwd);
       return json(response);
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "providers failed", 500);
@@ -165,24 +165,21 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
       const model = asRecord(body?.model);
       const requestedProviderID = typeof model?.providerID === "string" ? model.providerID : undefined;
       const requestedModelID = typeof model?.modelID === "string" ? model.modelID : undefined;
-      const providerSelection = requestedProviderID ? splitProviderPrefix(requestedProviderID) : undefined;
-      const selectedBackend = providerSelection?.backendId
-        ? backendById(providerSelection.backendId)
-        : defaultBackend();
-      if (!selectedBackend) return jsonError("unknown model backend", 400);
+      const providerID = requestedProviderID;
 
       const auth: BackendCredentialInput = hasCredentials
         ? {
             credentials: body?.credentials as BackendCredentialInput["credentials"],
-            selectedProviderID: providerSelection?.native,
+            selectedProviderID: providerID,
             selectedModelID: requestedModelID,
           }
         : {
             credentialRef: body?.credentialRef as string,
-            selectedProviderID: providerSelection?.native,
+            selectedProviderID: providerID,
             selectedModelID: requestedModelID,
           };
-      const response = await selectedBackend.listModels(dir ?? process.cwd(), auth);
+      const cwd = dir ?? process.cwd();
+      const response = await listOmpModels(cwd, await resolveBackendCredentials(auth, { cwd }));
       return json(response);
     } catch (err) {
       if (err instanceof CredentialInputError) return jsonError(err.message, err.statusCode);
@@ -192,10 +189,10 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
 
   // OpenCode v2 exposes a flat model list alongside the provider catalog.
   // The sidecar's existing catalog is grouped by provider; keep the wire
-  // model shape and normalize provider ids for multi-backend mode.
+  // model shape.
   if (p === "/model" && req.method === "GET") {
     try {
-      const providersData = await listProviders(dir ?? process.cwd());
+      const providersData = await listOmpModels(dir ?? process.cwd());
       const models = providersData.providers.flatMap((provider) =>
         Object.values(provider.models).map((model) => toV2ModelInfo(model, provider.id)),
       );
@@ -209,7 +206,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
   // the head of the configured default provider is the active default.
   if (p === "/model/default" && req.method === "GET") {
     try {
-      const providersData = await listProviders(dir ?? process.cwd());
+      const providersData = await listOmpModels(dir ?? process.cwd());
       const provider = providersData.providers.find((entry) => entry.id === providersData.default.default);
       if (!provider) return json({ location: { directory: dir ?? process.cwd() }, data: null });
       const model = Object.values(provider.models)[0];
@@ -246,7 +243,7 @@ export async function handleProviders(ctx: RouteContext): Promise<Response | und
   if (path === "/api/small-model") {
     if (req.method !== "GET") return jsonError("method not allowed", 405);
     try {
-      const providersData = await listProviders(effectiveDir);
+      const providersData = await listOmpModels(effectiveDir);
       const seen: Record<string, true> = {};
       const authenticatedProviders: string[] = [];
       for (const pr of providersData.providers) {

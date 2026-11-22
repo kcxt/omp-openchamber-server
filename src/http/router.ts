@@ -45,11 +45,6 @@ export function apiOrGet(ctx: RouteContext): boolean {
   return ctx.path !== ctx.p || ctx.req.method === "GET";
 }
 
-/** A route reachable both as `/x` and as `/api/x`, matched on the raw path. */
-export function bothPaths(...routes: string[]): ReadonlySet<string> {
-  return new Set(routes.flatMap((route) => [route, `/api${route}`]));
-}
-
 export async function dispatch(table: readonly RouteHandler[], ctx: RouteContext): Promise<Response> {
   if (ctx.req.method === "OPTIONS") return new Response(null, { status: 204, headers: ctx.cors });
   for (const handler of table) {

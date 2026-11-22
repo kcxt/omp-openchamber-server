@@ -93,29 +93,3 @@ export function resolveImageDataUrl(data: string, mime: string = "image/png", cu
 
   return `data:${mime};base64,${data}`;
 }
-
-/**
- * Resolves a blob ref or raw base64 string into base64 data.
- */
-export function resolveImageBase64(data: string, customBlobsDir?: string): string | null {
-  if (!data) return null;
-  if (isBlobRef(data)) {
-    const buffer = readBlobBufferSync(data, customBlobsDir);
-    if (buffer) {
-      if (buffer.subarray(0, 5).toString("utf8") === "data:") {
-        const text = buffer.toString("utf8");
-        const commaIdx = text.indexOf(",");
-        return commaIdx >= 0 ? text.slice(commaIdx + 1) : text;
-      }
-      return buffer.toString("base64");
-    }
-    return null;
-  }
-
-  if (data.startsWith("data:")) {
-    const commaIdx = data.indexOf(",");
-    return commaIdx >= 0 ? data.slice(commaIdx + 1) : data;
-  }
-
-  return data;
-}

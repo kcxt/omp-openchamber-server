@@ -17,7 +17,6 @@
 
 const ID_RANDOM_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ID_RANDOM_LENGTH = 14;
-const HEX_TIME_LENGTH = 12;
 
 let lastMintTimestamp = 0;
 let mintCounter = 0;
@@ -80,5 +79,3 @@ export function timeHexOfMessageId(id: string | undefined): string | undefined {
 export function randomIdSuffix(): string {
   return randomBase62(ID_RANDOM_LENGTH);
 }
-
-export const MESSAGE_HEX_TIME_LENGTH = HEX_TIME_LENGTH;

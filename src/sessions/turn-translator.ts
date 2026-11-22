@@ -14,9 +14,9 @@
  * is derived from the snapshot instead of trusted.
  */
 import { randomUUID } from "node:crypto";
-import type { ModelRef, OpenCodeTodo, TokenBreakdown, ToolPartState, TurnTelemetry } from "../providers/types";
+import type { ModelRef, OpenCodeTodo, TokenBreakdown, ToolPartState, TurnTelemetry } from "../shared/types";
 import { mapOmpUsageToTokens } from "../omp/transcript-reader";
-import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "../providers/omp/todo";
+import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "../omp/todo";
 import {
   emitFormCreated,
   emitFormSettled,
@@ -467,7 +467,7 @@ export class TurnTranslator {
   /**
    * omp's own directive (resume's continue, a goal nudge) as a completed
    * `developer` tool card in the turn it drives; the transcript mapper
-   * (providers/omp/messages.ts#developerToolPart) builds the same part.
+   * (omp/messages.ts#developerToolPart) builds the same part.
    */
   #developer(message: Record<string, unknown>): void {
     const at = typeof message.timestamp === "number" ? message.timestamp : Date.now();

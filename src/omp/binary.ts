@@ -84,7 +84,7 @@ function bundledCandidates(env: Environment): string[] {
   if (configured.length > 0) return configured;
 
   return uniquePaths([
-    join(import.meta.dir, "..", "..", "..", "resources", "omp", bundledBinaryName),
+    join(import.meta.dir, "..", "..", "resources", "omp", bundledBinaryName),
     join(executableDir, "resources", "omp", bundledBinaryName),
     process.platform === "darwin"
       ? join(executableDir, "..", "Resources", "omp", bundledBinaryName)
@@ -125,7 +125,7 @@ function readConfiguredVersion(env: Environment): string | null {
 
   try {
     const manifest = JSON.parse(
-      readFileSync(join(import.meta.dir, "..", "..", "..", "package.json"), "utf8"),
+      readFileSync(join(import.meta.dir, "..", "..", "package.json"), "utf8"),
     ) as { ompVersion?: unknown };
     return typeof manifest.ompVersion === "string" && manifest.ompVersion.trim()
       ? manifest.ompVersion.trim()
@@ -190,7 +190,7 @@ export function ensureOmpBinary(env: Environment = currentEnvironment()): Promis
 
   ensurePromise ??= (async () => {
     try {
-      const { prepareOmp } = await import("../../../scripts/prepare-omp");
+      const { prepareOmp } = await import("../../scripts/prepare-omp");
       await prepareOmp();
       return resolveOmpBinary(env);
     } catch (error) {

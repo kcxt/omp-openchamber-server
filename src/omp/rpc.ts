@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BackendCredentials, OpenCodeModel, OpenCodeProvider, OpenCodeProvidersResponse } from "../types";
+import type { BackendCredentials, OpenCodeModel, OpenCodeProvider, OpenCodeProvidersResponse } from "../shared/types";
 
 export function getSidecarExtensionPaths(): string[] {
-  const extensionsDir = join(import.meta.dir, "..", "..", "adapters", "openchamber", "extensions");
+  const extensionsDir = join(import.meta.dir, "..", "adapters", "openchamber", "extensions");
   if (!existsSync(extensionsDir)) return [];
   return readdirSync(extensionsDir)
     .filter((f) => f.endsWith(".ts"))

@@ -18,7 +18,4 @@ export const logger = prettyStream
   : pino({ level: logLevel });
 
 export const httpLogger = logger.child({ module: "http" });
-export const rpcLogger = logger.child({ module: "rpc" });
 export const promptLogger = logger.child({ module: "prompt" });
-export const sessionLogger = logger.child({ module: "session" });
-export const approvalLogger = logger.child({ module: "approval" });

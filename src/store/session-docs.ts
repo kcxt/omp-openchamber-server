@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { OpenCodePromptTextPart } from "../providers/types";
+import type { OpenCodePromptTextPart } from "../shared/types";
 
 export interface SessionDocRevert {
   messageID: string;

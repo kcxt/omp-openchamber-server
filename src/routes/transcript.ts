@@ -2,7 +2,8 @@
 import { followSession } from "../adapters/openchamber/follow";
 import { loadOmpContext } from "../adapters/openchamber/omp-context";
 import { page, toV2Message } from "../adapters/openchamber/v2";
-import { MissingWorkingDirectoryError } from "../providers/omp/rpc";
+import { MissingWorkingDirectoryError } from "../omp/rpc";
+import { loadSessionMessages } from "../omp/messages";
 import type { RouteContext } from "../http/router";
 import { resolveSessionRoute } from "../services/session-route";
 
@@ -12,9 +13,9 @@ export async function handleTranscript(ctx: RouteContext): Promise<Response | un
   if (contextMatch && req.method === "GET") {
     try {
       const sessionId = decodeURIComponent(contextMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionId, dir);
+      const { session } = await resolveSessionRoute(sessionId, dir);
       if (!session) return jsonError("session not found", 404);
-      return json(await loadOmpContext(backend, session, { breakdown: url.searchParams.get("breakdown") === "1" }));
+      return json(await loadOmpContext(session, { breakdown: url.searchParams.get("breakdown") === "1" }));
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "context lookup failed", 500);
     }
@@ -24,9 +25,9 @@ export async function handleTranscript(ctx: RouteContext): Promise<Response | un
   const msgMatch = p.match(/^\/session\/([^/]+)\/message$/);
   if (msgMatch && req.method === "GET") {
     try {
-      const { backend, session } = await resolveSessionRoute(msgMatch[1], dir);
+      const { session } = await resolveSessionRoute(msgMatch[1], dir);
       if (!session) return jsonError("session not found", 404);
-      const messages = await backend.store.transcript(msgMatch[1], session.directory);
+      const messages = await loadSessionMessages(msgMatch[1], session.directory);
       // Anything a terminal omp appends to this session from now on is pushed live.
       if (messages != null) followSession(msgMatch[1], session.directory, session.path);
       if (messages == null) return jsonError("load failed", 500);
@@ -52,9 +53,9 @@ export async function handleTranscript(ctx: RouteContext): Promise<Response | un
     try {
       const sessionID = decodeURIComponent(messageGetMatch[1]!);
       const messageID = decodeURIComponent(messageGetMatch[2]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
-      const messages = await backend.store.transcript(sessionID, session.directory);
+      const messages = await loadSessionMessages(sessionID, session.directory);
       const message = messages?.find((entry) => entry.info.id === messageID);
       if (!message) return jsonError("message not found", 404);
       return json({ data: toV2Message(message) });
@@ -67,9 +68,9 @@ export async function handleTranscript(ctx: RouteContext): Promise<Response | un
   if (sessionContextMatch && req.method === "GET") {
     try {
       const sessionID = decodeURIComponent(sessionContextMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
-      const messages = await backend.store.transcript(sessionID, session.directory);
+      const messages = await loadSessionMessages(sessionID, session.directory);
       if (messages == null) return jsonError("load failed", 500);
       return json({ data: messages.map(toV2Message) });
     } catch (err) {

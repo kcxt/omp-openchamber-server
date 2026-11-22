@@ -336,8 +336,20 @@ Deletes the session and its transcript JSONL file.
 - **Response `200 OK`**: `true`
 
 ### `GET /session/status`
-Returns the execution status (`busy` / `idle`) for all active sessions.
+Returns the sessions that are busy now, keyed by session id; idle sessions are
+absent. The map is computed when asked (`docs/architecture.md`, "The busy
+model"), not stored:
 
+- a session with a live runtime is busy while a parent run is live or due
+  (including the gap before an omp-scheduled goal continuation);
+- a running subagent's child session is busy while its parent's runtime says so;
+- any other session is busy only when a running omp holds its lease **and** the
+  transcript tail is mid-turn. No lease holder means idle regardless of the tail.
+
+The parent session is idle while only background subagents or async jobs run;
+those appear as busy child sessions and in `GET /experimental/job`.
+
+- **Query Parameters**: `directory` (string, optional): restrict to one project.
 - **Response `200 OK`**:
 ```json
 {
@@ -360,6 +372,14 @@ Returns the OpenCode v2 global active-session snapshot. Each entry has
   }
 }
 ```
+
+**Response `503`**: a session's status could not be determined (the lease probe
+failed). OpenChamber treats an empty map as "all idle" and starts queued sends
+and goal turns, so an unknown status is an error here, never an empty map.
+
+### `GET /experimental/job`
+Background work running in driven sessions: subagents and async jobs, from
+omp's `get_subagents` / `get_state`.
 
 ---
 
@@ -400,22 +420,24 @@ Fetches all messages for a session via direct JSONL read (fast path).
 ]
 ```
 
-### `POST /session/:id/prompt_async`
-Enqueues a turn prompt to the OMP child process.
+### `POST /session/:id/prompt_async` · `POST /session/:id/prompt` · `POST /session/:id/message`
+One prompt; the three routes differ only in the acknowledgement. The sidecar
+starts a runtime for the session when none is live, applies the model pick
+(`model` in the body, else the session's recorded model: `set_model` plus
+`set_thinking_level`, so the picked effort is what runs), and hands the message
+to omp. A staged revert is committed first. A prompt is refused with `400` when
+another omp owns the session (omp would otherwise fork it); send from a fork or
+close that omp.
 
 - **Request Body**:
 ```json
 {
+  "id": "msg_client_minted",
   "parts": [
-    {
-      "type": "text",
-      "text": "Write a unit test for main.ts"
-    }
+    { "type": "text", "text": "Write a unit test for main.ts" }
   ],
-  "model": {
-    "providerID": "llama.cpp",
-    "modelID": "qwen3.8-27b"
-  },
+  "model": { "providerID": "llama.cpp", "modelID": "qwen3.8-27b" },
+  "variant": "high",
   "delivery": "steer",
   "credentials": {
     "apiKey": "...",
@@ -424,26 +446,128 @@ Enqueues a turn prompt to the OMP child process.
 }
 ```
 
-`credentials` is optional and is only used when supplied. Instead of raw
-credentials, send `credentialRef` with an opaque reference owned by the host
-application. Send exactly one of these fields, never both. The sidecar
-resolves the envelope before starting the OMP child; requests without either
-field retain OMP's existing host-local provider configuration. See
-[`providers.md`](providers.md#caller-owned-credentials-opt-in) for the
-credential shape and resolver contract.
+- `id` is OpenChamber's client message id. It is sent to omp as `hostMessageId`
+  (P1) and is the message id in the transcript from then on.
+- `delivery: "steer"` adds input to the run in progress (omp's steer);
+  otherwise a prompt sent while a run is live is queued as omp's follow-up. Both
+  join the current run, so there is no "session busy" refusal. Several
+  busy → idle pairs can follow one prompt when omp starts further runs (queued
+  input, goal continuation, background results).
+- A prompt whose whole text is `.` is omp's continue (`resume`): no message
+  reaches the model, an idle session runs omp's recovery directive, a streaming
+  one is interrupted and continued. The transcript keeps a `.` message under the
+  client id. On a subagent session `.` resumes that subagent.
+- A prompt to a subagent session goes to its parent's runtime: `steer_subagent`
+  while it runs, otherwise `409` (send `.` to resume it, or prompt the parent).
+- A body starting with `/aside <question>` is a side question (below).
+- `credentials` / `credentialRef`: see "Caller-owned credentials".
 
-Set `delivery` to `"steer"` to add input to an already-running OMP turn. The
-sidecar forwards this as OMP's `streamingBehavior: "steer"` and keeps the
-session busy until the active turn reaches its terminal event. The field is
-optional for ordinary prompts.
+- **Response, `prompt_async` and `message`**: `200` `{"queued": true}`.
+- **Response, `prompt`**: `200` `{"data": { id, sessionID, type: "user", payload, delivery, time }}`.
+- **Errors**: `400` invalid body or session owned by another omp, `404` unknown
+  session, `409` subagent not steerable, `500`/`502` omp refused the prompt or
+  the model switch.
 
-- **Response `200 OK`**: `{"queued": true}`
-- **Response `409 Conflict`**: `{"error": "session busy"}` (if an ordinary prompt is sent while a turn is already executing on this session).
+### `POST /session/:id/command`
+Runs a slash command by sending `/<name> <arguments>` as the prompt. Body:
+`{ "command" | "name", "arguments" | "text", "id"?, "files"?, "delivery"? }`.
+`204` when accepted, same errors as a prompt. omp's builtin and plugin commands
+(`GET /command`) run in omp.
 
-### `POST /session/:id/abort`
-Interrupts active model generation on the session child process.
+### `POST /session/:id/summarize` · `/compact`
+Compacts through the session's own runtime (a fresh child would compact its own
+empty session). `200` with a `compaction` message; `409` when omp refuses
+(streaming, nothing to compact).
 
-- **Response `200 OK`**: `true`
+### `POST /session/:id/shell`
+Runs `command` through the session's runtime when it has one, otherwise a plain
+`bash` in the session directory. Emits `session.shell.started` / `ended`; `204`.
+
+### `POST /session/:id/interrupt` · `POST /session/:id/abort`
+Esc. `interrupt` answers `{ "interrupted": boolean, "withdrawn"?: { "steering": string[], "followUp": string[] } }`;
+the legacy `abort` answers a bare boolean.
+
+The sidecar sends omp's `abort_and_restore_queue`: the parent run and its
+synchronous subagents stop, and queued steer/follow-up text is **withdrawn**: it
+is returned in `withdrawn`, its inbox bubbles are cancelled
+(`session.inbox.cancelled`), and it is not re-sent. It waits until the run has
+stopped, bounded by 5 s; past that the omp child is killed, idle is published
+with `aborted: true`, and the next prompt starts a fresh child on the same
+transcript. Background subagents keep running; stop one by sending the abort to
+its own session (`cancel_subagent`). A session with no live runtime answers
+`interrupted: false`.
+
+### Revert, redo, fork, move, model, rename
+
+- `POST /session/:id/revert/stage` `{ messageID }`: moves omp's leaf to the
+  message's parent (`navigate_tree`) and journals a `host-revert` entry (P2) so
+  the branch is durable. The abandoned branch stays in omp's file; the message
+  list shows only the active branch. `DELETE /session/:id/revert` is redo: back to
+  the abandoned leaf. `POST /session/:id/revert/commit` (and any prompt) accepts
+  the staged revert (`409` when nothing is staged). Only a user message is a
+  valid boundary (`400`); an unknown one is `404`. The sidecar truncates nothing.
+- `POST /session/:id/fork` `{ before? }`: omp's `fork`; the new transcript is
+  omp's and the OpenChamber metadata is copied to the new session id.
+- `POST /session/:id/move` `{ directory }`: omp's `/move <dir>`. omp keeps the
+  session id and moves the file; a refusal becomes `409`/`500` with omp's text.
+- `POST /session/:id/model` `{ model: { providerID, id, variant? } }`: applied
+  immediately (a runtime is started when none is live), pushing the model and
+  the effort; omp journals both. `502` if omp rejects the model, `400` when
+  another omp owns the session.
+- `PATCH /session/:id` with `title`: omp's `set_session_name` on the runtime.
+
+Revert, fork, move and rename on a session another omp owns are refused (`409`).
+
+### Goals
+OpenChamber's goal record lives in the session's metadata
+(`metadata.openchamber.goal`; `PATCH /session/:id`). The sidecar translates the
+record's changes into omp goal operations on the session's runtime: a new or
+resumed active goal creates/resumes omp's goal (the objective text is read from
+OpenChamber's objective file, `GET|PUT|DELETE /goals/objective/:id`), a paused
+goal pauses it, a removed goal drops it. omp runs the continuations itself, and
+the session stays busy through them, so OpenChamber's idle-driven goal loop never
+finds an idle session with an active goal to audit or re-prompt.
+
+omp's goal changes are mirrored back into the record: `complete` (the agent
+called the `goal` tool), `budgetLimited` (token budget reached), and
+`tokensUsed` while active. If a stretch settles with the goal still `active`
+(omp stopped continuing after a turn with no tool progress) the record becomes
+`blocked` with a reason, and a message or Resume continues it. The sidecar does
+not write `~/.omp/goals`.
+
+### Side questions (`/aside`)
+A prompt `/aside <question>` (typed, or sent as the `aside` command) runs omp's
+`/btw` on the session's runtime, started when none is live. It works while a run
+is in progress and **does not change the session's status**: it opens no run, so
+no `session.status` event is emitted. The question appears as a user message
+`/aside <question>` and the answer streams as an assistant message, finalised
+by omp's terminal record; ids derive from omp's topic id, so a transcript reload
+shows the same messages. omp checkpoints each turn to `<session>/btw-history/`,
+which the sidecar reads after a reload or restart. `400` for an empty question,
+`409` on a subagent session (ask in the parent) or while a previous question is
+still running.
+
+### Caller-owned credentials (opt-in)
+A prompt, or `POST /config/providers`, can carry exactly one of `credentials`
+(a provider section in omp's `models.yml` shape: `providerID`, `apiKey`,
+`baseUrl`, `api`, `auth`, `authHeader`, `headers`, `compat`, `discovery`,
+`remoteCompaction`, `modelOverrides`, `disableStrictTools`, Bedrock guardrail
+fields, `transport`, optional `models`) or `credentialRef` (opaque to omp). With
+neither, omp keeps its normal host-local credential resolution. `providerID` is
+optional inside `credentials`; if present it must match the selected model's
+provider.
+
+`credentialRef` is resolved by the HTTP resolver at `OC_CREDENTIAL_RESOLVER_URL`
+(optional bearer `OC_CREDENTIAL_RESOLVER_TOKEN`): it receives `{ credentialRef,
+providerID, modelID, cwd, openCodeId }` and returns the credential object, or it
+under `credentials` / `credential`. A session's credentialed child is reused for
+the same reference; a new reference or a changed payload replaces an idle child
+(`409` while it is busy). For such a child the sidecar creates a private
+temporary `PI_CODING_AGENT_DIR` with a generated `models.yml`, removed when the
+child exits (best effort on an abrupt kill). Raw credentials are never written
+to session data or sent in prompt frames. Errors map to `CredentialInputError`
+statuses (`400`, `401` unresolved ref, `424` no resolver configured, `502`
+resolver failure).
 
 ---
 
@@ -451,8 +575,7 @@ Interrupts active model generation on the session child process.
 
 ### `GET /model`
 Returns the configured model catalog as a flat array of OpenCode model objects.
-Provider IDs are set on each model, including namespaced IDs when multiple
-backends are enabled.
+Provider IDs are omp's own (no prefix).
 
 ### `GET /model/default`
 Returns `{ "providerID": "...", "modelID": "..." }` for the active default
@@ -561,7 +684,7 @@ instead of failing on a missing route.
 | Endpoint | Method | Response |
 |---|---|---|
 | `/fs/directory-stats` | `POST` | `{ "results": [{ "path", "isDirectory", "reason"?, "realPath"? }] }` for a `{ "paths": [...] }` body. `reason` is `not-found`, `not-directory`, or `unavailable`; the client maps the first two to "missing". |
-| `/session-todos/:id` | `GET` | `{ "revision", "state": "off" }` when the backend has no todo support, else `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`. |
+| `/session-todos/:id` | `GET` | `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`, read from omp's todo state in the transcript. |
 | `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items in the prompt-payload shape the client seeds as optimistic user messages. |
 | `/session/:id/inbox/:itemId` | `DELETE` | `204` — cancels a queued prompt. |
 | `/session/:id/inbox/:itemId` | `PATCH` | `409` — delivery mode is chosen by the prompt request, not by a queued item. |

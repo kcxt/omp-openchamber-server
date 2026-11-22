@@ -12,7 +12,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { BackendGoalSnapshot } from "../../providers/types";
+import type { BackendGoalSnapshot } from "../../shared/types";
 
 export interface OcGoal {
   id: string;

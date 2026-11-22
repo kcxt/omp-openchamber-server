@@ -29,7 +29,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Database } from "bun:sqlite";
-import { ompAgentDir, ompSessionsRoot } from "../providers/omp/paths";
+import { ompAgentDir, ompSessionsRoot } from "../omp/paths";
 import { isSidecarRecord, parseTranscript, SIDECAR_RECORD_TYPES, type TranscriptEntry } from "../omp/transcript-reader";
 import { openChamberDataDir, SessionDocs, type SessionDoc } from "./session-docs";
 

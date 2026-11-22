@@ -2,7 +2,7 @@
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { goalObjectivePath } from "../adapters/openchamber/goal";
-import { readSessionTodos } from "../providers/omp/todo";
+import { readSessionTodos } from "../omp/todo";
 import { nextSessionTodosRevision } from "../shared/sse";
 import type { RouteContext } from "../http/router";
 import { readJson } from "../http/response";
@@ -23,10 +23,9 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
   const sessionTodosMatch = p.match(/^\/session-todos\/([^/]+)$/);
   if (sessionTodosMatch && req.method === "GET") {
     try {
-      const { backend, session } = await resolveSessionRoute(decodeURIComponent(sessionTodosMatch[1]!), dir);
+      const { session } = await resolveSessionRoute(decodeURIComponent(sessionTodosMatch[1]!), dir);
       if (!session) return jsonError("session not found", 404);
       const revision = nextSessionTodosRevision();
-      if (!backend.capabilities.todo) return json({ revision, state: "off" });
       const todos = await readSessionTodos(session.path);
       return json({
         revision,
@@ -78,9 +77,8 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
   const todoMatch = p.match(/^\/session\/([^/]+)\/todo$/);
   if (todoMatch && req.method === "GET") {
     try {
-      const { backend, session } = await resolveSessionRoute(todoMatch[1]!, dir);
+      const { session } = await resolveSessionRoute(todoMatch[1]!, dir);
       if (!session) return jsonError("session not found", 404);
-      if (!backend.capabilities.todo) return json([]);
       const todos = await readSessionTodos(session.path);
       return json(todos);
     } catch (err) {

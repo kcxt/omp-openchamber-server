@@ -14,10 +14,10 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resolveOmpBinary } from "../providers/omp/binary";
-import { createOmpCredentialRuntime } from "../providers/omp/credential-runtime";
-import { assertWorkingDirectory } from "../providers/omp/rpc";
-import type { BackendCredentials } from "../providers/types";
+import { resolveOmpBinary } from "./binary";
+import { createOmpCredentialRuntime } from "./credential-runtime";
+import { assertWorkingDirectory } from "./rpc";
+import type { BackendCredentials } from "../shared/types";
 
 export interface LeaseReport {
   /** Ids a running omp holds (this sidecar's own children included). */

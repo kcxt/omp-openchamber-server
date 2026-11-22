@@ -4,7 +4,7 @@ import { abortSession, asideQuestionOf, compactSession, promptSession, runShell 
 import { mimeFromPath } from "../sessions/prompt-input";
 import { generateSmallModelText } from "../adapters/openchamber/small-model";
 import { toV2FileAttachment } from "../adapters/openchamber/v2";
-import { splitProviderPrefix } from "../providers/registry";
+import { loadSessionMessages } from "../omp/messages";
 import { emitOpenCodeV2Event } from "../shared/sse";
 import { logger } from "../shared/logger";
 import type { RouteContext } from "../http/router";
@@ -22,9 +22,8 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
   const compactMatch = p.match(/^(?:\/api)?\/session\/([^/]+)\/(?:summarize|compact)$/);
   if (compactMatch && req.method === "POST") {
     try {
-      const { backend, session } = await resolveSessionRoute(compactMatch[1], dir);
+      const { session } = await resolveSessionRoute(compactMatch[1], dir);
       if (!session) return jsonError("session not found", 404);
-      if (!backend.capabilities.compact) return jsonError("summarize not supported by backend", 501);
       try {
         await compactSession(session);
       } catch (err) {
@@ -78,9 +77,8 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
   if (shellMatch && req.method === "POST") {
     try {
       const openCodeId = shellMatch[1];
-      const { backend, session } = await resolveSessionRoute(openCodeId, dir);
+      const { session } = await resolveSessionRoute(openCodeId, dir);
       if (!session) return jsonError("session not found", 404);
-      if (!backend.capabilities.shell) return jsonError("shell not supported by backend", 400);
       const body = asRecord(await readJson(req));
       const command = typeof body?.command === "string" ? body.command : "";
       const shellID = typeof body?.id === "string" && body.id ? body.id : randomUUID();
@@ -134,11 +132,11 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
   if (sessionGenerateMatch && req.method === "POST") {
     try {
       const sessionID = decodeURIComponent(sessionGenerateMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
       const body = asRecord(await readJson(req));
       if (typeof body?.prompt !== "string" || !body.prompt.trim()) return jsonError("prompt required", 400);
-      const messages = await backend.store.transcript(sessionID, session.directory);
+      const messages = await loadSessionMessages(sessionID, session.directory);
       const history = (messages ?? []).slice(-20).map((message) => {
         const role = message.info.role === "user" ? "User" : message.info.role === "assistant" ? "Assistant" : "";
         if (!role) return "";
@@ -167,19 +165,19 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
   }
 
   // `/experimental/generate/text` is what OpenChamber's own small-model
-  // service (goal progress checks, titles, commit text) calls on its backend.
+  // service (goal progress checks, titles, commit text) calls on its server.
   // The named model runs exactly as asked, through omp.
   if ((p === "/generate/text" || p === "/experimental/generate/text") && req.method === "POST") {
     try {
       const body = asRecord(await readJson(req));
       if (typeof body?.prompt !== "string" || !body.prompt.trim()) return jsonError("prompt required", 400);
       const model = asRecord(body.model);
-      const selection = splitProviderPrefix(typeof model?.providerID === "string" ? model.providerID : "");
+      const providerID = typeof model?.providerID === "string" ? model.providerID : "";
       const modelId = typeof model?.id === "string" ? model.id : undefined;
       const generated = await generateSmallModelText({
         prompt: body.prompt,
         directory: dir ?? process.cwd(),
-        ...(selection.native && modelId ? { model: `${selection.native}/${modelId}` } : {}),
+        ...(providerID && modelId ? { model: `${providerID}/${modelId}` } : {}),
         ...(typeof model?.variant === "string" ? { variant: model.variant } : {}),
       });
       return json({ data: { text: generated.text }, text: generated.text });

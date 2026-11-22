@@ -1,11 +1,7 @@
 /**
- * Backend-agnostic contracts for the provider abstraction.
- *
- * Layering rules (see docs/providers.md):
- *  - `src/providers/types.ts` (this file) is a leaf: it imports only shared
- *    src-level protocol modules and is imported by every backend.
- *  - Backend implementations live under `src/providers/<backendId>/` and may
- *    import shared src modules, but must never import `main.ts` or `src/sessions/`.
+ * Shared wire and domain types: the OpenCode protocol shapes the sidecar
+ * serves (providers, sessions, messages, parts) and the omp-side inputs it
+ * maps from (credentials, goal snapshot). A leaf module: it imports nothing.
  */
 
 // ---------------------------------------------------------------------------
@@ -267,28 +263,10 @@ export interface OpenCodeMessageRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Backends
+// omp goal
 // ---------------------------------------------------------------------------
 
-/**
- * Feature matrix consulted by the sidecar to gate backend-specific routes.
- * `compact` and `shell` gate OpenCode routes that are backed by omp-RPC
- * methods (`summarize`, `bash`); a backend without them returns 501/400.
- */
-export interface BackendCapabilities {
-  thinkingLevels: boolean;
-  images: boolean;
-  approvals: boolean;
-  subagents: boolean;
-  todo: boolean;
-  skills: boolean;
-  compact: boolean;
-  shell: boolean;
-  /** The backend runs goals itself (the agent ends them); the host must not drive its own loop. */
-  goals: boolean;
-}
-
-/** The backend's own goal for a session (omp goal mode): it, not the host, decides when the goal is done. */
+/** omp's own goal for a session (goal mode): omp, not the host, decides when the goal is done. */
 export interface BackendGoalSnapshot {
   status: "active" | "paused" | "complete" | "budget-limited" | "dropped";
   objective: string;
@@ -297,44 +275,3 @@ export interface BackendGoalSnapshot {
 }
 
 export type BackendGoalOp = "create" | "resume" | "pause" | "drop";
-
-export interface SessionUpdateInput {
-  metadata?: Record<string, unknown>;
-  /** Staged revert, with the leaf redo returns to (§3.9). */
-  revert?: { messageID: string; redoLeafId?: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
-  time?: { created?: number; updated?: number; archived?: number | null; viewed?: number };
-}
-
-/** Persistent session storage owned by a backend. */
-export interface SessionStore {
-  create(
-    directory: string | null | undefined,
-    init?: { id?: string; title?: string; parentID?: string; model?: ModelRef; metadata?: Record<string, unknown> },
-  ): Promise<OpenCodeSession>;
-  get(openCodeId: string, directory?: string | null): Promise<OpenCodeSession | null>;
-  list(
-    directory?: string | null,
-    options?: { all?: boolean; limit?: number; archived?: boolean; search?: string },
-  ): Promise<OpenCodeSession[]>;
-  delete(openCodeId: string, directory?: string | null): Promise<boolean>;
-  update(
-    openCodeId: string,
-    updates: SessionUpdateInput,
-    directory?: string | null,
-  ): Promise<OpenCodeSession | null>;
-  children(parentOpenCodeId: string, directory?: string | null): Promise<OpenCodeSession[]>;
-  transcript(openCodeId: string, cwd: string): Promise<OpenCodeMessageRecord[] | null>;
-  getTodos?(openCodeId: string, cwd: string): Promise<OpenCodeTodo[] | undefined>;
-}
-
-/** One agent backend (omp, fake, later Claude Code / Codex). */
-export interface AgentBackend {
-  /** Stable backend id; also the session-id prefix for non-legacy sessions. */
-  id: string;
-  label: string;
-  capabilities: BackendCapabilities;
-  defaultModel: ModelRef;
-  listModels(cwd: string, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse>;
-  store: SessionStore;
-  shutdownAll(): void;
-}

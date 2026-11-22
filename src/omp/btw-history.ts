@@ -7,7 +7,7 @@
  */
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { timeHexFromTimestamp } from "../../shared/message-id";
+import { timeHexFromTimestamp } from "../shared/message-id";
 
 export type BtwStatus = "running" | "complete" | "cancelled" | "error" | "interrupted";
 

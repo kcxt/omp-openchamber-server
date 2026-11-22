@@ -4,7 +4,6 @@
  */
 import { handleOmpConfigRoute, listOmpSlashCommands } from "../adapters/openchamber/omp-config";
 import { listAvailableSkills } from "../adapters/openchamber/discovery";
-import { defaultBackend } from "../providers/registry";
 import { apiOrGet, type RouteContext } from "../http/router";
 import { readJson } from "../http/response";
 import { readOmpConfig, writeOmpConfig } from "../services/settings-file";
@@ -36,7 +35,7 @@ function toV2ConfigEntries(directory: string): Array<{ type: "document"; path: s
       // OpenChamber gates its todo panel on OpenCode's `experimental.todo` flag
       // and turns it off when the config says nothing. omp always has its todo
       // tool, so the sidecar says so explicitly instead of leaving it unset.
-      experimental: { todo: defaultBackend().capabilities.todo },
+      experimental: { todo: true },
     },
   }];
 }

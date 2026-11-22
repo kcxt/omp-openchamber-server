@@ -762,6 +762,4 @@ export function createTerminalRuntime() {
 
   return { handleHttp, ws, shutdown };
 }
-
-export type TerminalRuntime = ReturnType<typeof createTerminalRuntime>;
 export const TERMINAL_WS_PATH = "/api/terminal/ws";

@@ -3,11 +3,11 @@ import { readdir, stat, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { serializeTitleSlot } from "./title";
-import { emitOpenCodeV2Event, emitSessionUpdated } from "../../shared/sse";
-import { readTranscriptSummary } from "../../omp/transcript-reader";
-import { SessionDocs, type SessionDoc, type SessionDocRevert } from "../../store/session-docs";
-import type { OpenCodeSession, TokenBreakdown } from "../types";
+import { serializeTitleSlot } from "../omp/title";
+import { emitOpenCodeV2Event, emitSessionUpdated } from "../shared/sse";
+import { readTranscriptSummary } from "../omp/transcript-reader";
+import { SessionDocs, type SessionDoc, type SessionDocRevert } from "./session-docs";
+import type { OpenCodeSession, TokenBreakdown } from "../shared/types";
 
 import {
   encodeCwd,
@@ -15,7 +15,7 @@ import {
   ompSessionsRoot,
   sameDirectory,
   sessionBucketNames,
-} from "./paths";
+} from "../omp/paths";
 
 export { encodeCwd };
 

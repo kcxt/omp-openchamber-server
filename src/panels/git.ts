@@ -2031,7 +2031,7 @@ function errorRoute(error: Error): GitRouteResult {
   return route({ error: sanitizeGitText(error.message || "Git operation failed") }, 500);
 }
 
-async function generateCommitMessage(directory: string, body: GitRecord): Promise<GitRecord> {
+async function generateCommitMessage(body: GitRecord): Promise<GitRecord> {
   const files = Array.isArray(body.files) ? body.files.filter((value): value is string => isGitString(value) && value.trim().length > 0) : [];
   if (files.length === 0) throw new GitHttpError(400, "No files provided to generate commit message");
   const names = files.map((file) => basename(file)).slice(0, 5);
@@ -2364,7 +2364,7 @@ export async function handleGitRequest(req: Request, url: URL, effectiveDir: str
     }
     if (path === "/api/git/commit-message") {
       if (method !== "POST") return methodError();
-      return route(await generateCommitMessage(directory, await body()));
+      return route(await generateCommitMessage(await body()));
     }
     if (path === "/api/git/pr-description") {
       if (method !== "POST") return methodError();
