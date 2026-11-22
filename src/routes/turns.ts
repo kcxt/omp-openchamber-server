@@ -249,7 +249,7 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return stopMatch[2] === "interrupt" ? json({ interrupted: false }) : json(false);
       const { stopped, withdrawn } = await abortSession(session);
-      // `withdrawn`: queued input Esc took back from omp (D3), returned unsent.
+      // `withdrawn`: queued input Esc took back that could not be sent again (normally empty).
       return stopMatch[2] === "interrupt"
         ? json({ interrupted: stopped, ...(withdrawn ? { withdrawn: { steering: withdrawn.steering, followUp: withdrawn.followUp } } : {}) })
         : json(stopped);

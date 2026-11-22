@@ -77,7 +77,7 @@ Busy is the **parent's own work**: `active` from an accepted prompt or `agent_st
 
 ### Abort
 
-Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagents stop, queued steer/follow-up text is withdrawn and returned in the `/interrupt` response (`withdrawn`), and its inbox bubbles are cancelled. The runtime then waits for the run to stop (`agent_end`, or `get_state.isStreaming === false`), bounded by `ABORT_DEADLINE_MS` (5 s); past the deadline the child's process group is killed, state becomes `closed` and idle is published with `aborted: true`. The next prompt starts a fresh child on the same transcript. Background subagents keep running by design.
+Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagents stop, queued steer/follow-up text is sent again once the run has stopped (same ids; a steer becomes a follow-up), and only what cannot be sent again is returned in the `/interrupt` response (`withdrawn`) with its inbox bubbles cancelled. The runtime then waits for the run to stop (`agent_end`, or `get_state.isStreaming === false`), bounded by `ABORT_DEADLINE_MS` (5 s); past the deadline the child's process group is killed, state becomes `closed` and idle is published with `aborted: true`. The next prompt starts a fresh child on the same transcript. Background subagents keep running by design.
 
 ### Child lifetime
 

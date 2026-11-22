@@ -503,9 +503,13 @@ Esc. `interrupt` answers `{ "interrupted": boolean, "withdrawn"?: { "steering": 
 the legacy `abort` answers a bare boolean.
 
 The sidecar sends omp's `abort_and_restore_queue`: the parent run and its
-synchronous subagents stop, and queued steer/follow-up text is **withdrawn**: it
-is returned in `withdrawn`, its inbox bubbles are cancelled
-(`session.inbox.cancelled`), and it is not re-sent. It waits until the run has
+synchronous subagents stop. Queued steer/follow-up messages are not dropped: once
+the run has stopped they are **sent again** to omp, oldest first, under the ids
+the client already shows. The first starts the next run, the rest follow it, and a
+queued steer becomes a follow-up (`session.inbox.delivery.changed`, `delivery:
+"queue"`). `withdrawn` lists only what could not be sent again (omp refused it or
+the child is gone); those inbox bubbles are cancelled
+(`session.inbox.cancelled`). It waits until the run has
 stopped, bounded by 5 s; past that the omp child is killed, idle is published
 with `aborted: true`, and the next prompt starts a fresh child on the same
 transcript. Background subagents keep running; stop one by sending the abort to

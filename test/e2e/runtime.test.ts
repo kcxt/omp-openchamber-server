@@ -80,27 +80,29 @@ describe("one busy period per omp run", () => {
 });
 
 describe("Esc", () => {
-  test("with queued input: the withdrawn text comes back unsent and the session goes idle", async () => {
+  test("with queued input: the queue is sent again right after the run stops, under the ids the client shows", async () => {
     stack.script([{ when: "hold on", steps: [{ text: "holding " }, { sleep: 20_000 }, { text: "never" }] }]);
     const id = await createSession();
     const rec = await record();
     await prompt(id, { id: "msg_runtimeB0001", parts: [{ type: "text", text: "hold on" }] });
     await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
-    await prompt(id, { id: "msg_runtimeB0002", parts: [{ type: "text", text: "queued one" }], delivery: "queue" });
+    await prompt(id, { id: "msg_runtimeB0002", parts: [{ type: "text", text: "steer one" }], delivery: "steer" });
+    await prompt(id, { id: "msg_runtimeB0003", parts: [{ type: "text", text: "queued one" }], delivery: "queue" });
     await Bun.sleep(200);
 
     const res = await stack.http(`/session/${id}/interrupt?${dir()}`, { method: "POST" });
     expect(res.body.interrupted).toBe(true);
-    expect(res.body.withdrawn).toEqual({ steering: [], followUp: ["queued one"] });
-    await rec.until("idle", () => rec.ended(id).length > 0, 6_000);
+    expect(res.body.withdrawn).toEqual({ steering: [], followUp: [] });
+    await rec.until("both messages delivered", () => rec.of(id, "session.inbox.delivered").length >= 2, 10_000);
+    await rec.until("the resumed run to finish", () => rec.of(id, "session.execution.succeeded").length > 0, 10_000);
     await rec.stop();
 
-    expect(rec.of(id, "session.inbox.cancelled").map((e) => e.data.inboxID)).toEqual(["msg_runtimeB0002"]);
-    expect((await statusMap())[id]).toBeUndefined();
+    expect(rec.of(id, "session.inbox.cancelled")).toEqual([]);
+    expect(rec.of(id, "session.inbox.delivery.changed").map((e) => [e.data.inboxID, e.data.delivery])).toEqual([["msg_runtimeB0002", "queue"]]);
+    expect(rec.of(id, "session.inbox.delivered").map((e) => e.data.inboxID)).toEqual(["msg_runtimeB0001", "msg_runtimeB0002", "msg_runtimeB0003"]);
     expect(stack.frames().some((f) => f.type === "abort_and_restore_queue")).toBe(true);
-    // The withdrawn message never reached omp's transcript.
     const messages = (await stack.http(`/session/${id}/message?${dir()}&order=asc`)).body.data as any[];
-    expect(messages.filter((m) => m.type === "user").map((m) => m.text)).toEqual(["hold on"]);
+    expect(messages.filter((m) => m.type === "user").map((m) => m.text)).toEqual(["hold on", "steer one", "queued one"]);
   });
 
   test("while a background subagent runs: the parent goes idle, the child session stays busy", async () => {

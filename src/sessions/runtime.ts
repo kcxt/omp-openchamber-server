@@ -58,11 +58,22 @@ export interface PromptInput {
   delivery?: "steer" | "queue";
 }
 
-/** Queued input `abort_and_restore_queue` withdrew, with the inbox ids it was announced under. */
+/** One queued prompt `abort_and_restore_queue` took back, under the inbox id it was announced with. */
+interface WithdrawnItem {
+  hostMessageId: string;
+  message: string;
+  images?: ImageContent[];
+  /** How the client queued it. */
+  delivery: "steer" | "queue";
+}
+
+/** Queued input `abort_and_restore_queue` withdrew and the sidecar could not send again, with the inbox ids it was announced under. */
 export interface Withdrawn {
   steering: string[];
   followUp: string[];
   inboxIDs: string[];
+  /** Internal: what {@link SessionRuntime.abort} sends again once the run has stopped. */
+  items?: WithdrawnItem[];
 }
 
 export type SubagentStatus = "running" | "completed" | "failed" | "aborted";
@@ -156,8 +167,13 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function texts(value: unknown): string[] {
-  return Array.isArray(value) ? value.flatMap((item) => typeof record(item)?.text === "string" ? [record(item)!.text as string] : []) : [];
+function restored(value: unknown): Array<{ text: string; images?: ImageContent[] }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const entry = record(item);
+    if (typeof entry?.text !== "string") return [];
+    return [{ text: entry.text, ...(Array.isArray(entry.images) ? { images: entry.images as ImageContent[] } : {}) }];
+  });
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -183,7 +199,7 @@ export class SessionRuntime {
   /** Commands that keep the session busy while they run (compaction). */
   #busyCommands = 0;
   /** Client ids of prompts omp accepted and has not journaled yet, in send order (output assembly). */
-  #undelivered: string[] = [];
+  #undelivered: Array<{ id: string; delivery: "steer" | "queue" }> = [];
   /** Collects `command_output` while the runtime runs a command itself (`/move`). */
   #capture?: string[];
   readonly #aside: AsideStream;
@@ -213,7 +229,7 @@ export class SessionRuntime {
         readTodos: async () => extractTodosFromOmpDetails({ phases: (await this.#getState())?.todoPhases }) ?? undefined,
         journalNotice: (text, level) => this.#journalNotice(text, level),
         delivered: (id) => {
-          this.#undelivered = this.#undelivered.filter((entry) => entry !== id);
+          this.#undelivered = this.#undelivered.filter((entry) => entry.id !== id);
         },
       },
     });
@@ -299,7 +315,7 @@ export class SessionRuntime {
     return this.#serial(async () => {
       this.#assertOpen();
       if (this.#state === "idle") this.#translator.setParent(input.hostMessageId);
-      this.#undelivered.push(input.hostMessageId);
+      this.#undelivered.push({ id: input.hostMessageId, delivery: input.delivery === "steer" ? "steer" : "queue" });
       // A behaviour is always given: omp ignores it when idle, and a run omp
       // starts on its own (a goal continuation) can never refuse the prompt.
       const data = await this.#child.request("prompt", {
@@ -310,7 +326,7 @@ export class SessionRuntime {
       });
       if (record(data)?.agentInvoked === false) {
         // Handled locally (builtin command): omp journals nothing and starts no run.
-        this.#undelivered = this.#undelivered.filter((entry) => entry !== input.hostMessageId);
+        this.#undelivered = this.#undelivered.filter((entry) => entry.id !== input.hostMessageId);
         if (!this.#runLive) this.#translator.finishRun();
       } else if (!this.#runLive) {
         this.#awaitingRun = true;
@@ -360,7 +376,7 @@ export class SessionRuntime {
     if (this.#state !== "active") {
       // Nothing of the parent's runs; a queue an earlier abort stranded is still withdrawn.
       const data = await this.#child.request("abort_and_restore_queue", {}).catch(() => undefined);
-      return this.#withdrawn(data);
+      return this.#resend(this.#withdrawn(data));
     }
     this.#setState("aborting");
     const deadline = Date.now() + ABORT_DEADLINE_MS;
@@ -380,14 +396,45 @@ export class SessionRuntime {
     } catch (err) {
       promptLogger.error({ err, sessionID: this.sessionId }, "[abort] the parent run did not stop; killing the omp child");
       this.close("abort");
-      return withdrawn;
+      return { ...withdrawn, items: undefined };
     }
     this.#awaitingRun = false;
     this.#due = false;
     this.#dueGeneration++;
     this.#undelivered = [];
     this.#setState(this.#runLive ? "active" : "idle", { aborted: true });
-    return withdrawn;
+    return this.#resend(withdrawn);
+  }
+
+  /**
+   * Esc stops the run, not the user's queued messages: what omp took back is sent again,
+   * oldest first, under the ids the client already shows. The first starts the next run and
+   * the rest follow it, so a steer that never reached a step boundary becomes a follow-up
+   * (`session.inbox.delivery.changed`). Returns what could not be sent (the child is gone, or
+   * omp refused it); those inbox items are the caller's to cancel.
+   */
+  async #resend(withdrawn: Withdrawn): Promise<Withdrawn> {
+    const items = withdrawn.items ?? [];
+    const { items: _taken, ...rest } = withdrawn;
+    if (items.length === 0) return rest;
+    for (let sent = 0; sent < items.length; sent++) {
+      const item = items[sent]!;
+      try {
+        await this.prompt({ message: item.message, images: item.images, hostMessageId: item.hostMessageId, delivery: "queue" });
+      } catch (err) {
+        this.#reportProblem(err, "could not send queued messages again after Esc");
+        const left = items.slice(sent);
+        return {
+          steering: left.filter((entry) => entry.delivery === "steer").map((entry) => entry.message),
+          followUp: left.filter((entry) => entry.delivery === "queue").map((entry) => entry.message),
+          inboxIDs: left.map((entry) => entry.hostMessageId),
+        };
+      }
+      if (item.delivery === "steer") {
+        emitOpenCodeV2Event("session.inbox.delivery.changed", { sessionID: this.sessionId, inboxID: item.hostMessageId, delivery: "queue" }, this.cwd);
+      }
+    }
+    return { steering: [], followUp: [], inboxIDs: [] };
   }
 
   /** Compacts the session through its own child. Refused while a run is live. */
@@ -909,11 +956,30 @@ export class SessionRuntime {
    */
   #withdrawn(data: unknown): Withdrawn {
     const value = record(data);
-    const steering = texts(value?.steering);
-    const followUp = texts(value?.followUp);
-    if (steering.length + followUp.length === 0) return { steering, followUp, inboxIDs: [] };
-    const inboxIDs = this.#undelivered.splice(0);
-    return { steering, followUp, inboxIDs };
+    const steering = restored(value?.steering);
+    const followUp = restored(value?.followUp);
+    if (steering.length + followUp.length === 0) return { steering: [], followUp: [], inboxIDs: [] };
+    const undelivered = this.#undelivered.splice(0);
+    // omp reports steering and follow-ups apart, each oldest first; the client ids come in send order.
+    const ids = {
+      steer: undelivered.filter((entry) => entry.delivery === "steer").map((entry) => entry.id),
+      queue: undelivered.filter((entry) => entry.delivery === "queue").map((entry) => entry.id),
+    };
+    const items: WithdrawnItem[] = [];
+    for (const [delivery, list] of [["steer", steering], ["queue", followUp]] as const) {
+      list.forEach((entry, index) => {
+        const hostMessageId = ids[delivery][index];
+        if (hostMessageId) items.push({ hostMessageId, message: entry.text, ...(entry.images?.length ? { images: entry.images } : {}), delivery });
+      });
+    }
+    const sendable = new Set(items.map((item) => item.hostMessageId));
+    return {
+      steering: steering.map((entry) => entry.text),
+      followUp: followUp.map((entry) => entry.text),
+      // Only what cannot be sent again is cancelled.
+      inboxIDs: undelivered.map((entry) => entry.id).filter((id) => !sendable.has(id)),
+      items,
+    };
   }
 
   /**
