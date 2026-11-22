@@ -37,6 +37,16 @@ function hasRealModel(model: Partial<ModelRef> | undefined): model is ModelRef {
   return typeof model?.providerID === "string" && typeof model?.modelID === "string" && !(model.providerID === "omp" && model.modelID === "omp");
 }
 
+/**
+ * Logs a failure and shows it in OpenChamber: a `session.error` is what its chat
+ * view renders as the turn's error, so nothing that fails here is silent.
+ */
+export function reportSessionProblem(session: Pick<OpenCodeSession, "id" | "directory">, err: unknown, what: string): void {
+  const reason = err instanceof Error ? err.message : String(err);
+  promptLogger.error({ err, sessionID: session.id }, `[session] ${what}`);
+  emitSessionError(session.id, { message: `${what}: ${reason}` }, session.directory);
+}
+
 function failure(err: unknown): PromptOutcome {
   if (err instanceof CredentialInputError) return { queued: false, error: err.message, status: err.statusCode };
   if (err instanceof OwnedElsewhereError) return { queued: false, error: err.message, status: 400 };
@@ -128,7 +138,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
         return { queued: false, error: err instanceof Error ? err.message : String(err), status: 502 };
       }
     } else {
-      void runtime.setModel(pick).catch((err) => promptLogger.warn({ err, sessionID: session.id }, "[prompt] model pick not applied mid-run"));
+      void runtime.setModel(pick).catch((err) => reportSessionProblem(session, err, "the model pick was not applied"));
     }
   }
 
@@ -139,7 +149,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
     if (uuid) {
       await SessionDocs.update(uuid, (draft) => {
         draft.visibleParts = { ...draft.visibleParts, [prepared.messageID]: prepared.visibleParts };
-      }).catch((err) => promptLogger.warn({ err, sessionID: session.id }, "[prompt] could not record the visible prompt parts"));
+      }).catch((err) => reportSessionProblem(session, err, "could not record the visible prompt parts"));
     }
   }
 
@@ -157,10 +167,13 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
       });
     }
   } catch (err) {
-    emitSessionError(session.id, err, session.directory);
-    promptLogger.error({ err, sessionID: session.id }, "[prompt] omp refused the prompt");
+    reportSessionProblem(session, err, "omp refused the prompt");
     return failure(err);
   }
+  // A goal armed for this message starts now that the message is admitted: omp
+  // folds the goal into this run instead of starting a run of its own ahead of it.
+  const armed = takeArmedGoal(runtime);
+  if (armed) await startOmpGoal(runtime, armed).catch((err) => reportSessionProblem(session, err, "could not start the goal"));
   return { queued: true, messageID: prepared.messageID };
 }
 
@@ -218,7 +231,7 @@ export async function applySessionModel(session: OpenCodeSession, model: ModelRe
  * Starts (or restarts) omp's goal from what OpenChamber armed. A goal omp still
  * holds from an earlier arming is dropped first: omp allows one goal at a time.
  */
-async function startOmpGoal(runtime: SessionRuntime, change: Extract<GoalChange, { op: "start" | "resume" }>): Promise<void> {
+async function startOmpGoal(runtime: SessionRuntime, change: GoalStart): Promise<void> {
   const held = await runtime.getGoal().catch(() => null);
   if (change.op === "resume" && held) {
     if (held.status === "active") await runtime.goal("pause").catch(() => {}); // re-arms continuation, which omp stopped
@@ -231,15 +244,52 @@ async function startOmpGoal(runtime: SessionRuntime, change: Extract<GoalChange,
   await runtime.goal("create", { objective: change.objective, tokenBudget: change.tokenBudget });
 }
 
+type GoalStart = Extract<GoalChange, { op: "start" | "resume" }>;
+
+/**
+ * How long a goal armed on an idle session waits for the prompt that carries
+ * its objective. OpenChamber writes the goal record and sends that prompt
+ * back to back; creating the goal on an idle omp first would make omp start a
+ * goal run of its own, and the user's message would queue behind it unanswered.
+ */
+const GOAL_PROMPT_GRACE_MS = 1_500;
+
+/** A goal armed on an idle runtime, waiting for its prompt (a timer handle; dies with the runtime). */
+const armedGoals = new WeakMap<SessionRuntime, { change: GoalStart; timer: ReturnType<typeof setTimeout> }>();
+
+function takeArmedGoal(runtime: SessionRuntime): GoalStart | undefined {
+  const armed = armedGoals.get(runtime);
+  if (!armed) return undefined;
+  clearTimeout(armed.timer);
+  armedGoals.delete(runtime);
+  return armed.change;
+}
+
 /** Applies a change OpenChamber made to the session's goal record to omp's goal; omp runs the continuations. */
 export async function applyGoalChange(session: OpenCodeSession, prev: unknown, next: unknown): Promise<void> {
   const change = await goalChangeFor(session.id, ocGoalOf({ openchamber: { goal: prev } }), ocGoalOf({ openchamber: { goal: next } }));
   if (!change) return;
   if (change.op === "pause" || change.op === "drop") {
-    await Registry.get(session.id, session.directory)?.goal(change.op);
+    const runtime = Registry.get(session.id, session.directory);
+    if (!runtime) return;
+    takeArmedGoal(runtime);
+    await runtime.goal(change.op);
     return;
   }
-  await startOmpGoal(await Registry.ensure(session), change);
+  const runtime = await Registry.ensure(session);
+  takeArmedGoal(runtime);
+  if (runtime.state !== "idle") {
+    // A live run takes the goal as a steer; omp continues it after the run.
+    await startOmpGoal(runtime, change);
+    return;
+  }
+  // No prompt within the grace window (the goal dialog's Start): omp starts the goal run itself.
+  const timer = setTimeout(() => {
+    const armed = takeArmedGoal(runtime);
+    if (armed) void startOmpGoal(runtime, armed).catch((err) => reportSessionProblem(session, err, "could not start the goal"));
+  }, GOAL_PROMPT_GRACE_MS);
+  timer.unref?.();
+  armedGoals.set(runtime, { change, timer });
 }
 
 /** `/session/:id/shell`: through the session's runtime when it has one, else a plain shell in the session's directory. */

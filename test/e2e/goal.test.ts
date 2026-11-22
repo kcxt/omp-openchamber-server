@@ -15,7 +15,11 @@ beforeAll(async () => {
 afterAll(() => stack.stop());
 
 const dir = () => encodeURIComponent(stack.project);
-const sessionId = async () => ((await stack.http(`/session?directory=${dir()}`)).body.data as Array<{ id: string }>)[0]!.id;
+/** The session this test just created: the newest by creation time (list order follows `updated`, which an earlier test's late write can move). */
+const sessionId = async () => {
+  const list = (await stack.http(`/session?directory=${dir()}`)).body.data as Array<{ id: string; time: { created: number } }>;
+  return list.reduce((newest, s) => (s.time.created > newest.time.created ? s : newest)).id;
+};
 const status = async (id: string) => (await stack.http(`/session/status?directory=${dir()}`)).body?.[id]?.type ?? "idle";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -59,6 +63,10 @@ describe("omp's own goal mode", () => {
     }
     expect(settled?.status).toBe("complete");
     expect(settled?.statusReason).toBe("reported by agent");
+    // OpenChamber's UI learns of the settled goal from its own metadata broadcast: the goal row shows it complete.
+    const row = page.getByRole("group", { name: "Session goal — open details" });
+    await row.waitFor({ timeout: 15_000 });
+    expect(await row.getByText("Complete", { exact: true }).isVisible()).toBe(true);
     for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
     expect(await status(id)).toBe("idle");
     samples.push("done");
@@ -138,5 +146,40 @@ describe("omp's own goal mode", () => {
     expect(settled?.statusReason).toBe("reported by agent");
     expect(await page.getByText("digested the result").first().isVisible()).toBe(true);
     expect(stack.frames().filter((f) => f.type === "prompt").map((f) => f.message).at(-1)).toBe("kickoff");
+  });
+
+  test("a goal armed with its message: the message is answered first, then omp continues the goal", async () => {
+    stack.script([
+      { when: "(#1)", steps: [{ text: "objective met" }, { goalComplete: true }] },
+      { when: "build it", steps: [{ tool: "bash", args: { command: "make" }, result: "built" }, { text: "on it" }] },
+    ]);
+    await newSession(page);
+    await send(page, "warm up");
+    await page.getByText("Echo: warm up").waitFor();
+    const id = await sessionId();
+
+    // OpenChamber's armed send: the goal record is written, then the message carrying the objective follows at once.
+    const now = Date.now();
+    const goal = { id: "goal4", objective: "build it", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
+    const res = await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
+    });
+    expect(res.ok).toBe(true);
+    await send(page, "build it");
+
+    await page.getByText("on it").first().waitFor({ timeout: 30_000 });
+    await page.getByText("objective met").first().waitFor({ timeout: 30_000 });
+    // omp got the message before the goal: the goal joined that run instead of starting one ahead of it.
+    const frames = stack.frames();
+    const promptAt = frames.findIndex((f) => f.type === "prompt" && String(f.message).includes("build it"));
+    const goalAt = frames.findIndex((f) => f.type === "goal" && f.op === "create" && f.objective === "build it");
+    expect(promptAt).toBeGreaterThanOrEqual(0);
+    expect(goalAt).toBeGreaterThan(promptAt);
+    // Past OpenChamber's 5 s "unanswered" check: the message has its reply.
+    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
+    await sleep(6_000);
+    expect(await page.getByText("OpenCode did not start a reply to this message.").count()).toBe(0);
   });
 });

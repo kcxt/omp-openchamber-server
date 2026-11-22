@@ -39,6 +39,10 @@
 //                    reports `recapDueAt` and a `recap` frame follows. Default off (omp's own default is 240 s).
 //   OMP_STUB_NO_MODELS  1 = no models are available (only `omp session inspect` / `omp models` use it in practice)
 //   OMP_STUB_PROVIDER  provider id of the stub's models (default "stub")
+//   --auto-title      like omp's flag of the same name: the session names itself. Once the first assistant message of a session
+//                    without a title is written, ~40 ms later the stub writes a title into the transcript's title slot and emits
+//                    NO frame, as omp does. The title is the script's top-level `"title"` string, else the first six words of
+//                    the first user message. Without the flag (omp's RPC mode default) a session is never titled.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -62,6 +66,7 @@ const leaseDir = process.env.PI_TEST_SESSION_OWNERS_DIR ?? join(dirname(agentDir
 const TICK = Number(process.env.OMP_STUB_TICK_MS ?? 4);
 const PROVIDER = process.env.OMP_STUB_PROVIDER ?? "stub";
 const NO_MODELS = process.env.OMP_STUB_NO_MODELS === "1";
+const AUTO_TITLE = argv.includes("--auto-title");
 const RECAP_MS = Number(process.env.OMP_STUB_RECAP_MS ?? 0);
 const MODELS = NO_MODELS ? [] : [
   { provider: PROVIDER, id: "fast", name: "Stub Fast", reasoning: false },
@@ -302,6 +307,31 @@ function pickSteps(prompt: string): any[] {
   const turn = script.turns?.find((t) => !t.when || prompt.includes(t.when));
   return turn?.steps ?? [{ text: `Echo: ${prompt}` }];
 }
+
+// --auto-title: the user message that will name the session, and the timer that writes the title.
+let titleInput: string | undefined;
+let titleTimer: ReturnType<typeof setTimeout> | undefined;
+function noteTitleInput(text: string): void {
+  if (AUTO_TITLE && !header.title && titleInput === undefined && text.trim()) titleInput = text;
+}
+function setTitle(title: string): void {
+  header = { ...header, title };
+  if (file) writeFileSync(file, titleSlot(title) + readFileSync(file, "utf8").split("\n").slice(1).join("\n"));
+}
+function armAutoTitle(): void {
+  if (titleInput === undefined || titleTimer || header.title) return;
+  const input = titleInput;
+  titleTimer = setTimeout(() => {
+    titleTimer = undefined;
+    if (header.title) return;
+    let scripted: unknown;
+    const path = process.env.OMP_STUB_SCRIPT;
+    if (path && existsSync(path)) {
+      try { scripted = JSON.parse(readFileSync(path, "utf8")).title; } catch { /* derived below */ }
+    }
+    setTitle(typeof scripted === "string" && scripted.trim() ? scripted.trim() : input.trim().split(/\s+/).slice(0, 6).join(" "));
+  }, 40);
+}
 function usage(outTokens: number) {
   return { input: 100, output: outTokens, cacheRead: 0, cacheWrite: 0, totalTokens: 100 + outTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 }
@@ -434,6 +464,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOp
     out({ type: "turn_start" });
     turnOpen = true;
     const mid = newMessageId();
+    if (!opts.custom && !opts.synthetic && !body.startsWith(GOAL_CONTINUATION)) noteTitleInput(body);
     if (opts.custom) {
       const message = { role: "custom", customType: opts.custom.customType, content: opts.custom.content, display: true, attribution: "agent", timestamp: Date.now() };
       out({ type: "message_start", message, messageId: mid });
@@ -508,6 +539,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOp
     append("message", { message: final });
     out({ type: "message_end", message: final, messageId: mid });
     newMessages.push(final);
+    if (!failure && !aborted) armAutoTitle();
 
     const results: any[] = [];
     if (!final.stopReason.match(/error|aborted/)) {
@@ -1026,7 +1058,7 @@ async function handle(frame: any): Promise<void> {
         const text = last?.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") ?? "";
         return respond(id, type, { text: text || null });
       }
-      case "set_session_name": header = { ...header, title: frame.name }; if (file) writeFileSync(file, titleSlot(frame.name) + readFileSync(file, "utf8").split("\n").slice(1).join("\n")); return respond(id, type);
+      case "set_session_name": setTitle(frame.name); return respond(id, type);
       case "set_todos": todoPhases = frame.phases ?? []; return respond(id, type, {});
       case "prompt": {
         const text = String(frame.message ?? "");

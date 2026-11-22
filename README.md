@@ -19,6 +19,7 @@ bun run src/main.ts --binary /path/to/patched/omp --host 100.x.y.z --port 4096
 | `-b, --binary` (`--omp-bin`) | `OMP_BIN` | the patched omp from the `local` branch (the staged upstream release in `resources/omp`, `bun run prepare:omp`, is only a fallback and lacks the patches) |
 | `-p, --port` | `OC_SIDECAR_PORT` | `4096` |
 | `--host` | `OC_SIDECAR_HOST` | `127.0.0.1` |
+| — | `OC_OPENCHAMBER_URL` | `http://$OPENCHAMBER_HOST:$OPENCHAMBER_PORT`, else `http://127.0.0.1:3000`. Where the sidecar reaches OpenChamber's own server: a goal omp settles is written through OpenChamber's metadata route so its UI shows it. Set it when OpenChamber is bound to a non-loopback address (the launcher's Tailscale default); with `OPENCHAMBER_UI_PASSWORD` set the sidecar logs in with it. Unreachable = the session document is written directly and a warning is logged |
 | — | `LOG_LEVEL` | `info` (`debug` = access log) |
 
 Connect: OpenChamber → **Settings → Remote Instances → Add server** → `http://127.0.0.1:4096`. Or `OPENCODE_HOST=http://127.0.0.1:4096 OPENCODE_SKIP_START=true openchamber serve --foreground`.

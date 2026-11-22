@@ -92,6 +92,8 @@ export class Rig {
       [
         "autoResume: false", "mcp:", "  enableProjectConfig: false", "browser:", "  enabled: false", "  relay: false",
         "goal:", "  continuationModes: [rpc]",
+        // `--auto-title` names a session with the title model alone (no forked reply, no card): one scripted request.
+        "title:", "  generator: tiny", "  icons: boring",
         ...(options.recapSeconds ? ["recap:", `  idleSeconds: ${options.recapSeconds}`] : []),
         "",
       ].join("\n"),
@@ -186,7 +188,8 @@ export class OmpChild {
   }
 
   static start(rig: Rig, cwd: string, args: string[], env: Record<string, string>): OmpChild {
-    const common = ["--mode", "rpc", "--cwd", cwd, "--no-title", "--no-pty", ...args];
+    // Titles are off (`--no-title`) unless the test asks for `--auto-title`, which `--no-title` would cancel.
+    const common = ["--mode", "rpc", "--cwd", cwd, ...(args.includes("--auto-title") ? [] : ["--no-title"]), "--no-pty", ...args];
     const cmd = ompCommand(common);
     const proc = Bun.spawn(cmd, {
       cwd: kind === "real" ? OMP_DIR : REPO,

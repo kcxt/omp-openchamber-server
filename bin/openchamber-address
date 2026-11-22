@@ -1,0 +1,26 @@
+# Sourced by bin/openchamber-serve and bin/omp-server: where OpenChamber's web
+# server listens. Sets $openchamber_host and $openchamber_port.
+#
+# OpenChamber is the only thing exposed to the network. Bind it to the tailnet
+# address when tailscale reports one so other devices (a phone) reach it without
+# a tunnel. Override with OPENCHAMBER_HOST (127.0.0.1 keeps it local-only).
+# openchamber refuses a network-exposed bind without a UI password and its unit
+# would then restart forever, so that case falls back to loopback (saying why).
+
+openchamber_port=${OPENCHAMBER_PORT:-3000}
+openchamber_host=${OPENCHAMBER_HOST:-}
+if [ -z "$openchamber_host" ] && command -v tailscale >/dev/null 2>&1; then
+    openchamber_host=$(tailscale ip -4 2>/dev/null | head -n1)
+fi
+[ -n "$openchamber_host" ] || openchamber_host=127.0.0.1
+
+case "$openchamber_host" in
+127.* | localhost | ::1) ;;
+*)
+    if [ -z "${OPENCHAMBER_UI_PASSWORD:-}" ] && [ "${OPENCHAMBER_ALLOW_UNAUTHENTICATED_LAN:-}" != true ]; then
+        echo "openchamber: no OPENCHAMBER_UI_PASSWORD set, using 127.0.0.1 instead of $openchamber_host" >&2
+        echo "openchamber: put OPENCHAMBER_UI_PASSWORD=... in ~/.config/omp-openchamber-server/env to serve on $openchamber_host" >&2
+        openchamber_host=127.0.0.1
+    fi
+    ;;
+esac

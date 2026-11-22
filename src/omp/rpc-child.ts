@@ -99,6 +99,7 @@ export class RpcChild implements OmpRpcTransport {
       const toolArgs = [
         ...(options.noTools ? ["--no-tools"] : []),
         ...(options.disableExtensions ? ["--no-extensions"] : []),
+        ...(options.autoTitle ? ["--auto-title"] : []),
       ];
       try {
         // detached: the child leads its own process group so kill() can take

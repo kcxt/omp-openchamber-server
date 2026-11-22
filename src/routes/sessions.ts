@@ -1,5 +1,5 @@
 /** Session lifecycle: create, list, get, update, delete, fork, status, view/move/model. */
-import { applyGoalChange, applySessionModel, forkSession, moveSession, removeSession, renameSession, resumeAfterRestart, SessionOpError } from "../sessions/service";
+import { applyGoalChange, applySessionModel, forkSession, moveSession, removeSession, renameSession, reportSessionProblem, resumeAfterRestart, SessionOpError } from "../sessions/service";
 import { addSessionSyntheticContext } from "../sessions/prompt-input";
 import { assertStatusesKnown, SessionStatusUnknownError, sessionStatusMap } from "../sessions/status";
 import { getPendingBlockingRequestsSnapshot, toOpenCodeFormRequest, toOpenCodePermissionRequest } from "../adapters/openchamber/approvals";
@@ -345,9 +345,15 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         );
         if (!updated) return jsonError("session not found", 404);
         // OpenChamber's goal record is served by omp's own goal, not OpenChamber's audit loop.
+        // Awaited: OpenChamber sends the goal's prompt right after this returns, and a failure
+        // must reach it (its goal button re-arms on an error) as well as the chat view.
         if (body?.metadata && "openchamber" in body.metadata) {
-          void applyGoalChange(updated, previousGoal, ocGoalOf(updated.metadata))
-            .catch((err) => logger.warn({ err, sessionID: openCodeId }, "[goal] could not apply the goal change to omp"));
+          try {
+            await applyGoalChange(updated, previousGoal, ocGoalOf(updated.metadata));
+          } catch (err) {
+            reportSessionProblem(updated, err, "could not apply the goal to omp");
+            throw err;
+          }
         }
         return noContent();
       } catch (err) {

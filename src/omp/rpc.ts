@@ -72,6 +72,8 @@ export interface OmpRpcSpawnOptions {
   noTools?: boolean;
   /** Do not load sidecar/project extensions into this embedded OMP child. */
   disableExtensions?: boolean;
+  /** `--auto-title`: omp names the session from its messages, as in its interactive mode (an RPC child never does by default). */
+  autoTitle?: boolean;
 }
 
 /** Stable error for RPC operations whose persisted session cwd was removed. */

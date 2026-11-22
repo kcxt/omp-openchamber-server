@@ -103,6 +103,8 @@ export async function startStack(options: { env?: Record<string, string>; binary
       ...baseEnv,
       OC_SIDECAR_PORT: String(sidecarPort),
       OC_SIDECAR_HOST: "127.0.0.1",
+      // Where the sidecar reaches OpenChamber's own server (goal changes it makes go through its metadata route).
+      OC_OPENCHAMBER_URL: `http://127.0.0.1:${uiPort}`,
     });
   }
   const api = `http://127.0.0.1:${sidecarPort}`;
@@ -126,9 +128,9 @@ export async function startStack(options: { env?: Record<string, string>; binary
     stubBin: STUB,
     env: baseEnv,
 
-    /** Replace the stub's script; takes effect on the next prompt. */
-    script(turns: Turn[]): void {
-      writeFileSync(scriptFile, JSON.stringify({ turns }));
+    /** Replace the stub's script; takes effect on the next prompt. `title` is what the stub's `--auto-title` names a session. */
+    script(turns: Turn[], title?: string): void {
+      writeFileSync(scriptFile, JSON.stringify({ turns, ...(title ? { title } : {}) }));
     },
     /** Frames the sidecar sent to any stub omp, in order. */
     frames(): Array<Record<string, any>> {

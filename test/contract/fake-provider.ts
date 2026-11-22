@@ -31,6 +31,8 @@ export interface ScriptTurn {
 }
 export interface Script {
   turns: ScriptTurn[];
+  /** What `--auto-title` names a session: the stub writes it into the title slot, the fake provider answers omp's title request with it. */
+  title?: string;
 }
 
 export interface RecordedRequest {
@@ -105,6 +107,10 @@ export class FakeProvider {
     body.messages.forEach((m, i) => { if (m.role === "user") lastUser = i; });
     const prompt = lastUser >= 0 ? textOf(body.messages[lastUser]!.content) : "";
     const groupIndex = body.messages.slice(lastUser + 1).filter((m) => m.role === "assistant").length;
+    // omp's title request (`--auto-title`, title.generator: tiny) carries the first message as `<user>…</user>` and wants `<title>…</title>` back.
+    if (this.script.title !== undefined && prompt.startsWith("<user>\n")) {
+      return this.#stream(req, body.model, { content: [{ text: `<title>${this.script.title}</title>` }], tools: [] });
+    }
     const turn = this.script.turns.find((t) => !t.when || prompt.includes(t.when));
     const steps: ScriptStep[] = turn?.steps ?? [{ text: `Echo: ${prompt}` }];
     const group = groupSteps(steps)[groupIndex] ?? { content: [{ text: "ok" }], tools: [] };
