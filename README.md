@@ -19,9 +19,37 @@ omp --version
 
 `bun setup` links `packages/coding-agent/scripts/omp` (a launcher that runs the checkout's TypeScript source) as `omp` in `~/.bun/bin`; make sure that directory is on `PATH`, or symlink the launcher yourself (e.g. `ln -s "$PWD/packages/coding-agent/scripts/omp" ~/bin/omp`). Update with `git pull && bun install`, plus `bun run build:native` when Rust crates or `packages/natives` changed. Nix users: `nix develop` first, then `bun setup`.
 
-Point the sidecar at the binary with `--binary` (or `OMP_BIN`); the systemd launcher `bin/omp-server` uses `$OMP_BIN`, default `~/bin/omp`.
+Point the sidecar at the binary with `--binary` (or `OMP_BIN`); the unit's launcher `bin/omp-server` uses `$OMP_BIN`, default `~/bin/omp`.
 
-## Run
+## Run (systemd, the supported way)
+
+```bash
+bun install
+./install.sh
+systemctl --user daemon-reload
+systemctl --user stop openchamber.service omp-server.service    # only when switching from an older install
+systemctl --user start openchamber.service                      # omp-server.service and its socket start with it
+```
+
+`install.sh` symlinks four things into `~/.config/systemd/user` and `~/bin`, all pointing into this checkout:
+
+| Unit | Role |
+|---|---|
+| `omp-server.socket` | the sidecar's port (`ListenStream=127.0.0.1:4096`), held by systemd so it survives restarts. Change the address or port **here**, not with `--port`. |
+| `omp-server.service` | the sidecar (`bin/omp-server`), loopback backend of OpenChamber. Socket-activated; starts each omp session as an instance of `omp-child@.service` (`omp-child@<session>-<n>`). |
+| `omp-child@.service` | the template for one omp session, and the agents' sandbox (`ProtectSystem=strict`, `ProtectHome=tmpfs`, explicit `BindPaths=`). What to run reaches an instance as credentials (`LoadCredential=`), so provider keys are not in the unit or `ps`; `bin/omp-child` is its launcher. The sidecar's own sandbox is in `omp-server.service`, and `openchamber.service` joins its private `/tmp` (`JoinsNamespaceOf=`), so the terminal panel sees the temp files the agents write. Edit them for your layout. |
+| `openchamber.service` | the network-facing web UI (Tailscale address, needs `OPENCHAMBER_UI_PASSWORD` in `~/.config/omp-openchamber-server/env`, otherwise it binds `127.0.0.1`). |
+
+**Updating is `git pull && systemctl --user restart omp-server.service`.** The port stays open, running omp sessions are not touched, and the new sidecar adopts them; a turn in flight carries on and finishes. Restart `openchamber.service` only when OpenChamber itself changed. How the handover works, what it keeps and what it cannot: [`docs/handover.md`](./docs/handover.md). `systemctl --user list-units 'omp-child@*'` lists the live sessions; `journalctl --user -fu omp-server` follows the sidecar.
+
+Two properties of this setup to know about:
+
+- **The sidecar can reach your user bus** (`BindPaths=%t/bus %t/systemd/private`), because it starts and watches the omp units with `systemctl --user`. Whoever can talk to that bus can start a unit outside the sandbox. The agents cannot: the shared drop-in does not bind it. Treat the sidecar as trusted code.
+- **`clientIp` is `"unknown"`** inside the sidecar: its public socket is systemd's, forwarded to `Bun.serve` over a private unix socket (the peer address is not carried). Irrelevant on loopback.
+
+Needs unprivileged user namespaces for the sandbox (`sysctl kernel.unprivileged_userns_clone=1`) and a running user manager with a session bus (any login session).
+
+### Without systemd (development)
 
 ```bash
 bun install
@@ -29,22 +57,20 @@ bun run src/main.ts                 # http://127.0.0.1:4096
 bun run src/main.ts --binary /path/to/patched/omp --host 100.x.y.z --port 4096
 ```
 
+Here omp sessions are children of the sidecar and **end when it stops**: no handover, no socket. Fine for hacking on the sidecar; use the units for anything you rely on.
+
 | Option | Env | Default |
 |---|---|---|
 | `-b, --binary` (`--omp-bin`) | `OMP_BIN` | the patched omp from the `local` branch (the staged upstream release in `resources/omp`, `bun run prepare:omp`, is only a fallback and lacks the patches) |
-| `-p, --port` | `OC_SIDECAR_PORT` | `4096` |
-| `--host` | `OC_SIDECAR_HOST` | `127.0.0.1` |
+| `-p, --port` | `OC_SIDECAR_PORT` | `4096` (ignored under `omp-server.socket`) |
+| `--host` | `OC_SIDECAR_HOST` | `127.0.0.1` (ignored under `omp-server.socket`) |
+| — | `OC_CHILD_SUPERVISOR` | `systemd` runs each omp session as a transient unit (set by `omp-server.service`); unset = plain child processes |
+| — | `OC_SUPERVISOR_DIR` | where the FIFOs and the adoption ledger live (the unit sets `~/.cache/omp-sidecar`) |
 | — | `LOG_LEVEL` | `info` (`debug` = access log) |
 
+Point the sidecar at the patched omp with `--binary` (or `OMP_BIN`); `bin/omp-server` uses `$OMP_BIN`, default `~/bin/omp`.
+
 Connect: OpenChamber → **Settings → Remote Instances → Add server** → `http://127.0.0.1:4096`. Or `OPENCODE_HOST=http://127.0.0.1:4096 OPENCODE_SKIP_START=true openchamber serve --foreground`.
-
-### systemd user service
-
-```bash
-./install.sh && systemctl --user daemon-reload && systemctl --user enable --now openchamber.service
-```
-
-With the two units, `openchamber.service` is the network-facing web UI (Tailscale address, needs `OPENCHAMBER_UI_PASSWORD` in `~/.config/omp-openchamber-server/env`, otherwise it binds `127.0.0.1`) and `omp-server.service` is its loopback backend. Both are sandboxed (`ProtectSystem=strict`, `ProtectHome=tmpfs`, explicit `BindPaths=`); edit them for your layout. Update = `git pull && systemctl --user restart omp-server openchamber`.
 
 Caller-owned provider credentials: see [`docs/api-reference.md`](./docs/api-reference.md#caller-owned-credentials-opt-in).
 
@@ -113,6 +139,6 @@ CONTRACT_OMP=real bun test test/contract # the same against the patched omp (def
 
 The e2e suite needs `openchamber` on `PATH` and Chromium (`CHROMIUM_PATH` overrides `/usr/bin/chromium`). Each run builds a throwaway `$HOME`, `PI_CODING_AGENT_DIR`, `TMPDIR` and OpenChamber data dir with an explicit child environment, so it never reads `~/.omp` or any API key. `omp` is `test/stub-omp/omp`, a scripted stand-in that speaks omp's RPC protocol and persists sessions the way omp does (bucket naming, `id`/`parentId` tree, session leases, `navigate_tree`/`fork`); `test/e2e/stack.ts` documents its script format. `E2E_KEEP=1` keeps the run directory. The contract suite runs real omp only under an allow-listed environment and a local fake provider (no live credentials). See [`docs/testing.md`](./docs/testing.md).
 
-Layout: `src/server.ts` (Bun.serve + dispatch) · `src/routes/` (HTTP handlers) · `src/sessions/` (runtime, registry, turn translator, status) · `src/omp/` (RPC child, one-shot CLI, transcript reader) · `src/store/` (session docs, importer, catalogue) · `src/panels/` · `src/adapters/openchamber/` (OpenChamber compat) · `src/shared/`. Details in [`docs/architecture.md`](./docs/architecture.md).
+Layout: `src/server.ts` (Bun.serve + dispatch) · `src/routes/` (HTTP handlers) · `src/sessions/` (runtime, registry, turn translator, status) · `src/omp/` (RPC child, systemd supervision, one-shot CLI, transcript reader) · `src/store/` (session docs, catalogue) · `src/panels/` · `src/adapters/openchamber/` (OpenChamber compat) · `src/shared/`. Details in [`docs/architecture.md`](./docs/architecture.md).
 
-Docs: [`architecture`](./docs/architecture.md) · [`api-reference`](./docs/api-reference.md) · [`omp-protocol`](./docs/omp-protocol.md) · [`openchamber-contract`](./docs/openchamber-contract.md) · [`testing`](./docs/testing.md)
+Docs: [`architecture`](./docs/architecture.md) · [`handover`](./docs/handover.md) · [`api-reference`](./docs/api-reference.md) · [`omp-protocol`](./docs/omp-protocol.md) · [`openchamber-contract`](./docs/openchamber-contract.md) · [`testing`](./docs/testing.md)

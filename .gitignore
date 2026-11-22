@@ -7,3 +7,5 @@ bun.lock
 .cache/omp/
 resources/omp/*
 !resources/omp/.gitkeep
+.cache/capsule-last/
+.cache/capsules/

@@ -1,39 +1,32 @@
 # systemd user unit for the omp sidecar: the OpenCode-compatible backend that
-# openchamber.service (the web UI) talks to. It listens on loopback only.
+# openchamber.service (the web UI) talks to. Its port is held by omp-server.socket.
 #
 # install.sh symlinks this file into ~/.config/systemd/user and links
 # ~/bin/omp-server to bin/omp-server in this checkout. ExecStart runs that
 # link, so `git pull` in the checkout + `systemctl --user restart omp-server`
 # is the whole update path: nothing in this unit points at a checkout path.
 #
-# Sandboxing mirrors harness-sandbox.sh (bwrap) with systemd directives:
-#   bwrap                              systemd
-#   --tmpfs / + --ro-bind /usr /opt     ProtectSystem=strict (whole tree ro)
-#   /home not mounted                   ProtectHome=tmpfs (hidden, re-opened by binds)
-#   --bind <dir>                        BindPaths= (writable)
-#   --ro-bind <dir>                     BindReadOnlyPaths=
-#   --tmpfs /tmp                        PrivateTmp=yes
-#   --cap-drop ALL                      user units already run capability-less,
-#                                       plus NoNewPrivileges=
-#   (network was kept for resolver access) network stays enabled: omp needs
-#   HTTPS to model providers, so PrivateNetwork= must stay off
-#
-# In per-user service managers these namespace options imply PrivateUsers=,
-# which needs unprivileged user namespaces enabled in the kernel
-# (sysctl kernel.unprivileged_userns_clone=1 on Arch: unpriv_userns=1).
+# A restart does not touch running omp sessions (docs/handover.md): every omp
+# child is its own unit (an instance of omp-child@.service), the socket stays open,
+# and the new sidecar adopts the children it finds. The agents' sandbox is
+# omp-child@.service; this unit's own is below. Both share one
+# private /tmp (JoinsNamespaceOf=, set on each child), and so does the terminal
+# of openchamber.service.
 
 [Unit]
 Description=omp OpenChamber sidecar (OpenCode API backend)
 Documentation=https://github.com/alvins82/omp-openchamber-server
+Requires=omp-server.socket
+After=omp-server.socket
 
 [Service]
 Type=simple
 ExecStart=%h/bin/omp-server
 Environment=OMP_BIN=%h/bin/omp
-# Loopback only (bin/omp-server default): OpenChamber is the network-facing
-# part. To expose the sidecar itself for OpenChamber's Remote Instances, set
-# OC_SIDECAR_HOST to a tailnet address; it has no auth of its own.
-# Environment=OC_SIDECAR_HOST=100.x.y.z
+# Children as transient units + the handover state they are adopted from. The directory is inside a bound path
+# of the sandbox (ProtectHome=tmpfs hides /run/user).
+Environment=OC_CHILD_SUPERVISOR=systemd
+Environment=OC_SUPERVISOR_DIR=%h/.cache/omp-sidecar
 # Per-request access log, off by default:
 # Environment=LOG_LEVEL=debug
 # Optional secrets (EXA_API_KEY, NVIDIA_API_KEY, ...); missing file is ignored.
@@ -41,24 +34,20 @@ EnvironmentFile=-%h/.config/omp-openchamber-server/env
 Restart=on-failure
 RestartSec=2s
 
-# --- sandbox ---
+# --- sandbox (the agents' is omp-child@.service) ---
+# See that file for the bwrap-to-systemd mapping and the user-namespace requirement. The sidecar runs a few things
+# itself (terminal panel, git, the shell fallback of /session/:id/shell), so it stays sandboxed, but note that it
+# can reach the user manager (below) and so is not a boundary against itself.
 ProtectSystem=strict
 ProtectHome=tmpfs
 PrivateTmp=yes
 NoNewPrivileges=yes
-
-# Writable: OpenChamber's own state (chats live under ~/.config/openchamber),
-# this checkout (repo + omp sources + session workdirs), omp state, toolchain
-# caches. -%h/git is the project root before it moved to /hdd/brute/projects:
-# OpenChamber's project registry and omp's session records still carry
-# /home/cas/git/... paths, so point it at the moved checkouts (ln -s) and they
-# keep resolving here. The "-" keeps the unit alive when ~/git is absent.
-BindPaths=%h/.config/openchamber /hdd/brute/projects -%h/git %h/.omp %h/.pi %h/.paseo %h/.cache %h/.cargo %h/.rustup
-
-# Read-only: the omp binary link itself, bun cache, dotfiles agents read.
+BindPaths=/opt/rocm %h/.config/openchamber /hdd/brute/projects -%h/git %h/.omp %h/.pi %h/.paseo %h/.cache %h/.cargo %h/.rustup
 BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.gitignore %h/.zshrc
 
-# Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
-# lines in harness-sandbox.sh), e.g.:
-# BindPaths=/hdd/brute/projects
-# BindPaths=%t
+# The sidecar starts the children and watches them (systemctl --user), so it, and only it,
+# can reach the user manager: the bus for systemd-run and other clients, the manager's private socket for systemctl (which does not
+# fall back to the bus). That is a sandbox escape by design: whoever can talk to either can start a unit outside
+# the sandbox. The agents the children run cannot: their drop-in binds neither.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+BindPaths=%t/bus %t/systemd/private

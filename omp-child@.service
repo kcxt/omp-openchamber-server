@@ -1,0 +1,64 @@
+# One omp --mode rpc process, serving one OpenChamber session. A template: the sidecar starts an instance per
+# driven session (`systemctl --user start omp-child@<session>-<n>.service`) and adopts the running ones after a
+# restart (docs/handover.md). The instance is not in the sidecar's cgroup, so stopping the sidecar leaves it running.
+#
+# What to run is not in this file: the sidecar hands it over as credentials (LoadCredential=, read by the manager
+# before the sandbox applies, copied into a private read-only directory), and bin/omp-child reads it. That keeps
+# the environment, which can hold provider keys, out of the unit, the manager's property list and `ps`.
+#
+# This is the agents' sandbox. omp-server.service has its own: it stays sandboxed for what it runs itself (terminal
+# panel, git, shell fallback), but it can reach the user manager, which an agent must not (neither %t/bus nor
+# %t/systemd/private is bound here). JoinsNamespaceOf= shares the sidecar's private /tmp, and openchamber.service
+# joins it too, so its terminal sees the temp files the agents write; the mount namespaces themselves stay separate.
+#
+# The sandbox mirrors harness-sandbox.sh (bwrap) with systemd directives:
+#   bwrap                              systemd
+#   --tmpfs / + --ro-bind /usr /opt     ProtectSystem=strict (whole tree ro)
+#   /home not mounted                   ProtectHome=tmpfs (hidden, re-opened by binds)
+#   --bind <dir>                        BindPaths= (writable)
+#   --ro-bind <dir>                     BindReadOnlyPaths=
+#   --tmpfs /tmp                        PrivateTmp=yes
+#   --cap-drop ALL                      user units already run capability-less,
+#                                       plus NoNewPrivileges=
+#   (network was kept for resolver access) network stays enabled: omp needs
+#   HTTPS to model providers, so PrivateNetwork= must stay off
+# In per-user service managers these namespace options imply PrivateUsers=, which needs unprivileged user
+# namespaces enabled in the kernel (sysctl kernel.unprivileged_userns_clone=1; Arch: unpriv_userns=1).
+
+[Unit]
+Description=omp agent session %i
+Documentation=https://github.com/alvins82/omp-openchamber-server
+JoinsNamespaceOf=omp-server.service
+# A failed instance is forgotten, so a name never blocks a later start.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+# Where bin/omp-child finds its FIFOs: the same directory omp-server.service gives the sidecar (OC_SUPERVISOR_DIR).
+Environment=OC_SUPERVISOR_DIR=%h/.cache/omp-sidecar
+LoadCredential=cwd:%h/.cache/omp-sidecar/%i.cwd
+LoadCredential=env:%h/.cache/omp-sidecar/%i.env
+LoadCredential=argv:%h/.cache/omp-sidecar/%i.argv
+ExecStart=%h/bin/omp-child %i
+KillMode=control-group
+TimeoutStopSec=5
+
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Writable: OpenChamber's own state (chats live under ~/.config/openchamber),
+# this checkout (repo + omp sources + session workdirs), omp state, toolchain
+# caches. -%h/git is the project root before it moved to /hdd/brute/projects:
+# OpenChamber's project registry and omp's session records still carry
+# /home/cas/git/... paths, so point it at the moved checkouts (ln -s) and they
+# keep resolving here. The "-" keeps the unit alive when ~/git is absent.
+BindPaths=/opt/rocm %h/.config/openchamber /hdd/brute/projects -%h/git %h/.omp %h/.pi %h/.paseo %h/.cache %h/.cargo %h/.rustup
+
+# Read-only: the omp binary link itself, the launcher, bun cache, dotfiles agents read.
+BindReadOnlyPaths=%h/bin %h/.bun %h/.gitconfig %h/.gitignore %h/.zshrc
+
+# Add host mounts the agent needs (mirrors ~/.config/opencode.mounts --bind
+# lines in harness-sandbox.sh), e.g.:
+# BindPaths=/hdd/brute/projects

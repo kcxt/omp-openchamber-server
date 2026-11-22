@@ -15,6 +15,9 @@ Description=OpenChamber web UI (omp sidecar backend)
 Documentation=https://github.com/alvins82/omp-openchamber-server
 Requires=omp-server.service
 After=omp-server.service
+# Share the sidecar's private /tmp, which the omp agents' units share too: the terminal panel then sees the temp
+# files the agents write. Needs PrivateTmp=yes on both.
+JoinsNamespaceOf=omp-server.service
 
 [Service]
 Type=simple

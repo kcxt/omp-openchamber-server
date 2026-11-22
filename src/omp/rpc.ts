@@ -74,6 +74,8 @@ export interface OmpRpcSpawnOptions {
   disableExtensions?: boolean;
   /** `--auto-title`: omp names the session from its messages, as in its interactive mode (an RPC child never does by default). */
   autoTitle?: boolean;
+  /** Names a supervised child's unit after what it serves (the session id); no effect on a plain child. */
+  label?: string;
 }
 
 /** Stable error for RPC operations whose persisted session cwd was removed. */

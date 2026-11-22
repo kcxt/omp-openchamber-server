@@ -15,6 +15,7 @@ import { routeTable } from "./routes";
 import { terminalRuntime } from "./services/instances";
 import { resolveSidecarConfig, startRuntime } from "./services/runtime";
 import { openChamberDataDir } from "./services/settings-file";
+import { forwardInheritedSocket, internalSocketPath, socketActivated } from "./services/socket-activation";
 
 interface SidecarWebSocketData {
   kind: "events" | "terminal";
@@ -32,9 +33,11 @@ const clientAuth = createClientAuthRuntime({
 
 const webSocketCleanups = new WeakMap<object, () => void>();
 
+const internalPath = socketActivated() ? internalSocketPath() : undefined;
+
 const server = Bun.serve<SidecarWebSocketData>({
-  hostname: config.host,
-  port: config.port,
+  // `unix` and `hostname`/`port` are alternatives that Bun's typings cannot see through a spread.
+  ...(internalPath ? { unix: internalPath } : { hostname: config.host, port: config.port }) as { hostname: string; port: number },
   idleTimeout: 0,
   websocket: {
     open(ws) {
@@ -86,5 +89,8 @@ const server = Bun.serve<SidecarWebSocketData>({
     return res;
   },
 });
+
+// With systemd's socket the public listener is systemd's (socket-activation.ts): Bun.serve stays on a private socket.
+if (socketActivated()) forwardInheritedSocket(internalPath!);
 
 startRuntime(server, config);

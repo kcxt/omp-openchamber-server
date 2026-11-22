@@ -217,6 +217,13 @@ export async function compactSession(session: OpenCodeSession): Promise<void> {
 /** Applies a model pick at once, starting a runtime when none is live; omp journals it. */
 export async function applySessionModel(session: OpenCodeSession, model: ModelRef): Promise<{ applied: boolean; error?: string }> {
   try {
+    if (isSubagentTranscript(session.path)) {
+      // A subagent has no runtime of its own: its parent's omp switches it.
+      const found = Registry.findSubagent(session.id);
+      if (!found) return { applied: false, error: "This subagent belongs to a session that is not running here. Switch models in the parent session instead." };
+      await found.runtime.setSubagentModel(found.subagent.id, model);
+      return { applied: true };
+    }
     const runtime = await Registry.ensure(session);
     await runtime.setModel({ providerID: model.providerID, modelID: model.modelID, variant: model.variant });
     return { applied: true };
@@ -463,9 +470,14 @@ export function removeSession(sessionId: string, cwd: string): void {
   clearSessionApprovals(sessionId);
 }
 
-/** Process shutdown: every runtime and omp child. */
+/** Process shutdown: every runtime and omp child; supervised children are left for the next sidecar. */
 export function shutdownSessions(): void {
   Registry.shutdown();
   OmpCli.shutdown();
   RpcChild.killAll();
+}
+
+/** Startup: takes over the supervised omp children a previous sidecar left running. */
+export function adoptSessions(): Promise<void> {
+  return Registry.adoptAll();
 }

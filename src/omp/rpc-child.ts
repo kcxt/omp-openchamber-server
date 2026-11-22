@@ -1,5 +1,7 @@
+import { rm } from "node:fs/promises";
 import { resolveOmpBinary } from "./binary";
 import { createOmpCredentialRuntime, type OmpCredentialRuntime } from "./credential-runtime";
+import { FifoProcess } from "./fifo-process";
 import {
   assertWorkingDirectory,
   embeddedOmpConfigOverlay,
@@ -8,6 +10,15 @@ import {
   type OmpRpcSpawnOptions,
   type OmpRpcTransport,
 } from "./rpc";
+import {
+  childUnitState,
+  newHandle,
+  removeRecord,
+  startChildUnit,
+  supervised,
+  writeRecord,
+  type ChildRecord,
+} from "./supervisor";
 
 /** Minimal surface of the spawned process the transport needs. */
 interface RpcProcess {
@@ -58,6 +69,10 @@ export class RpcChild implements OmpRpcTransport {
   #dead = false;
   #cleanup?: () => Promise<void> | void;
   #cleanupStarted = false;
+  #record?: ChildRecord;
+  #fifo?: FifoProcess;
+  #monitor?: ReturnType<typeof setInterval>;
+  #released = false;
 
   static killAll(): void {
     for (const child of [...RpcChild.#active]) {
@@ -70,15 +85,32 @@ export class RpcChild implements OmpRpcTransport {
     RpcChild.#active.clear();
   }
 
-  private constructor(proc: RpcProcess, reader: ReadableStreamDefaultReader<Uint8Array>, cleanup?: () => Promise<void> | void) {
+  private constructor(
+    proc: RpcProcess,
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    cleanup?: () => Promise<void> | void,
+    record?: ChildRecord,
+    fifo?: FifoProcess,
+  ) {
     this.#proc = proc;
     this.#reader = reader;
     this.#cleanup = cleanup;
+    this.#record = record;
+    this.#fifo = fifo;
     // `ready` may never arrive (flaky subsystems can withhold it); a later
     // rejection of the already-abandoned promise must not crash the process.
     this.#ready.promise.catch(() => {});
     RpcChild.#active.add(this);
     this.#pump();
+    // A unit that vanishes without writing its closing frame (stopped from outside, killed with its wrapper).
+    if (fifo) {
+      this.#monitor = setInterval(() => {
+        void childUnitState(fifo.handle.unit).then((state) => {
+          if (!state.active) this.#closedUnit({ type: "rpc_process_closed" });
+        });
+      }, 2_000);
+      this.#monitor.unref?.();
+    }
   }
 
   static async spawn(cwd: string, maxAttempts = 3, options: OmpRpcSpawnOptions = {}): Promise<RpcChild> {
@@ -102,24 +134,21 @@ export class RpcChild implements OmpRpcTransport {
         ...(options.autoTitle ? ["--auto-title"] : []),
       ];
       try {
-        // detached: the child leads its own process group so kill() can take
-        // down MCP/LSP grandchildren instead of orphaning them.
-        const proc = Bun.spawn(
-          [omp, "--mode", "rpc", "--cwd", cwd, "--no-pty", "--config", embeddedOmpConfigOverlay(), ...toolArgs, ...extArgs],
-          {
-            stdin: "pipe",
-            stdout: "pipe",
-            stderr: "inherit",
-            detached: true,
-            env: {
-              ...Bun.env,
-              ...(credentialRuntime?.env ?? {}),
-              PI_SKIP_VERSION_CHECK: "1",
-            },
-          },
-        );
-        const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
-        child = new RpcChild(proc, reader, credentialRuntime?.cleanup);
+        const argv = [omp, "--mode", "rpc", "--cwd", cwd, "--no-pty", "--config", embeddedOmpConfigOverlay(), ...toolArgs, ...extArgs];
+        const env = { ...Bun.env, ...(credentialRuntime?.env ?? {}), PI_SKIP_VERSION_CHECK: "1" };
+        if (supervised()) {
+          const handle = newHandle(options.label ?? "child");
+          const pid = await startChildUnit(handle, { argv, cwd, env });
+          const fifo = new FifoProcess(handle, pid);
+          const record: ChildRecord = { ...handle, cwd, ...(credentialRuntime ? { credentialDir: credentialRuntime.agentDir } : {}) };
+          writeRecord(record);
+          child = new RpcChild(fifo, fifo.stdout.getReader(), credentialRuntime?.cleanup, record, fifo);
+        } else {
+          // detached: the child leads its own process group so kill() can take
+          // down MCP/LSP grandchildren instead of orphaning them.
+          const proc = Bun.spawn(argv, { stdin: "pipe", stdout: "pipe", stderr: "inherit", detached: true, env });
+          child = new RpcChild(proc, (proc.stdout as ReadableStream<Uint8Array>).getReader(), credentialRuntime?.cleanup);
+        }
         // Readiness is proven by the first real RPC response, not the
         // `ready` frame: omp processes pre-`ready` frames in order, but
         // `ready` itself can be withheld by flaky subsystems (MCP servers,
@@ -161,14 +190,17 @@ export class RpcChild implements OmpRpcTransport {
         const message = err instanceof Error ? err.message : String(err);
         this.#fail(new Error(`RPC stdout read error: ${message}`));
       } finally {
-        // A close nobody asked for (crash, OOM kill) must reach the turn
-        // listeners, or the session stays "busy" with its last tool running.
-        const unexpected = !this.#dead;
-        this.#dead = true;
-        RpcChild.#active.delete(this);
-        this.#fail(new Error("RPC process closed"));
-        if (unexpected) this.#handleFrame({ type: "rpc_process_closed" });
-        this.#cleanupOnce();
+        // A released child is still running: nothing ended.
+        if (!this.#released) {
+          // A close nobody asked for (crash, OOM kill) must reach the turn
+          // listeners, or the session stays "busy" with its last tool running.
+          const unexpected = !this.#dead;
+          this.#dead = true;
+          RpcChild.#active.delete(this);
+          this.#fail(new Error("RPC process closed"));
+          if (unexpected) this.#handleFrame({ type: "rpc_process_closed" });
+          this.#cleanupOnce();
+        }
       }
     })();
   }
@@ -205,6 +237,7 @@ export class RpcChild implements OmpRpcTransport {
   }
 
   #handleFrame(frame: Record<string, unknown>): void {
+    if (frame.type === "rpc_process_closed" && this.#fifo) return this.#closedUnit(frame as OmpRpcEvent);
     if (frame.type === "ready") {
       this.#ready.resolve();
       return;
@@ -229,16 +262,30 @@ export class RpcChild implements OmpRpcTransport {
       }
       return;
     }
-    if (typeof frame.type === "string") {
-      const event = frame as OmpRpcEvent;
-      for (const listener of this.#listeners) {
-        try {
-          listener(event);
-        } catch {
-          // ignore listener errors
-        }
+    if (typeof frame.type === "string") this.#emit(frame as OmpRpcEvent);
+  }
+
+  #emit(event: OmpRpcEvent): void {
+    for (const listener of this.#listeners) {
+      try {
+        listener(event);
+      } catch {
+        // ignore listener errors
       }
     }
+  }
+
+  /** A supervised child ended: the wrapper's closing frame, or its unit vanishing without one. */
+  #closedUnit(frame: OmpRpcEvent): void {
+    if (this.#dead) return;
+    this.#dead = true;
+    RpcChild.#active.delete(this);
+    clearInterval(this.#monitor);
+    this.#fail(new Error("RPC process closed"));
+    this.#emit(frame);
+    this.#fifo?.release();
+    if (this.#record) removeRecord(this.#record);
+    this.#cleanupOnce();
   }
 
   #fail(err: Error): void {
@@ -300,8 +347,16 @@ export class RpcChild implements OmpRpcTransport {
   kill(): void {
     RpcChild.#active.delete(this);
     this.#dead = true;
+    clearInterval(this.#monitor);
     this.#fail(new Error("RPC killed"));
     this.#cleanupOnce();
+    if (this.#fifo) {
+      // The unit is the process group: stopping it takes MCP/LSP grandchildren along.
+      this.#fifo.kill();
+      this.#fifo.release();
+      if (this.#record) removeRecord(this.#record);
+      return;
+    }
     const pid = this.#proc.pid;
     if (pid > 0) {
       try {
@@ -319,5 +374,60 @@ export class RpcChild implements OmpRpcTransport {
     } catch {
       // ignore
     }
+  }
+
+  // ------------------------------------------------------------------ supervision (supervisor.ts)
+
+  /** The ledger record of a supervised child; undefined for a child of this process. */
+  get record(): ChildRecord | undefined {
+    return this.#record;
+  }
+
+  /** Adds what the owning runtime knows (session, transcript, credentials) to the ledger record. */
+  annotate(fields: Partial<ChildRecord>): void {
+    if (!this.#record || this.#dead) return;
+    this.#record = { ...this.#record, ...fields };
+    writeRecord(this.#record);
+  }
+
+  /**
+   * Lets go of a supervised child without touching it, for a sidecar that is going away: the child
+   * keeps running and a new sidecar adopts it. A partial line already read is kept in the ledger so
+   * the next reader starts on a frame boundary.
+   */
+  release(): void {
+    if (!this.#fifo || !this.#record) return this.kill();
+    this.#released = true;
+    this.#dead = true;
+    RpcChild.#active.delete(this);
+    clearInterval(this.#monitor);
+    this.#fail(new Error("RPC released"));
+    writeRecord({ ...this.#record, rest: this.#buffer });
+    void this.#reader.cancel().catch(() => {});
+    this.#fifo.release();
+  }
+
+  /** Takes over a child a previous sidecar left running. Rejects when it is gone or does not answer. */
+  static async attach(record: ChildRecord): Promise<RpcChild> {
+    const state = await childUnitState(record.unit);
+    if (!state.active) throw new Error(`${record.unit} is not running`);
+    const fifo = new FifoProcess(record, state.mainPid);
+    const credentialDir = record.credentialDir;
+    const child = new RpcChild(
+      fifo,
+      fifo.stdout.getReader(),
+      credentialDir ? () => rm(credentialDir, { recursive: true, force: true }) : undefined,
+      { ...record, rest: undefined },
+      fifo,
+    );
+    if (record.rest) child.#buffer = record.rest;
+    try {
+      await withTimeout(child.request("get_state").then(() => {}), 10_000, `${record.unit} did not answer get_state`);
+      await child.request("set_subagent_subscription", { level: "events" }).catch(() => {});
+    } catch (err) {
+      child.kill();
+      throw err;
+    }
+    return child;
   }
 }

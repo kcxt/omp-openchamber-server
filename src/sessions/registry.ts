@@ -4,9 +4,10 @@
  * session is driven through its parent's runtime, never by a second omp child
  * writing the parent's artifact file.
  */
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { credentialInputFingerprint, resolveBackendCredentials } from "../omp/credentials";
+import { liveChildUnits, readRecords, removeRecord, stopChildUnit, supervised } from "../omp/supervisor";
 import { withOmpRecapAssist } from "./recap";
 import { getOmpSessionByOpenCodeId, updateOmpSession } from "../store/sessions";
 import type { BackendCredentialInput } from "../shared/types";
@@ -129,8 +130,42 @@ export const Registry = {
     Registry.get(sessionId, cwd)?.close(reason);
   },
 
+  /**
+   * Takes over the supervised omp children a previous sidecar left running (`omp/supervisor.ts`). A
+   * record whose unit is gone is dropped; a running unit nobody has a record for is stopped.
+   */
+  async adoptAll(): Promise<void> {
+    if (!supervised()) return;
+    const live = await liveChildUnits();
+    const known = new Set<string>();
+    for (const record of readRecords()) {
+      known.add(record.unit);
+      if (!live.has(record.unit) || !record.sessionId) {
+        if (live.has(record.unit)) await stopChildUnit(record.unit);
+        if (record.credentialDir) rmSync(record.credentialDir, { recursive: true, force: true });
+        removeRecord(record);
+        continue;
+      }
+      try {
+        const runtime = await SessionRuntime.adopt(record);
+        adopt(keyOf(runtime.sessionId, runtime.cwd), runtime);
+        // The runtime was busy before anyone listened.
+        if (busyOf(runtime.state)) emitSessionStatus(runtime.sessionId, { type: "busy" }, runtime.cwd);
+        promptLogger.info({ sessionID: runtime.sessionId, unit: record.unit, state: runtime.state }, "[runtime] adopted a running omp child");
+      } catch (err) {
+        promptLogger.warn({ err, sessionID: record.sessionId, unit: record.unit }, "[runtime] could not adopt an omp child; stopping it");
+        await stopChildUnit(record.unit);
+      }
+    }
+    for (const unit of live) if (!known.has(unit)) await stopChildUnit(unit);
+  },
+
+  /** Sidecar shutdown: supervised children stay for the next sidecar, the rest are closed. */
   shutdown(): void {
-    for (const runtime of Registry.all()) runtime.close("shutdown");
+    for (const runtime of Registry.all()) {
+      if (supervised()) runtime.release();
+      else runtime.close("shutdown");
+    }
     runtimes.clear();
   },
 };

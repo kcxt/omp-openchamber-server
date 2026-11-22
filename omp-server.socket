@@ -1,0 +1,14 @@
+# The sidecar's public port, held by systemd so it survives a sidecar restart: connections made while a new
+# release starts wait in this socket's backlog and are served by the new process (docs/handover.md).
+#
+# Loopback only: the sidecar has no auth of its own and openchamber.service (the network-facing half) talks to
+# it here. To expose it for OpenChamber's Remote Instances, replace the address with a tailnet one
+# (`systemctl --user edit omp-server.socket`).
+#
+# The port is set here, not by OC_SIDECAR_PORT / --port: with this socket the sidecar listens on systemd's fd.
+
+[Unit]
+Description=omp OpenChamber sidecar socket
+
+[Socket]
+ListenStream=127.0.0.1:4096

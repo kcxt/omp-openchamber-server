@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parseCliArgs, printHelp } from "../adapters/openchamber/cli";
 import { resolveProviderConnection, resolveSmallModel } from "../adapters/openchamber/small-model";
-import { shutdownSessions } from "../sessions/service";
+import { adoptSessions, shutdownSessions } from "../sessions/service";
 import { stopFollowingAll } from "../adapters/openchamber/follow";
 import { listOmpSessions } from "../store/sessions";
 import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBinary } from "../omp/binary";
@@ -13,7 +13,10 @@ import { logger } from "../shared/logger";
 import { setSidecarUrl } from "../shared/endpoint";
 import { browserControlBroker, messageQueueRuntime, terminalRuntime } from "./instances";
 import { openChamberDataDir } from "./settings-file";
-import { runImporter } from "../store/importer";
+import { drainForwarder, socketActivated } from "./socket-activation";
+
+/** How long a shutdown waits for requests in flight when systemd holds the public socket. */
+const DRAIN_MS = 1_500;
 
 export interface SidecarConfig {
   host: string;
@@ -47,10 +50,6 @@ export async function resolveSidecarConfig(): Promise<SidecarConfig> {
   if (options.host) process.env.OC_SIDECAR_HOST = options.host;
 
   await ensureOmpBinary();
-  // Before any omp child can open a session: transcripts must hold only omp's own entries.
-  const migration = await runImporter();
-  if (migration.errors.length > 0) logger.warn({ errors: migration.errors }, "[sidecar] session data migration left errors; affected sessions keep their old files");
-  else if (migration.sessions.length > 0) logger.info({ sessions: migration.sessions.length }, "[sidecar] migrated sidecar session records");
 
   return {
     host: process.env.OC_SIDECAR_HOST || "127.0.0.1",
@@ -111,6 +110,7 @@ export function startRuntime(server: { port?: number; stop(closeActiveConnection
   logStartupBanner(config.host, server.port);
   publishEndpoint(config.host, server.port ?? config.port);
   messageQueueRuntime.start();
+  void adoptSessions().catch((err) => logger.warn({ err }, "[sidecar] could not adopt running omp children"));
   const stopOmpUpdateChecker = startOmpUpdateChecker();
 
   // Parse every session header once, in the background, so OpenChamber's first
@@ -165,12 +165,17 @@ export function startRuntime(server: { port?: number; stop(closeActiveConnection
     } catch {
       // ignore
     }
-    try {
-      server.stop(true);
-    } catch {
-      // ignore
-    }
-    process.exit(0);
+    // Behind systemd's socket, in-flight requests get a moment to finish before the process goes (socket-activation.ts).
+    const finish = () => {
+      try {
+        server.stop(true);
+      } catch {
+        // ignore
+      }
+      process.exit(0);
+    };
+    if (socketActivated()) void drainForwarder(DRAIN_MS).then(finish);
+    else finish();
   }
 
   // Leave the terminal in normal line mode on process exit in case shutdown began

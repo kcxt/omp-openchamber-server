@@ -1,0 +1,30 @@
+#!/bin/bash
+# The body of omp-child@.service: one omp --mode rpc process, with its stdin and stdout on two named FIFOs.
+# $1 is the instance name. What to run comes from the unit's credentials (the sidecar writes them, systemd copies
+# them into $CREDENTIALS_DIRECTORY, the secrets never sit in the unit or its environment):
+#   cwd    NUL-terminated working directory
+#   env    NUL-separated KEY=VALUE pairs
+#   argv   NUL-separated command line
+#
+# Both FIFOs are opened read-write: the child is then a reader and a writer of its own pipes, so the sidecar going
+# away (a restart) is neither EOF on stdin nor EPIPE on stdout. When omp exits, one closing frame is written into
+# `out`, so its death reaches whichever sidecar is attached, in order (docs/handover.md).
+
+set -u
+instance=$1
+dir=${OC_SUPERVISOR_DIR:?OC_SUPERVISOR_DIR is not set}
+creds=${CREDENTIALS_DIRECTORY:?no credentials}
+
+IFS= read -r -d '' cwd < "$creds/cwd"
+mapfile -d '' -t envs < "$creds/env"
+mapfile -d '' -t argv < "$creds/argv"
+# The sources the manager read them from: a provider key stays on disk only until here (the sidecar cannot remove
+# them, `systemctl start` returns before the manager has read them).
+rm -f -- "$dir/$instance.cwd" "$dir/$instance.env" "$dir/$instance.argv"
+[ "${#argv[@]}" -gt 0 ] || { echo "omp-child: empty argv" >&2; exit 64; }
+
+cd "$cwd" || { echo "omp-child: cannot enter working directory '$cwd' (cwd bytes: $(printf %s "$cwd" | od -c | head -2 | tr -s ' '))" >&2; exit 66; }
+env -- "${envs[@]}" "${argv[@]}" 0<>"$dir/$instance.in" 1<>"$dir/$instance.out"
+code=$?
+printf '{"type":"rpc_process_closed","exitCode":%s}\n' "$code" 1<>"$dir/$instance.out"
+exit "$code"

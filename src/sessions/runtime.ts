@@ -11,6 +11,7 @@
  * busy instead.
  */
 import { RpcChild } from "../omp/rpc-child";
+import type { ChildRecord } from "../omp/supervisor";
 import { readOmpConfigSmallModel } from "../adapters/openchamber/small-model";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
@@ -231,10 +232,34 @@ export class SessionRuntime {
     credential?: BackendCredentials;
     credentialFingerprint?: string;
   }): Promise<SessionRuntime> {
-    const child = await RpcChild.spawn(init.cwd, 3, { autoTitle: true, ...(init.credential ? { credential: init.credential } : {}) });
+    const child = await RpcChild.spawn(init.cwd, 3, { autoTitle: true, label: init.sessionId, ...(init.credential ? { credential: init.credential } : {}) });
     const runtime = new SessionRuntime(child, init);
     try {
       await runtime.#open();
+    } catch (err) {
+      runtime.close("crash");
+      throw err;
+    }
+    child.annotate({ sessionId: init.sessionId, transcriptPath: runtime.#transcriptPath, credentialFingerprint: init.credentialFingerprint });
+    return runtime;
+  }
+
+  /**
+   * Takes over a supervised child a previous sidecar left running (`omp/supervisor.ts`). Nothing is
+   * cached across the handover: busy/idle, the model, the title and running subagents are read back
+   * from omp, and a run still streaming keeps the session busy until its own `agent_end`.
+   */
+  static async adopt(record: ChildRecord): Promise<SessionRuntime> {
+    if (!record.sessionId || !record.transcriptPath) throw new Error(`${record.unit} has no session`);
+    const child = await RpcChild.attach(record);
+    const runtime = new SessionRuntime(child, {
+      sessionId: record.sessionId,
+      cwd: record.cwd,
+      transcriptPath: record.transcriptPath,
+      credentialFingerprint: record.credentialFingerprint,
+    });
+    try {
+      await runtime.#reattach();
     } catch (err) {
       runtime.close("crash");
       throw err;
@@ -531,6 +556,29 @@ export class SessionRuntime {
     return this.#child.request("steer_subagent", { subagentId, message });
   }
 
+  /**
+   * `/switch` on a subagent's session: omp switches that subagent alone and persists nothing. A `default`
+   * effort sends no level, so omp applies the model's default for the subagent.
+   * Throws when omp refuses the subagent or the model.
+   */
+  async setSubagentModel(subagentId: string, pick: ModelPick): Promise<void> {
+    this.#assertOpen();
+    const level = isDefaultVariant(pick.variant) ? undefined : ompThinkingLevel(pick.variant);
+    try {
+      await this.#child.request("set_subagent_model", {
+        subagentId,
+        provider: pick.providerID,
+        modelId: pick.modelID,
+        ...(level ? { level } : {}),
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message.replace(/^RPC set_subagent_model: /, "") : String(err);
+      throw new Error(`could not switch to ${pick.providerID}/${pick.modelID}: ${reason}`);
+    }
+    const entry = this.#subagents.get(subagentId);
+    if (entry?.translator) entry.translator.model = { providerID: pick.providerID, modelID: pick.modelID, variant: pick.variant ?? "default" };
+  }
+
   cancelSubagent(subagentId: string): Promise<unknown> {
     this.#assertOpen();
     return this.#child.request("cancel_subagent", { subagentId });
@@ -545,7 +593,7 @@ export class SessionRuntime {
       id: entry.id,
       sessionID: this.sessionId,
       status: "running",
-      title: entry.description,
+      title: entry.id,
       time: { started: entry.startedAt },
       kind: "subagent",
       childSessionID: entry.childSessionId!,
@@ -571,6 +619,21 @@ export class SessionRuntime {
   }
 
   // ------------------------------------------------------------------ lifecycle
+
+  /**
+   * The sidecar is going away and this child stays: no kill, nothing is announced as ended. A new
+   * sidecar adopts it (`adopt`). Unsupervised children cannot outlive the sidecar and are closed.
+   */
+  release(): void {
+    if (this.#state === "closed") return;
+    if (!this.#child.record) return this.close("shutdown");
+    this.#state = "closed";
+    clearTimeout(this.#pollTimer);
+    clearTimeout(this.#releaseTimer);
+    this.#unsubscribe();
+    this.#child.release();
+    logger.debug({ sessionID: this.sessionId }, "[runtime] released to the next sidecar");
+  }
 
   close(reason: CloseReason): void {
     if (this.#state === "closed") return;
@@ -660,6 +723,31 @@ export class SessionRuntime {
     this.#state = "idle";
     for (const listener of this.#stateListeners) listener({ state: "idle", previous: "starting" });
     this.#recompute();
+    this.#armRelease();
+  }
+
+  async #reattach(): Promise<void> {
+    const state = await this.#getState();
+    if (!state) throw new Error("the adopted omp child did not report its state");
+    if (typeof state.sessionFile === "string") this.#transcriptPath = state.sessionFile;
+    const model = record(state.model);
+    if (typeof model?.provider === "string" && typeof model.id === "string") {
+      this.#translator.model = { providerID: model.provider, modelID: model.id, variant: typeof state.thinkingLevel === "string" ? state.thinkingLevel : "default" };
+    }
+    this.#publishedTitle = (await readTranscriptSummary(this.#transcriptPath).catch(() => null))?.title;
+    // Subagents the previous sidecar was following: re-announced as started, so their child sessions are followed again.
+    const snapshot = record(await this.#child.request("get_subagents").catch(() => undefined));
+    for (const entry of Array.isArray(snapshot?.subagents) ? snapshot.subagents : []) {
+      const sub = record(entry);
+      if (!sub || (sub.status !== "running" && sub.status !== "pending")) continue;
+      this.#onSubagentFrame({ type: "subagent_lifecycle", payload: { id: sub.id, agent: sub.agent, description: sub.description, sessionFile: sub.sessionFile, status: "started" } } as OmpFrame);
+    }
+    this.#runLive = state.isStreaming === true;
+    this.#state = "idle";
+    for (const listener of this.#stateListeners) listener({ state: "idle", previous: "starting" });
+    this.#recompute();
+    // A run omp decided to start while no sidecar was attached (a goal continuation) is found the same way a run's end finds it.
+    if (!this.#runLive) void this.#checkDue();
     this.#armRelease();
   }
 
@@ -907,9 +995,11 @@ export class SessionRuntime {
       projectID: "global",
       directory: this.cwd,
       path: entry.sessionFile ?? "",
-      title: entry.description,
+      title: entry.id,
       parentID: this.sessionId,
-      agent: entry.agent,
+      // OpenChamber knows only the `omp` agent: omp's own agent type ("task", …) here makes it drop the
+      // session's model/effort for its own defaults. The type stays on the job and the description.
+      agent: "omp",
       model: { id: model.modelID, providerID: model.providerID, modelID: model.modelID, variant: model.variant },
       version: "0.0.0",
       time: { created: entry.startedAt, updated: Date.now() },

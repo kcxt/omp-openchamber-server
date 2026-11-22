@@ -82,7 +82,7 @@ Last run: e2e 78/78, contract on the stub 99/99.
 1. **Stub fidelity.** Now diffed against the real omp by `test/contract` (`docs/research/R7.md` lists what differed and was fixed). Remaining differences: goal continuations, auto-compaction, retries, approval round trips and image prompts are modelled from source or not at all; `session_exit` records written when a child is SIGTERMed are not asserted.
 2. **Ownership probe cost.** Status of an undriven session runs `omp session lease` (batched, ~0.2 s) and the first transcript read starts an `inspect` prefetch (~2 s). A terminal omp that has the session open but has not written yet holds no lease and cannot be detected; the driven path is safe because the child claims the lease on open (P3).
 3. **Approvals** during a turn, images, files and `credentialRef` have no coverage.
-4. **Importer** (`src/store/importer.ts`): `bun test test/importer.test.ts` covers a transcript with interleaved legacy lines plus a `.jsonl.oc`, a clean transcript, an orphan `.jsonl.oc`, dry run and a second run. Not covered: title-DB message ids (`history.db`), a transcript changing during the rewrite.
+4. **Handover under systemd** (`test/systemd`, `docs/handover.md`): restart mid-turn, no refused request, a dying child. Not covered: an adopted child with caller-owned credentials, a restart with a pending approval, the shipped unit files themselves (the capsule runs mirrors of them).
 5. **OpenChamber-owned failures** seen in panels and deliberately ignored: `/api/source-control/binding` (422, no GitHub binding) and `/api/git/worktrees/archives` (500) come from OpenChamber's own web server, not the sidecar.
-6. Deleting sessions from the UI, large or compacted histories.
+6. Large or compacted histories.
 7. Websocket event delivery and the `503` unknown-status path.
