@@ -112,8 +112,10 @@ describe(`subagent frames (${rig.kind})`, () => {
     expect(listed.map((s) => s.id)).toEqual(["Sleeper"]);
     expect(listed[0].status).toBe("running");
     expect(typeof listed[0].sessionFile).toBe("string");
-    const steer = await c.send({ type: "steer_subagent", subagentId: "Sleeper", message: "keep going" });
+    const steer = await c.send({ type: "steer_subagent", subagentId: "Sleeper", message: "keep going", hostMessageId: "host-sub-steer" });
     expect(steer.success).toBe(true);
+    expect((await c.send({ type: "get_queued_prompts", subagentId: "Nobody" })).success).toBe(false);
+    expect((await c.send({ type: "get_queued_prompts", subagentId: "Sleeper" })).success).toBe(true);
     expect((await c.send({ type: "set_subagent_model", subagentId: "Sleeper", provider: "fake", modelId: "smart" })).success).toBe(true);
     expect((await c.send({ type: "set_subagent_model", subagentId: "Sleeper", provider: "fake", modelId: "nope" })).success).toBe(false);
     expect((await c.send({ type: "set_subagent_model", subagentId: "Nobody", provider: "fake", modelId: "smart" })).success).toBe(false);

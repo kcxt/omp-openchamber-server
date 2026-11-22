@@ -43,7 +43,8 @@ omp --mode rpc --cwd <dir> --no-title --no-pty [--config <overlay>] [--extension
 | `set_session_name` | `{name}` | none | |
 | `get_last_assistant_text`, `set_todos`, `export_html`, `bash`, `goal{op,…}` | | as before | `goal`: see §10. |
 | `set_subagent_subscription` | `{level:"off"\|"progress"\|"events"}` | `{level}` | Invalid level: `success:false`. |
-| `get_subagents`, `cancel_subagent{subagentId}`, `steer_subagent{subagentId,message}` | | `{subagents[]}`, `{cancelled}`, none | §5. |
+| `get_subagents`, `cancel_subagent{subagentId}`, `steer_subagent{subagentId,message,hostMessageId?}` | | `{subagents[]}`, `{cancelled}`, none | §5. |
+| `get_queued_prompts{subagentId?}` | | `{steering[],followUp[]}`: the queued user input, each `{text,images?,hostMessageId?}`; a subagent's entries carry text only | The queue the sidecar lists after a reload and rebuilds on adopt; `abort_and_restore_queue` entries carry `hostMessageId` too. |
 | `prompt "/move <dir>"` | | `{agentInvoked:false}` | Relocates the session (R5). Failure is only visible in `command_output`. |
 | `btw`, `btw_cancel`, `get_btw_history` | `{question, recordId?}`, `{recordId?}`, | `{record}`, `{cancelled}`, `{records[]}` | `/btw` side questions (§12): `recordId` continues a topic; one runs at a time; works while a run is live. |
 

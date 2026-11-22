@@ -81,7 +81,9 @@ Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagent
 
 ### Child lifetime
 
-A child is released after `OC_CHILD_IDLE_MS` once it is `idle`, `get_state.isSettled === true`, and omp owes no idle maintenance (`get_state.idleMaintenance` absent, P4), so omp's idle recap and idle compaction always run first. Unreadable state keeps the child. A crash ends the active stretch with an error turn and goes idle.
+A child is released after `OC_CHILD_IDLE_MS` once it is `idle`, `get_state.isSettled === true`, and omp owes no idle maintenance (`get_state.idleMaintenance` absent, P4), so omp's idle recap and idle compaction always run first. Unreadable state keeps the child. A crash ends the active stretch with an error turn and goes idle, and cancels the inbox bubbles of messages that were queued in the dead child.
+
+The queue itself is omp's: `get_queued_prompts` lists it (with the client id omp stores on each queued message), `abort_and_restore_queue` returns it, and a sidecar that adopts a running child reads the ids back from it. The runtime keeps only the ids it announced (`#undelivered`), to cancel them when the child dies; a subagent entry keeps the same list for its steers.
 
 ## omp layer (`src/omp/`)
 

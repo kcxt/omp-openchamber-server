@@ -475,9 +475,10 @@ close that omp.
 - A prompt to a subagent session goes to its parent's runtime: `steer_subagent`
   while it runs, otherwise `409` (send `.` to resume it, or prompt the parent).
   It is announced like any prompt (`session.inbox.enqueued`), stays pending until the
-  subagent reads it (`session.inbox.delivered`, matched by text: omp journals no client
-  ids for a subagent), is listed by the subagent session's `GET /inbox` meanwhile, and is
-  cancelled (`session.inbox.cancelled`) when the subagent ends or is stopped first.
+  subagent reads it (`session.inbox.delivered`; the steer carries the client id, which omp
+  stores on the subagent's user message), is listed by the subagent session's `GET /inbox`
+  meanwhile, and is cancelled (`session.inbox.cancelled`) when the subagent ends or is
+  stopped first. A sidecar restart forgets which steers a subagent still holds.
 - A body starting with `/aside <question>` is a side question (below).
 - `credentials` / `credentialRef`: see "Caller-owned credentials".
 
@@ -717,7 +718,7 @@ instead of failing on a missing route.
 |---|---|---|
 | `/fs/directory-stats` | `POST` | `{ "results": [{ "path", "isDirectory", "reason"?, "realPath"? }] }` for a `{ "paths": [...] }` body. `reason` is `not-found`, `not-directory`, or `unavailable`; the client maps the first two to "missing". |
 | `/session-todos/:id` | `GET` | `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`, read from omp's todo state in the transcript. |
-| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items, plus the prompts the session's omp holds but has not read yet (a steer waiting for a step boundary, a follow-up), in the prompt-payload shape the client seeds as pending user messages after a reload. |
+| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items, plus the prompts the session's omp holds but has not read yet (a steer waiting for a step boundary, a follow-up). omp lists them (`get_queued_prompts`), so a reload sees what is really queued; the bubble text is what the user typed when the sidecar recorded it, else omp's text, and attachments come back as images only. |
 | `/session/:id/inbox/:itemId` | `DELETE` | `204` — cancels a queued prompt. |
 | `/session/:id/inbox/:itemId` | `PATCH` | `409` — delivery mode is chosen by the prompt request, not by a queued item. |
 | `/session/:id/view` | `POST` | `204` — records `time.viewed` from the `idle` timestamp and emits `session.viewed`. |

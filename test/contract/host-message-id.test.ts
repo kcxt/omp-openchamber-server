@@ -71,6 +71,27 @@ describe(`P1 hostMessageId (${rig.kind})`, () => {
     expect(steer.message.steering).toBe(true);
   });
 
+  test("get_queued_prompts lists the queue with its host ids, takes nothing out, and abort_and_restore_queue returns the same ids", async () => {
+    rig.setScript({ turns: [slow] });
+    const m = c.mark();
+    c.fire({ type: "prompt", message: "SLOWRUN lp", hostMessageId: "host-lp0" });
+    await c.waitType("agent_start", { from: m });
+    await c.send({ type: "follow_up", message: "follow lp", hostMessageId: "host-lp-follow" });
+    await c.send({ type: "steer", message: "steer lp", hostMessageId: "host-lp-steer" });
+    const listed = (await c.send({ type: "get_queued_prompts" })).data;
+    const pick = (queue: any[]) => queue.map((entry) => [entry.text, entry.hostMessageId]);
+    expect(pick(listed.followUp)).toEqual([["follow lp", "host-lp-follow"]]);
+    expect(pick(listed.steering)).toContainEqual(["steer lp", "host-lp-steer"]);
+    // listing again finds the same queue: nothing was taken out
+    expect(pick((await c.send({ type: "get_queued_prompts" })).data.followUp)).toEqual([["follow lp", "host-lp-follow"]]);
+    const restored = (await c.send({ type: "abort_and_restore_queue" })).data;
+    expect(pick(restored.followUp)).toEqual([["follow lp", "host-lp-follow"]]);
+    expect(pick(restored.steering)).toContainEqual(["steer lp", "host-lp-steer"]);
+    await c.settled(m);
+    const after = (await c.send({ type: "get_queued_prompts" })).data;
+    expect([...after.steering, ...after.followUp]).toEqual([]);
+  });
+
   test("prompt{streamingBehavior} queued mid-run keeps its id", async () => {
     rig.setScript({ turns: [slow] });
     const m = c.mark();

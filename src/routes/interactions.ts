@@ -29,6 +29,8 @@ import {
 import type { RouteContext } from "../http/router";
 import { asRecord, readJson } from "../http/response";
 import { Registry } from "../sessions/registry";
+import { SessionDocs } from "../store/session-docs";
+import { readSessionIdSync } from "../store/sessions";
 import { messageQueueRuntime } from "../services/instances";
 import { resolveSessionRoute } from "../services/session-route";
 
@@ -181,15 +183,27 @@ export async function handleInteractions(ctx: RouteContext): Promise<Response | 
       };
     });
     // Prompts omp holds undelivered (a steer waiting for a step boundary, a follow-up): the client shows them
-    // pending after the streaming reply, and without this list a reload or session switch drops them.
+    // pending after the streaming reply, and without this list a reload or session switch drops them. omp
+    // lists them; a subagent's session has no runtime of its own, so its parent's runtime answers for it.
     const { session } = await resolveSessionRoute(sessionId, dir);
-    // A subagent's session has no runtime of its own: its parent's runtime holds the steers it has not read.
-    const held = !session ? [] : Registry.findSubagent(session.id)?.runtime.subagentPendingInbox(session.id)
-      ?? Registry.get(session.id, session.directory)?.pendingInbox() ?? [];
-    for (const entry of held) {
-      if (items.some((item) => item.id === entry.id)) continue;
-      items.push({ id: entry.id, sessionID: sessionId, time: { created: entry.created }, ...entry.item } as (typeof items)[number]);
-    }
+    const owner = session ? Registry.findSubagent(session.id) : undefined;
+    const held = !session ? [] : owner ? await owner.runtime.subagentPendingInbox(session.id) : await Registry.get(session.id, session.directory)?.pendingInbox() ?? [];
+    const visible = session ? (await SessionDocs.get(readSessionIdSync(session.path) ?? "").catch(() => undefined))?.visibleParts ?? {} : {};
+    const base = Date.now();
+    held.forEach((entry, index) => {
+      if (items.some((item) => item.id === entry.id)) return;
+      // omp holds the whole message (context and file text included); what the user typed is the bubble.
+      const typed = visible[entry.id]?.map((part) => part.text).join("\n\n");
+      const files = ("images" in entry ? entry.images ?? [] : []).map((image) => toV2FileAttachment({ uri: `data:${image.mimeType};base64,${image.data}`, mime: image.mimeType }));
+      items.push({
+        id: entry.id,
+        sessionID: sessionId,
+        type: "user",
+        time: { created: base + index },
+        delivery: entry.delivery,
+        payload: { text: typed ?? entry.text, ...(files.length > 0 ? { files } : {}) },
+      } as (typeof items)[number]);
+    });
     return json({ data: items });
   }
 

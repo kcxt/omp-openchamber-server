@@ -101,6 +101,21 @@ describe("pending inbox", () => {
   });
 });
 
+describe("omp dies with messages queued", () => {
+  test("their pending bubbles are cancelled: nothing will read them", async () => {
+    stack.script([{ when: "dies soon", steps: [{ text: "about to die " }, { sleep: 1_500 }, { crash: true }] }]);
+    const id = await createSession();
+    const rec = await record();
+    await prompt(id, { id: "msg_runtimeE0001", parts: [{ type: "text", text: "dies soon" }] });
+    await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
+    await prompt(id, { id: "msg_runtimeE0002", parts: [{ type: "text", text: "steer into the void" }], delivery: "steer" });
+    await prompt(id, { id: "msg_runtimeE0003", parts: [{ type: "text", text: "follow into the void" }], delivery: "queue" });
+    await rec.until("the child to die and its bubbles to go", () => rec.of(id, "session.inbox.cancelled").length >= 2, 10_000);
+    await rec.stop();
+    expect(rec.of(id, "session.inbox.cancelled").map((e) => e.data.inboxID).sort()).toEqual(["msg_runtimeE0002", "msg_runtimeE0003"]);
+  });
+});
+
 describe("Esc", () => {
   test("with queued input: the queue is sent again right after the run stops, under the ids the client shows", async () => {
     stack.script([{ when: "hold on", steps: [{ text: "holding " }, { sleep: 20_000 }, { text: "never" }] }]);

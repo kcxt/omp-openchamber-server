@@ -28,6 +28,7 @@ import {
   emitSessionStatus,
   emitSessionUpdated,
 } from "../shared/sse";
+import { makeMessageId } from "./prompt-input";
 import { TurnTranslator, type OmpFrame } from "./turn-translator";
 import { AsideStream } from "./aside";
 import type { BtwTopic } from "../omp/btw-history";
@@ -56,21 +57,19 @@ export interface PromptInput {
   hostMessageId: string;
   /** Joins a live run at the next turn boundary (`steer`) or after it (`queue`). */
   delivery?: "steer" | "queue";
-  /** What was announced to OpenChamber as `session.inbox.enqueued`, to list the prompt while omp holds it undelivered. */
-  inbox?: { item: Record<string, unknown>; created: number };
 }
 
-/** One queued prompt `abort_and_restore_queue` took back, under the inbox id it was announced with. */
+/** One queued prompt `abort_and_restore_queue` took back. */
 interface WithdrawnItem {
-  hostMessageId: string;
+  /** The id the client announced it under (omp stores it on the queued message). */
+  hostMessageId?: string;
   message: string;
   images?: ImageContent[];
   /** How the client queued it. */
   delivery: "steer" | "queue";
-  inbox?: PromptInput["inbox"];
 }
 
-/** Queued input `abort_and_restore_queue` withdrew and the sidecar could not send again, with the inbox ids it was announced under. */
+/** Queued input `abort_and_restore_queue` withdrew and the sidecar could not send again, with the inbox ids to cancel. */
 export interface Withdrawn {
   steering: string[];
   followUp: string[];
@@ -121,8 +120,8 @@ interface SubagentEntry extends SubagentInfo {
   /** Settles once `childSessionId` is known. */
   resolved?: Promise<void>;
   failure?: string;
-  /** Steers sent to the subagent that it has not read yet, oldest first (it journals no client ids, so they match by text). */
-  pending: Array<{ id: string; text: string; inbox: NonNullable<PromptInput["inbox"]> }>;
+  /** Inbox ids of steers sent to the subagent that it has not read yet, oldest first: all that is left to cancel when it ends. */
+  pending: string[];
 }
 
 /** How long Esc waits for the parent run to stop before the child is killed (§3.4). */
@@ -172,12 +171,16 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function restored(value: unknown): Array<{ text: string; images?: ImageContent[] }> {
+function restored(value: unknown): Array<{ text: string; images?: ImageContent[]; hostMessageId?: string }> {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
     const entry = record(item);
     if (typeof entry?.text !== "string") return [];
-    return [{ text: entry.text, ...(Array.isArray(entry.images) ? { images: entry.images as ImageContent[] } : {}) }];
+    return [{
+      text: entry.text,
+      ...(Array.isArray(entry.images) ? { images: entry.images as ImageContent[] } : {}),
+      ...(typeof entry.hostMessageId === "string" && entry.hostMessageId ? { hostMessageId: entry.hostMessageId } : {}),
+    }];
   });
 }
 
@@ -204,7 +207,7 @@ export class SessionRuntime {
   /** Commands that keep the session busy while they run (compaction). */
   #busyCommands = 0;
   /** Client ids of prompts omp accepted and has not journaled yet, in send order (output assembly). */
-  #undelivered: Array<{ id: string; delivery: "steer" | "queue"; inbox?: PromptInput["inbox"] }> = [];
+  #undelivered: string[] = [];
   /** Collects `command_output` while the runtime runs a command itself (`/move`). */
   #capture?: string[];
   readonly #aside: AsideStream;
@@ -234,7 +237,7 @@ export class SessionRuntime {
         readTodos: async () => extractTodosFromOmpDetails({ phases: (await this.#getState())?.todoPhases }) ?? undefined,
         journalNotice: (text, level) => this.#journalNotice(text, level),
         delivered: (id) => {
-          this.#undelivered = this.#undelivered.filter((entry) => entry.id !== id);
+          this.#undelivered = this.#undelivered.filter((entry) => entry !== id);
         },
       },
     });
@@ -320,7 +323,7 @@ export class SessionRuntime {
     return this.#serial(async () => {
       this.#assertOpen();
       if (this.#state === "idle") this.#translator.setParent(input.hostMessageId);
-      this.#undelivered.push({ id: input.hostMessageId, delivery: input.delivery === "steer" ? "steer" : "queue", inbox: input.inbox });
+      this.#undelivered.push(input.hostMessageId);
       // A behaviour is always given: omp ignores it when idle, and a run omp
       // starts on its own (a goal continuation) can never refuse the prompt.
       const data = await this.#child.request("prompt", {
@@ -331,7 +334,7 @@ export class SessionRuntime {
       });
       if (record(data)?.agentInvoked === false) {
         // Handled locally (builtin command): omp journals nothing and starts no run.
-        this.#undelivered = this.#undelivered.filter((entry) => entry.id !== input.hostMessageId);
+        this.#undelivered = this.#undelivered.filter((entry) => entry !== input.hostMessageId);
         if (!this.#runLive) this.#translator.finishRun();
       } else if (!this.#runLive) {
         this.#awaitingRun = true;
@@ -401,7 +404,8 @@ export class SessionRuntime {
     } catch (err) {
       promptLogger.error({ err, sessionID: this.sessionId }, "[abort] the parent run did not stop; killing the omp child");
       this.close("abort");
-      return { ...withdrawn, items: undefined };
+      this.#reportUnsent(withdrawn.items ?? []);
+      return { steering: withdrawn.steering, followUp: withdrawn.followUp, inboxIDs: withdrawn.inboxIDs.concat(withdrawn.items?.flatMap((item) => item.hostMessageId ? [item.hostMessageId] : []) ?? []) };
     }
     this.#awaitingRun = false;
     this.#due = false;
@@ -424,27 +428,44 @@ export class SessionRuntime {
     if (items.length === 0) return rest;
     for (let sent = 0; sent < items.length; sent++) {
       const item = items[sent]!;
+      const hostMessageId = item.hostMessageId ?? makeMessageId(this.sessionId);
       try {
-        await this.prompt({ message: item.message, images: item.images, hostMessageId: item.hostMessageId, delivery: "queue", inbox: item.inbox && { ...item.inbox, item: { ...item.inbox.item, delivery: "queue" } } });
+        await this.prompt({ message: item.message, images: item.images, hostMessageId, delivery: "queue" });
       } catch (err) {
         this.#reportProblem(err, "could not send queued messages again after Esc");
         const left = items.slice(sent);
+        this.#reportUnsent(left);
         return {
           steering: left.filter((entry) => entry.delivery === "steer").map((entry) => entry.message),
           followUp: left.filter((entry) => entry.delivery === "queue").map((entry) => entry.message),
-          inboxIDs: left.map((entry) => entry.hostMessageId),
+          inboxIDs: left.flatMap((entry) => entry.hostMessageId ? [entry.hostMessageId] : []).concat(rest.inboxIDs),
         };
       }
-      if (item.delivery === "steer") {
+      if (item.delivery === "steer" && item.hostMessageId) {
         emitOpenCodeV2Event("session.inbox.delivery.changed", { sessionID: this.sessionId, inboxID: item.hostMessageId, delivery: "queue" }, this.cwd);
       }
     }
-    return { steering: [], followUp: [], inboxIDs: [] };
+    // Everything was sent again: only ids the client showed with nothing behind them are left to cancel.
+    return { steering: [], followUp: [], inboxIDs: rest.inboxIDs };
   }
 
-  /** Prompts omp accepted and has not journaled yet, as announced to OpenChamber: its inbox. */
-  pendingInbox(): Array<{ id: string; item: Record<string, unknown>; created: number }> {
-    return this.#undelivered.flatMap((entry) => entry.inbox ? [{ id: entry.id, ...entry.inbox }] : []);
+  /** Queued messages that cannot be sent again leave their bubbles; the text stays in the chat as an error so it can be copied. */
+  #reportUnsent(items: WithdrawnItem[]): void {
+    if (items.length === 0) return;
+    const texts = items.map((item) => `• ${item.message.length > 400 ? `${item.message.slice(0, 400)}…` : item.message}`).join("\n");
+    emitSessionError(this.sessionId, { message: `${items.length} queued message(s) were not sent and are gone:\n${texts}` }, this.cwd);
+  }
+
+  /**
+   * The prompts omp holds and has not read yet, listed by omp itself (`get_queued_prompts`) so a reload sees
+   * what is really queued. Only entries queued under a client id are listed: those are the ones OpenChamber shows.
+   */
+  async pendingInbox(): Promise<Array<{ id: string; delivery: "steer" | "queue"; text: string; images?: ImageContent[] }>> {
+    if (this.#state === "closed") return [];
+    const queued = record(await this.#child.request("get_queued_prompts", {}).catch(() => undefined));
+    return (["steer", "queue"] as const).flatMap((delivery) =>
+      restored(queued?.[delivery === "steer" ? "steering" : "followUp"]).flatMap((entry) =>
+        entry.hostMessageId ? [{ id: entry.hostMessageId, delivery, text: entry.text, ...(entry.images?.length ? { images: entry.images } : {}) }] : []));
   }
 
   /** Compacts the session through its own child. Refused while a run is live. */
@@ -609,19 +630,18 @@ export class SessionRuntime {
   }
 
   /**
-   * Steers a subagent. `announced` is the inbox item already shown to OpenChamber for it: it stays
-   * pending until the subagent reads the message (`session.inbox.delivered`), is listed by the child's
-   * `GET /inbox` meanwhile, and is cancelled when the subagent ends without reading it or omp refuses it.
+   * Steers a subagent under the client's inbox id: omp stores it on the subagent's user message, so the
+   * subagent's stream acks it exactly (`session.inbox.delivered`). The id stays pending until then, and is
+   * cancelled when the subagent ends without reading it or omp refuses the steer.
    */
-  async steerSubagent(subagentId: string, message: string, announced?: { id: string; inbox: NonNullable<PromptInput["inbox"]> }): Promise<unknown> {
+  async steerSubagent(subagentId: string, message: string, hostMessageId?: string): Promise<unknown> {
     this.#assertOpen();
     const entry = this.#subagents.get(subagentId);
-    const pending = announced && entry ? { id: announced.id, text: message, inbox: announced.inbox } : undefined;
-    if (pending) entry!.pending.push(pending);
+    if (hostMessageId) entry?.pending.push(hostMessageId);
     try {
-      return await this.#child.request("steer_subagent", { subagentId, message });
+      return await this.#child.request("steer_subagent", { subagentId, message, ...(hostMessageId ? { hostMessageId } : {}) });
     } catch (err) {
-      if (pending && entry) entry.pending = entry.pending.filter((candidate) => candidate !== pending);
+      if (entry && hostMessageId) entry.pending = entry.pending.filter((id) => id !== hostMessageId);
       throw err;
     }
   }
@@ -632,18 +652,17 @@ export class SessionRuntime {
     return entry?.translator ? { ...entry.translator.model } : undefined;
   }
 
-  /** Steers a subagent has not read yet, as announced to OpenChamber. */
-  subagentPendingInbox(childSessionId: string): Array<{ id: string; item: Record<string, unknown>; created: number }> {
+  /**
+   * Steers a subagent has not read yet. omp lists what the subagent holds (texts only); the ids come from
+   * `pending`. A steer read but not yet acked has left omp's list, so the two are matched from the newest end.
+   */
+  async subagentPendingInbox(childSessionId: string): Promise<Array<{ id: string; delivery: "steer"; text: string }>> {
     const entry = [...this.#subagents.values()].find((candidate) => candidate.childSessionId === childSessionId);
-    return (entry?.pending ?? []).map((held) => ({ id: held.id, ...held.inbox }));
-  }
-
-  /** The inbox id of the steer a subagent just read (its text), when one is pending. */
-  #claimSubagentSteer(entry: SubagentEntry, text: string): string | undefined {
-    const at = entry.pending.findIndex((held) => held.text === text);
-    const index = at >= 0 ? at : 0;
-    const [held] = entry.pending.splice(index, 1);
-    return held?.id;
+    if (!entry || this.#state === "closed" || entry.pending.length === 0) return [];
+    const queued = record(await this.#child.request("get_queued_prompts", { subagentId: entry.id }).catch(() => undefined));
+    const texts = restored(queued?.steering).map((held) => held.text);
+    const ids = entry.pending.slice(Math.max(0, entry.pending.length - texts.length));
+    return ids.map((id, index) => ({ id, delivery: "steer" as const, text: texts[texts.length - ids.length + index]! }));
   }
 
   /**
@@ -734,6 +753,12 @@ export class SessionRuntime {
     this.#unsubscribe();
     this.#child.kill();
     clearSessionApprovals(this.sessionId);
+    // The queue died with the child: what the client still shows as pending will never be read.
+    if (reason === "crash" || reason === "abort") {
+      for (const inboxID of this.#undelivered.splice(0)) {
+        emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: this.sessionId, inboxID }, this.cwd);
+      }
+    }
     for (const entry of this.#subagents.values()) {
       if (entry.status === "running") this.#endChild(entry, "aborted");
     }
@@ -832,6 +857,8 @@ export class SessionRuntime {
       if (!sub || (sub.status !== "running" && sub.status !== "pending")) continue;
       this.#onSubagentFrame({ type: "subagent_lifecycle", payload: { id: sub.id, agent: sub.agent, description: sub.description, sessionFile: sub.sessionFile, status: "started" } } as OmpFrame);
     }
+    // The queue the previous sidecar left in omp: its ids are what a later Esc or crash has to answer for.
+    this.#undelivered = (await this.pendingInbox()).map((held) => held.id);
     this.#runLive = state.isStreaming === true;
     this.#state = "idle";
     for (const listener of this.#stateListeners) listener({ state: "idle", previous: "starting" });
@@ -1001,27 +1028,18 @@ export class SessionRuntime {
     const value = record(data);
     const steering = restored(value?.steering);
     const followUp = restored(value?.followUp);
-    if (steering.length + followUp.length === 0) return { steering: [], followUp: [], inboxIDs: [] };
     const undelivered = this.#undelivered.splice(0);
-    // omp reports steering and follow-ups apart, each oldest first; the client ids come in send order.
-    const ids = {
-      steer: undelivered.filter((entry) => entry.delivery === "steer").map((entry) => entry.id),
-      queue: undelivered.filter((entry) => entry.delivery === "queue").map((entry) => entry.id),
-    };
-    const items: WithdrawnItem[] = [];
-    for (const [delivery, list] of [["steer", steering], ["queue", followUp]] as const) {
-      list.forEach((entry, index) => {
-        const hostMessageId = ids[delivery][index];
-        const held = undelivered.find((candidate) => candidate.id === hostMessageId);
-        if (hostMessageId) items.push({ hostMessageId, message: entry.text, ...(entry.images?.length ? { images: entry.images } : {}), delivery, inbox: held?.inbox });
-      });
-    }
-    const sendable = new Set(items.map((item) => item.hostMessageId));
+    if (steering.length + followUp.length === 0) return { steering: [], followUp: [], inboxIDs: undelivered };
+    const items: WithdrawnItem[] = [
+      ...steering.map((entry) => ({ hostMessageId: entry.hostMessageId, message: entry.text, images: entry.images, delivery: "steer" as const })),
+      ...followUp.map((entry) => ({ hostMessageId: entry.hostMessageId, message: entry.text, images: entry.images, delivery: "queue" as const })),
+    ];
+    // What omp returned is sent again; any other id the client still shows has nothing behind it.
+    const sendable = new Set(items.flatMap((item) => item.hostMessageId ? [item.hostMessageId] : []));
     return {
       steering: steering.map((entry) => entry.text),
       followUp: followUp.map((entry) => entry.text),
-      // Only what cannot be sent again is cancelled.
-      inboxIDs: undelivered.map((entry) => entry.id).filter((id) => !sendable.has(id)),
+      inboxIDs: undelivered.filter((id) => !sendable.has(id)),
       items,
     };
   }
@@ -1103,7 +1121,7 @@ export class SessionRuntime {
       cwd: this.cwd,
       model,
       fullForm: true,
-      host: { claimUserMessage: (text) => this.#claimSubagentSteer(entry, text) },
+      host: { delivered: (id) => { entry.pending = entry.pending.filter((held) => held !== id); } },
     });
     emitSessionCreated({
       id: childId,
@@ -1137,8 +1155,8 @@ export class SessionRuntime {
   #publishChildEnd(entry: SubagentEntry): void {
     const childId = entry.childSessionId!;
     // A steer the subagent never read is not coming: its pending bubble goes away.
-    for (const held of entry.pending.splice(0)) {
-      emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: childId, inboxID: held.id }, this.cwd);
+    for (const inboxID of entry.pending.splice(0)) {
+      emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: childId, inboxID }, this.cwd);
     }
     if (entry.status === "failed") {
       entry.translator?.finishRun(entry.failure ?? "Subagent failed", "error");

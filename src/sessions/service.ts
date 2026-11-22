@@ -69,13 +69,13 @@ async function promptSubagent(session: OpenCodeSession, prepared: PreparedPrompt
   }
   // Announced like a root prompt: pending after the streaming reply until the subagent reads it.
   const model = runtime.subagentModel(session.id) ?? runtime.model;
-  const inbox = emitUserPrompt(session.id, session.directory, prepared, body, model);
+  emitUserPrompt(session.id, session.directory, prepared, body, model);
   try {
     if (resume) {
       await runtime.resume({ subagentId: subagent.id });
       emitOpenCodeV2Event("session.inbox.delivered", { sessionID: session.id, inboxID: messageID }, session.directory);
     } else {
-      await runtime.steerSubagent(subagent.id, text, { id: messageID, inbox });
+      await runtime.steerSubagent(subagent.id, text, messageID);
     }
   } catch (err) {
     emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: session.id, inboxID: messageID }, session.directory);
@@ -158,7 +158,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
     }
   }
 
-  const inbox = emitUserPrompt(session.id, session.directory, prepared, body, runtime.model);
+  emitUserPrompt(session.id, session.directory, prepared, body, runtime.model);
   if (prepared.message !== prepared.visibleText || prepared.visibleParts.length > 1) {
     // The transcript holds the whole message; what the user typed is the sidecar's to remember.
     const uuid = readSessionIdSync(session.path);
@@ -179,7 +179,6 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
         message: prepared.message,
         images: prepared.images,
         hostMessageId: prepared.messageID,
-        inbox,
         delivery: body.delivery === "steer" ? "steer" : "queue",
       });
     }

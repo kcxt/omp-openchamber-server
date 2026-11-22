@@ -323,13 +323,7 @@ export async function preparePrompt(sessionId: string, cwd: string, body: Prompt
  * inbox item (`session.inbox.enqueued`, delivered once omp journals it), the
  * user message, then its file and text parts.
  */
-/** The inbox item announced for a prompt (`session.inbox.enqueued`), kept to answer `GET /session/:id/inbox`. */
-export interface AnnouncedInbox {
-  item: Record<string, unknown>;
-  created: number;
-}
-
-export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<PreparedPrompt, "messageID" | "visibleText" | "visibleParts">, body: PromptBody, model: ModelRef): AnnouncedInbox {
+export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<PreparedPrompt, "messageID" | "visibleText" | "visibleParts">, body: PromptBody, model: ModelRef): void {
   const { messageID } = prompt;
   const created = Date.now() - 1;
   const filePayload = [
@@ -356,7 +350,6 @@ export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<Prep
       ...(body.metadata ? { metadata: body.metadata } : {}),
     },
   };
-  const announcedAt = Date.now();
   emitOpenCodeV2Event("session.inbox.enqueued", { sessionID: sessionId, inboxID: messageID, item }, cwd);
   emitMessageUpdated({
     info: {
@@ -404,5 +397,4 @@ export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<Prep
       sessionID: sessionId,
     }, cwd);
   }
-  return { item, created: announcedAt };
 }
