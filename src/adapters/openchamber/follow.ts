@@ -206,18 +206,6 @@ function setPublished(entry: Followed, status: "busy" | "idle"): void {
   if (status === "idle") emitSessionIdle(entry.id, entry.cwd);
 }
 
-let nextSlot = 0;
-const PACE_MS = Number(process.env.OC_FOLLOW_PACE_MS ?? 0);
-/** Runs `emit` in order, at least PACE_MS after the previous one. */
-function paced(emit: () => void): void {
-  const now = Date.now();
-  nextSlot = Math.max(nextSlot, now);
-  const delay = nextSlot - now;
-  nextSlot += PACE_MS;
-  if (delay === 0) emit();
-  else setTimeout(emit, delay);
-}
-
 /** Emits what changed in one record; whether anything was sent. */
 function emitRecord(entry: Followed, record: OpenCodeMessageRecord): boolean {
   const { id: sessionID, cwd } = entry;
@@ -234,14 +222,14 @@ function emitRecord(entry: Followed, record: OpenCodeMessageRecord): boolean {
     state.started = true;
     state.ended = true;
     const text = record.parts.flatMap((part) => (part.type === "text" && part.synthetic !== true ? [part.text] : [])).join("\n\n");
-    paced(() => emitOpenCodeV2Event("session.inbox.enqueued", {
+    emitOpenCodeV2Event("session.inbox.enqueued", {
       sessionID,
       inboxID: record.info.id,
       item: { type: "user", delivery: "queue", payload: { text, files: [] } },
-    }, cwd));
-    paced(() => emitMessageUpdated({ info: record.info }, cwd));
-    for (const part of record.parts) paced(() => emitMessagePartUpdated(sessionID, { ...part }, cwd));
-    paced(() => emitOpenCodeV2Event("session.inbox.delivered", { sessionID, inboxID: record.info.id }, cwd));
+    }, cwd);
+    emitMessageUpdated({ info: record.info }, cwd);
+    for (const part of record.parts) emitMessagePartUpdated(sessionID, { ...part }, cwd);
+    emitOpenCodeV2Event("session.inbox.delivered", { sessionID, inboxID: record.info.id }, cwd);
     return true;
   }
 
@@ -249,33 +237,36 @@ function emitRecord(entry: Followed, record: OpenCodeMessageRecord): boolean {
   if (!state.started) {
     state.started = true;
     const { finish: _finish, error: _error, ...open } = record.info;
-    paced(() => emitMessageUpdated({ info: { ...open, time: { created: record.info.time.created } } }, cwd));
+    emitMessageUpdated({ info: { ...open, time: { created: record.info.time.created } } }, cwd);
   }
   for (const part of record.parts) {
+    // A part goes out when it is new or changed, never again as it was: OpenChamber stamps a re-sent
+    // reasoning/text part with the event's own time, so repeating one rewrites its duration.
     const partSig = partSignature(part);
     if (state.parts.get(part.id) === partSig) continue;
     state.parts.set(part.id, partSig);
     if (part.type === "tool") {
-      // OpenChamber creates a tool part from `tool.input.started` (a pending part) and only advances it
-      // from there: a call announced as running or done is dropped, and the tail is refetched instead.
+      // A live tool call opens as a pending part (`tool.input.started`), then runs, then ends; OpenChamber
+      // only advances a part it already holds, so a call first heard of as running or done is announced
+      // the same way.
       if (!state.announcedTools.has(part.id)) {
-        paced(() => emitMessagePartUpdated(sessionID, { ...part, state: { ...part.state, status: "pending", input: {}, output: undefined, error: undefined } }, cwd));
+        emitMessagePartUpdated(sessionID, { ...part, state: { ...part.state, status: "pending", input: {}, output: undefined, error: undefined } }, cwd);
         if (part.state.status === "completed" || part.state.status === "error") {
-          paced(() => emitMessagePartUpdated(sessionID, { ...part, state: { ...part.state, status: "running", output: undefined, error: undefined } }, cwd));
+          emitMessagePartUpdated(sessionID, { ...part, state: { ...part.state, status: "running", output: undefined, error: undefined } }, cwd);
         }
       }
-      paced(() => emitMessagePartUpdated(sessionID, { ...part }, cwd));
+      emitMessagePartUpdated(sessionID, { ...part }, cwd);
       state.announcedTools.add(part.id);
     } else if (part.type === "text" || part.type === "reasoning") {
       const start = part.time?.start ?? record.info.time.created;
-      paced(() => emitMessagePartUpdated(sessionID, { ...part, time: { start, end: part.time?.end ?? start } }, cwd));
+      emitMessagePartUpdated(sessionID, { ...part, time: { start, end: part.time?.end ?? start } }, cwd);
     } else {
-      paced(() => emitMessagePartUpdated(sessionID, { ...part }, cwd));
+      emitMessagePartUpdated(sessionID, { ...part }, cwd);
     }
   }
   if (record.info.finish !== undefined && !state.ended) {
     state.ended = true;
-    paced(() => emitMessageUpdated({ info: record.info }, cwd));
+    emitMessageUpdated({ info: record.info }, cwd);
   }
   return true;
 }

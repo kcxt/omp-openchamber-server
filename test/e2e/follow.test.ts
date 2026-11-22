@@ -68,6 +68,42 @@ describe("a session a terminal omp owns is followed live", () => {
     expect(stack.sessionFiles().filter((f) => JSON.stringify(f.records).includes("slow please")).length).toBe(1);
     await terminal.close();
   });
+
+  test("each part of a growing turn is announced once, a tool call opening as pending", async () => {
+    stack.script([{ when: "grow", steps: [
+      { thinking: "first thought" },
+      { tool: "bash", args: { command: "echo one" }, result: "one" },
+      { sleep: 500 },
+      { thinking: "second thought" },
+      { tool: "bash", args: { command: "echo two" }, result: "two" },
+      { sleep: 500 },
+      { text: "Grown answer." },
+    ] }]);
+    const terminal = await OmpInstance.start(stack, stack.project);
+    await terminal.prompt("seed grow");
+    const id = ((await stack.http(`/session?directory=${dir()}`)).body.data as any[]).find((s) => s.title === "seed grow").id;
+    await stack.http(`/session/${id}/message?directory=${dir()}`);
+    const stream = collect();
+    await Bun.sleep(300);
+
+    await terminal.prompt("grow please");
+    await until("final text", () => stream.events.some((e) => e.type === "session.text.ended" && String(e.data?.text).includes("Grown answer.")));
+    await stream.stop();
+
+    // OpenChamber stamps a re-sent reasoning part with the event's own time, so a part repeated at every growth
+    // of its message would have its duration rewritten each time.
+    const keyOf = (e: any) => `${e.type} ${e.data?.assistantMessageID} ${e.data?.ordinal ?? e.data?.id}`;
+    const announced = stream.events.filter((e) => ["session.reasoning.ended", "session.text.ended", "session.tool.success"].includes(e.type)).map(keyOf);
+    expect(announced.length).toBe(5);
+    expect(new Set(announced).size).toBe(announced.length);
+    // OpenChamber only advances a tool part it holds: a call that is first heard of as running or done is dropped.
+    for (const called of stream.events.filter((e) => e.type === "session.tool.called")) {
+      const opened = stream.events.findIndex((e) => e.type === "session.tool.input.started" && e.data?.id === called.data.id);
+      expect(opened).toBeGreaterThanOrEqual(0);
+      expect(opened).toBeLessThan(stream.events.indexOf(called));
+    }
+    await terminal.close();
+  });
 });
 
 describe("a dead turn left in a transcript stays idle", () => {
