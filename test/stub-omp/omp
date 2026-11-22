@@ -640,6 +640,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOp
 let subIndex = 0;
 let asyncSeq = 0;
 const subagents = new Map<string, { snapshot: any; cancel: () => void; resume: (hostMessageId?: string) => void }>();
+const subagentModels = new Map<string, string>();
 /** Finished subagents stay registered: `resume` revives them from their transcript, as omp's lifecycle manager does. */
 const finishedSubagents = new Map<string, { call: any; sessionFile: string; index: number }>();
 async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
@@ -1008,6 +1009,12 @@ async function handle(frame: any): Promise<void> {
         const sub = subagents.get(String(frame.subagentId));
         if (sub) sub.cancel();
         return respond(id, type, { cancelled: !!sub });
+      }
+      case "set_subagent_model": {
+        if (!subagents.has(String(frame.subagentId))) return fail(id, type, `Subagent not found: ${String(frame.subagentId)}`);
+        if (!MODELS.some((x) => x.provider === frame.provider && x.id === frame.modelId)) return fail(id, type, `Model not found: ${frame.provider}/${frame.modelId}`);
+        subagentModels.set(String(frame.subagentId), `${frame.provider}/${frame.modelId}${frame.level ? `:${frame.level}` : ""}`);
+        return respond(id, type);
       }
       case "steer_subagent": {
         if (!subagents.has(String(frame.subagentId))) return fail(id, type, `Subagent refused the message: unknown subagent ${String(frame.subagentId)}`);
