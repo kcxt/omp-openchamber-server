@@ -2,6 +2,7 @@ import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { MissingWorkingDirectoryError, withOmpRpc } from "./rpc";
+import { appendOcRecord, ocStamp, readOcRecordLines } from "./oc-records";
 import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId } from "./store";
 import { sessionLogger } from "../../shared/logger";
 import {
@@ -12,6 +13,7 @@ import {
 } from "./title-db";
 import { editToolMetadata } from "../../shared/edit-diff";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
+import { timeHexFromTimestamp, timeHexOfMessageId } from "../../shared/message-id";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import { resolveImageDataUrl, isBlobRef } from "../../shared/blobs";
 import type {
@@ -24,6 +26,7 @@ import type {
   OpenCodeToolPart,
   TokenBreakdown,
 } from "../types";
+import { contextPointOfMessage, type OmpContextPoint } from "./context";
 export interface UsageMappingResult {
   tokens: TokenBreakdown;
   cost: number;
@@ -34,6 +37,7 @@ interface OmpTurnTelemetry {
   modelDurationMs?: number;
   ttftMs?: number;
   ttftSamples?: number;
+  context?: OmpContextPoint;
 }
 
 function hasTokenUsage(tokens: TokenBreakdown): boolean {
@@ -101,10 +105,12 @@ function getTurnTelemetryForMessage(
   const modelDurationMs = getAssistantModelDuration(msg, createdAt);
   const ttftMs = getAssistantTtft(msg);
   if (!hasTokenUsage(tokens) && modelDurationMs === undefined && ttftMs === undefined) return undefined;
+  const context = contextPointOfMessage(msg.contextSnapshot, tokens, msg.provider ?? "omp", msg.model ?? "omp", createdAt);
   return {
     turnUsage: tokens,
     ...(modelDurationMs !== undefined ? { modelDurationMs } : {}),
     ...(ttftMs !== undefined ? { ttftMs, ttftSamples: 1 } : {}),
+    ...(context ? { context } : {}),
   };
 }
 
@@ -124,10 +130,12 @@ function addTurnTelemetry(
   const ttftSamples = (current?.ttftSamples ?? 0) + (incoming?.ttftSamples ?? 0);
   const ttftMs = (current?.ttftMs ?? 0) + (incoming?.ttftMs ?? 0);
 
+  const context = incoming?.context ?? current?.context;
   recordTurnTelemetry(record, {
     turnUsage: addTokenUsage(currentUsage, incomingUsage),
     ...(modelDurationMs > 0 || current?.modelDurationMs !== undefined || incoming?.modelDurationMs !== undefined ? { modelDurationMs } : {}),
     ...(ttftSamples > 0 ? { ttftMs, ttftSamples } : {}),
+    ...(context ? { context } : {}),
   });
 }
 
@@ -291,6 +299,8 @@ export interface AgentMessage {
   duration?: number;
   /** Persisted OMP time-to-first-token in milliseconds. */
   ttft?: number;
+  /** Provider prompt size and non-message estimate recorded with the request (see context.ts). */
+  contextSnapshot?: unknown;
 }
 
 const TTL_MS = 5_000;
@@ -304,12 +314,8 @@ interface CacheEntry {
 }
 
 async function fileStamp(path: string): Promise<string | undefined> {
-  try {
-    const info = await stat(path);
-    return `${info.mtimeMs}:${info.size}`;
-  } catch {
-    return undefined;
-  }
+  const info = await ocStamp(path);
+  return info ? `${info.mtimeMs}:${info.size}` : undefined;
 }
 
 const messageCache = new Map<string, CacheEntry>();
@@ -436,11 +442,11 @@ export async function truncateOmpSessionAtMessage(
   // Preserve all prior records (including the OMP session header and title
   // slot), then append a durable clear marker for any staged revert.
   const retained = retainBeforeBoundary(lines, boundary);
-  retained.push(JSON.stringify({ type: "revert_change", timestamp: new Date().toISOString(), revert: null }));
   const tempPath = join(dirname(session.path), `.${randomUUID()}.revert.tmp`);
   try {
     await writeFile(tempPath, `${retained.join("\n")}\n`, "utf8");
     await rename(tempPath, session.path);
+    await appendOcRecord(session.path, { type: "revert_change", timestamp: new Date().toISOString(), revert: null });
   } catch {
     await unlink(tempPath).catch(() => {});
     return false;
@@ -1037,7 +1043,7 @@ export function mapRpcMessagesToOpenCodeRecords(
         messageId = msg.id;
         lastUserMatched = false;
       } else {
-        messageId = `msg_${openCodeId}_${msg.id ?? visibleIndex}`;
+        messageId = `msg_${timeHexFromTimestamp(createdAt)}_${openCodeId}_${msg.id ?? visibleIndex}`;
         lastUserMatched = false;
       }
 
@@ -1120,16 +1126,20 @@ export function mapRpcMessagesToOpenCodeRecords(
         if (typeof msg.id === "string" && msg.id.startsWith("msg_")) {
           messageId = msg.id;
         } else if (isCompaction) {
+          const cmpHex = timeHexFromTimestamp(createdAt);
           messageId = typeof msg.id === "string" && msg.id.length > 0
-            ? `msg_${openCodeId}_cmp_${msg.id}`
-            : `msg_${openCodeId}_cmp_${visibleIndex}`;
+            ? `msg_${cmpHex}_${openCodeId}_cmp_${msg.id}`
+            : `msg_${cmpHex}_${openCodeId}_cmp_${visibleIndex}`;
         } else if (lastUserMatched && lastUserMessageId) {
-          const segmentSuffix = assistantSegmentIndex > 0 ? `_segment_${assistantSegmentIndex}` : "";
-          messageId = `msg_${openCodeId}_asst_${lastUserMessageId}${segmentSuffix}`;
+          const asstHex = timeHexOfMessageId(lastUserMessageId) ?? timeHexFromTimestamp(createdAt);
+          const segmentSuffix = assistantSegmentIndex > 0 ? `_segment_${String(assistantSegmentIndex).padStart(2, "0")}` : "";
+          // `~` sits above the base62 range OpenChamber ids use, so the
+          // assistant sorts after its parent user id when they share a turn.
+          messageId = `msg_${asstHex}~${openCodeId}_asst_${lastUserMessageId}${segmentSuffix}`;
         } else if (typeof msg.id === "string" && msg.id.length > 0) {
-          messageId = `msg_${openCodeId}_${msg.id}`;
+          messageId = `msg_${timeHexFromTimestamp(createdAt)}_${openCodeId}_${msg.id}`;
         } else {
-          messageId = `msg_${openCodeId}_${visibleIndex}`;
+          messageId = `msg_${timeHexFromTimestamp(createdAt)}_${openCodeId}_${visibleIndex}`;
         }
 
         visibleIndex++;
@@ -1273,6 +1283,24 @@ export async function loadMessagesFromFile(
     }
   }
   const onActiveBranch = activeBranchFilter(records);
+  // Command notices live in the sidecar file; they are placed by timestamp below.
+  const notices: AgentMessage[] = [];
+  for (const line of await readOcRecordLines(sessionPath)) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      if (entry.type !== "oc_notice" || typeof entry.text !== "string" || typeof entry.timestamp !== "number") continue;
+      notices.push({
+        id: `notice_${entry.timestamp}`,
+        role: "assistant",
+        content: [{ type: "text", text: entry.level === "info" ? entry.text : `⚠️ ${entry.text}` }],
+        stopReason: "stop",
+        timestamp: entry.timestamp,
+      } as unknown as AgentMessage);
+    } catch {
+      continue;
+    }
+  }
 
   for (const entry of records) {
     if (entry.type === "session") hasSessionHeader = true;
@@ -1331,6 +1359,12 @@ export async function loadMessagesFromFile(
   // A readable session file with no message records is a valid empty
   // transcript. Returning [] keeps it distinct from a file read failure
   // (null), so callers do not spawn OMP just to read an empty session.
+  for (const notice of notices) {
+    const at = (notice as unknown as { timestamp: number }).timestamp;
+    const index = messages.findIndex((m) => typeof (m as { timestamp?: unknown }).timestamp === "number" && (m as { timestamp: number }).timestamp > at);
+    if (index === -1) messages.push(notice);
+    else messages.splice(index, 0, notice);
+  }
   if (messages.length === 0) return hasSessionHeader ? [] : null;
   return mapRpcMessagesToOpenCodeRecords(messages, openCodeId, dbPath);
 }

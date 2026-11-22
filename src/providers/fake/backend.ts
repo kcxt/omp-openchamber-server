@@ -44,6 +44,7 @@ const fakeCapabilities: BackendCapabilities = {
   skills: false,
   compact: false,
   shell: false,
+  goals: false,
 };
 
 interface FakeSession {

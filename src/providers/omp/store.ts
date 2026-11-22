@@ -1,5 +1,6 @@
-import { readdir, stat, mkdir, unlink, appendFile, rename } from "node:fs/promises";
+import { readdir, stat, mkdir, unlink, rename } from "node:fs/promises";
 import { readFileSync } from "node:fs";
+import { appendOcRecord, ocStamp, readOcRecordLines, removeOcRecords, ocRecordsPath } from "./oc-records";
 import { basename, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -214,7 +215,7 @@ const aliasIndex = new Map<string, string>();
 
 /** Bind OpenChamber session `openCodeId` to the transcript omp moved it to. */
 export async function adoptOmpTranscript(openCodeId: string, transcriptPath: string): Promise<void> {
-  await appendFile(transcriptPath, JSON.stringify({ type: "oc_alias", openCodeId, timestamp: new Date().toISOString() }) + "\n");
+  await appendOcRecord(transcriptPath, { type: "oc_alias", openCodeId, timestamp: new Date().toISOString() });
   aliasIndex.set(openCodeId, transcriptPath);
 }
 
@@ -241,14 +242,13 @@ const headerCache = new Map<string, { mtimeMs: number; size: number; header: Pro
 export async function readSessionHeader(filePath: string): Promise<SessionHeader | null> {
   let mtimeMs: number;
   let size: number;
-  try {
-    const info = await stat(filePath);
-    mtimeMs = info.mtimeMs;
-    size = info.size;
-  } catch {
+  const info = await ocStamp(filePath);
+  if (!info) {
     headerCache.delete(filePath);
     return null;
   }
+  mtimeMs = info.mtimeMs;
+  size = info.size;
   const hit = headerCache.get(filePath);
   if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
     const cached = await hit.header;
@@ -267,8 +267,25 @@ async function parseSessionHeader(
 ): Promise<SessionHeader | null> {
   try {
     const text = await Bun.file(filePath).text();
-    const lines = text.split("\n");
-    const maxHeaderLines = Math.min(lines.length, 200);
+    const transcriptLines = text.split("\n");
+    const maxHeaderLines = Math.min(transcriptLines.length, 200);
+    const ocLines = await readOcRecordLines(filePath);
+    const lines = [...transcriptLines, ...ocLines];
+    // omp's assistant messages record provider and model but no effort, so the
+    // effort the user picked (kept in the sidecar) carries over to a turn that ran
+    // on that same model instead of being reset to "default" by it.
+    let pickedModel: { providerID: string; modelID: string; variant: string } | undefined;
+    for (const line of ocLines) {
+      if (!line.includes('"model_change"')) continue;
+      try {
+        const entry = JSON.parse(line);
+        const raw = typeof entry.model === "string" ? entry.model : "";
+        const slash = raw.indexOf("/");
+        if (entry.type === "model_change" && slash > 0) {
+          pickedModel = { providerID: raw.slice(0, slash), modelID: raw.slice(slash + 1), variant: typeof entry.role === "string" ? entry.role : "default" };
+        }
+      } catch { /* skip malformed JSON */ }
+    }
     let header: SessionHeader | null = null;
     let latestTitle: string | undefined;
     let firstUserPrompt: string | undefined;
@@ -378,7 +395,11 @@ async function parseSessionHeader(
             latestModel = {
               providerID: raw.provider,
               modelID: raw.model,
-              variant: typeof raw.variant === "string" ? raw.variant : "default",
+              variant: typeof raw.variant === "string"
+                ? raw.variant
+                : pickedModel && pickedModel.providerID === raw.provider && pickedModel.modelID === raw.model
+                  ? pickedModel.variant
+                  : "default",
             };
           }
           if (raw?.usage || raw?.cost) {
@@ -596,6 +617,7 @@ export async function deleteOmpSession(
     deletePersistedMessageIds(openCodeId);
     deletePersistedMessageIds(fromOpenCodeSessionId(openCodeId));
     await unlink(session.path);
+    await removeOcRecords(session.path);
     return true;
   } catch {
     return false;
@@ -640,6 +662,7 @@ export async function moveOmpSession(
       const temporaryPath = `${destinationPath}.tmp-${randomUUID()}`;
       await Bun.write(temporaryPath, rewritten);
       await rename(temporaryPath, destinationPath);
+      await rename(ocRecordsPath(session.path), ocRecordsPath(destinationPath)).catch(() => {});
       await unlink(session.path);
     }
 
@@ -700,7 +723,7 @@ export async function updateOmpSession(
   if (updates.agent !== undefined && updates.agent !== session.agent) {
     try {
       const timestamp = new Date().toISOString();
-      await appendFile(session.path, JSON.stringify({ type: "agent_change", agent: updates.agent, timestamp }) + "\n");
+      await appendOcRecord(session.path, { type: "agent_change", agent: updates.agent, timestamp });
       session.agent = updates.agent;
       session.time.updated = Date.now();
     } catch {
@@ -716,7 +739,7 @@ export async function updateOmpSession(
     try {
       const timestamp = new Date().toISOString();
       const value = `${updates.model.providerID}/${updates.model.modelID}`;
-      await appendFile(session.path, JSON.stringify({ type: "model_change", model: value, role: updates.model.variant, timestamp }) + "\n");
+      await appendOcRecord(session.path, { type: "model_change", model: value, role: updates.model.variant, timestamp });
       session.model = {
         id: value,
         providerID: updates.model.providerID,
@@ -732,11 +755,11 @@ export async function updateOmpSession(
   if (updates.revert !== undefined) {
     try {
       const timestamp = new Date().toISOString();
-      await appendFile(session.path, JSON.stringify({
+      await appendOcRecord(session.path, {
         type: "revert_change",
         revert: updates.revert ?? undefined,
         timestamp,
-      }) + "\n");
+      });
       session.revert = updates.revert ?? undefined;
       session.time.updated = Date.now();
     } catch {
@@ -751,12 +774,11 @@ export async function updateOmpSession(
   if (updates.metadata !== undefined && typeof updates.metadata === "object") {
     try {
       const timestamp = new Date().toISOString();
-      const metadataEntry = JSON.stringify({
+      await appendOcRecord(session.path, {
         type: "metadata",
         metadata: updates.metadata,
         timestamp,
-      }) + "\n";
-      await appendFile(session.path, metadataEntry);
+      });
       session.metadata = { ...(session.metadata || {}), ...updates.metadata };
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
@@ -769,12 +791,11 @@ export async function updateOmpSession(
     try {
       const timestamp = new Date().toISOString();
       const archivedVal = updates.time.archived ?? 0;
-      const archiveEntry = JSON.stringify({
+      await appendOcRecord(session.path, {
         type: "archive",
         archived: archivedVal,
         timestamp,
-      }) + "\n";
-      await appendFile(session.path, archiveEntry);
+      });
       session.time = { ...session.time, archived: archivedVal };
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
@@ -788,12 +809,11 @@ export async function updateOmpSession(
   if (updates.time?.viewed !== undefined) {
     try {
       const viewed = updates.time.viewed;
-      const viewedEntry = JSON.stringify({
+      await appendOcRecord(session.path, {
         type: "viewed",
         viewed,
         timestamp: new Date().toISOString(),
-      }) + "\n";
-      await appendFile(session.path, viewedEntry);
+      });
       session.time = { ...session.time, viewed };
       emitOpenCodeV2Event("session.viewed", { sessionID: openCodeId, idle: viewed }, session.directory);
     } catch {

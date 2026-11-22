@@ -12,5 +12,4 @@ export * from "./git";
 export * from "./message-queue";
 export * from "./project-context";
 export * from "./prompt";
-export * from "./session-knowledge";
 export * from "./small-model";

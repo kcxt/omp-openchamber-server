@@ -789,7 +789,7 @@ export function nextSessionTodosRevision(): number {
  */
 export function emitOpenChamberSessionTodos(
   sessionID: string,
-  directory: string,
+  directory: string | undefined,
   todos: Array<{ content: string; status: string }>,
 ): void {
   emitOpenCodeEvent("openchamber:session-todos", {

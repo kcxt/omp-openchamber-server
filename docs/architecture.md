@@ -70,11 +70,9 @@ contracts. OpenChamber-specific compatibility logic stays under its adapter;
 - **Deterministic ID Translation**: Reversibly maps OMP UUIDs (`8-4-4-4-12`) to OpenCode format (`ses_<32hex>`).
 - **Session Creation**: Pre-allocates session header JSONL files for immediate UI visibility and navigation.
 
-### 3. OpenChamber context compatibility (`src/adapters/openchamber/project-context.ts`, `src/adapters/openchamber/session-knowledge.ts`)
+### 3. OpenChamber context compatibility (`src/adapters/openchamber/project-context.ts`)
 - Owns notes, project todos, and plan markdown when the UI connects directly to the sidecar.
 - Stores context under `$OPENCHAMBER_DATA_DIR/projects/<projectId>/context.json` and plan files under the matching `plans/` directory.
-- Keeps pinned notes and plans in `metadata.openchamber` on the session JSONL record, so context survives a browser restart and follows the session.
-- Returns knowledge text to the UI; the UI attaches it to outgoing prompts as a synthetic part.
 
 ### 4. Provider Registry (`src/providers/registry.ts`)
 

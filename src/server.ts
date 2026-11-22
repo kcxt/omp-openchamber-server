@@ -40,11 +40,13 @@ import {
   discardSessionConnection,
   sessionOwnedElsewhere,
   compactSession,
+  applyGoalChange,
   getSessionStatusMap,
   reconcileSessionStatuses,
   removeSessionState,
   shutdownAll,
 } from "./adapters/openchamber/prompt";
+import { ocGoalOf } from "./adapters/openchamber/goal";
 import { followSession, followedStatuses, stopFollowingAll } from "./adapters/openchamber/follow";
 
 import { page, toV2FileAttachment, toV2Message, toV2Session } from "./adapters/openchamber/v2";
@@ -66,6 +68,7 @@ import { randomUUID } from "node:crypto";
 import { fakeBackend } from "./providers/fake/backend";
 import { describeSmallModel, generateSmallModelText, readOmpConfigSmallModel, resolveSmallModel, resolveProviderConnection, ensureLegacyOmpConfigMigrated } from "./adapters/openchamber/small-model";
 import { handleOmpConfigRoute, listOmpSlashCommands } from "./adapters/openchamber/omp-config";
+import { attachOmpSessionContext, loadOmpContext } from "./adapters/openchamber/omp-context";
 import { handleOmpSettingsRoute } from "./adapters/openchamber/omp-settings";
 import { createTerminalRuntime, TERMINAL_WS_PATH } from "./adapters/openchamber/terminal";
 import { createClientAuthRuntime } from "./adapters/openchamber/client-auth";
@@ -73,7 +76,6 @@ import { handleGitRequest } from "./adapters/openchamber/git";
 import { createMessageQueueRuntime, isQueueError } from "./adapters/openchamber/message-queue";
 import { buildUsageStats } from "./adapters/openchamber/usage-stats";
 import { createProjectContextRuntime, handleProjectContextRequest } from "./adapters/openchamber/project-context";
-import { createSessionKnowledgeRuntime, handleSessionKnowledgeRequest } from "./adapters/openchamber/session-knowledge";
 
 /** Sessions this sidecar is driving plus those it only follows in another omp. */
 const allSessionStatuses = (directory?: string) => ({ ...followedStatuses(directory), ...getSessionStatusMap(directory) });
@@ -320,15 +322,6 @@ const openChamberDataDir = Bun.env.OPENCHAMBER_DATA_DIR
 
 const projectContextRuntime = createProjectContextRuntime({
   projectsDirPath: join(openChamberDataDir, "projects"),
-});
-
-const sessionKnowledgeRuntime = createSessionKnowledgeRuntime({
-  projectContextRuntime,
-  getSession: async (sessionId, directory) => (await resolveSessionRoute(sessionId, directory)).session,
-  updateSessionMetadata: async (sessionId, directory, metadata) => {
-    const { backend } = await resolveSessionRoute(sessionId, directory);
-    return backend.store.update(sessionId, { metadata }, directory);
-  },
 });
 
 function getOpenChamberSettingsFile(): string {
@@ -666,14 +659,6 @@ const server = Bun.serve<SidecarWebSocketData>({
         return json(
           projectContextRoute.body,
           projectContextRoute.status === undefined ? undefined : { status: projectContextRoute.status },
-        );
-      }
-
-      const sessionKnowledgeRoute = await handleSessionKnowledgeRequest(req, url, sessionKnowledgeRuntime);
-      if (sessionKnowledgeRoute) {
-        return json(
-          sessionKnowledgeRoute.body,
-          sessionKnowledgeRoute.status === undefined ? undefined : { status: sessionKnowledgeRoute.status },
         );
       }
 
@@ -1452,6 +1437,18 @@ const MIME_TYPES: Record<string, string> = {
         return json([]);
       }
 
+      const contextMatch = path.match(/^\/api\/omp\/context\/([^/]+)$/);
+      if (contextMatch && req.method === "GET") {
+        try {
+          const sessionId = decodeURIComponent(contextMatch[1]!);
+          const { backend, session } = await resolveSessionRoute(sessionId, dir);
+          if (!session) return jsonError("session not found", 404);
+          return json(await loadOmpContext(backend, session, { breakdown: url.searchParams.get("breakdown") === "1" }));
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "context lookup failed", 500);
+        }
+      }
+
       if (path === "/api/omp/settings" || path.startsWith("/api/omp/settings/")) {
         const settingsResponse = await handleOmpSettingsRoute(req, path);
         if (settingsResponse?.html !== undefined) {
@@ -2005,9 +2002,10 @@ const MIME_TYPES: Record<string, string> = {
         const openCodeId = sMatch[1];
         if (req.method === "GET") {
           try {
-            const { session } = await resolveSessionRoute(openCodeId, dir);
+            const { backend, session } = await resolveSessionRoute(openCodeId, dir);
             if (!session) return jsonError("session not found", 404);
-            return json({ data: toV2Session(attachOmpRecapAssist([session])[0] ?? session) });
+            const withContext = await attachOmpSessionContext(backend, attachOmpRecapAssist([session])[0] ?? session);
+            return json({ data: toV2Session(withContext) });
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "lookup failed", 500);
         }
@@ -2033,13 +2031,19 @@ const MIME_TYPES: Record<string, string> = {
             metadata?: Record<string, unknown>;
             time?: { archived?: number | null };
           } | undefined;
-          const { backend } = await resolveSessionRoute(openCodeId, dir);
+          const { backend, session } = await resolveSessionRoute(openCodeId, dir);
+          const previousGoal = ocGoalOf(session?.metadata);
           const updated = await backend.store.update(
             openCodeId,
             { title: body?.title, metadata: body?.metadata, time: body?.time },
             dir,
           );
           if (!updated) return jsonError("session not found", 404);
+          // OpenChamber's goal record is served by omp's own goal, not OpenChamber's audit loop.
+          if (body?.metadata && "openchamber" in body.metadata && backend.capabilities.goals) {
+            void applyGoalChange(openCodeId, updated.directory, updated.path, previousGoal, ocGoalOf(updated.metadata))
+              .catch((err) => logger.warn({ err, sessionID: openCodeId }, "[goal] could not apply the goal change to omp"));
+          }
           return noContent();
         } catch (err) {
           return jsonError(err instanceof Error ? err.message : "update failed", 500);
@@ -2199,18 +2203,10 @@ const MIME_TYPES: Record<string, string> = {
         const { backend, session } = await resolveSessionRoute(compactMatch[1], dir);
         if (!session) return jsonError("session not found", 404);
         if (!backend.capabilities.compact) return jsonError("summarize not supported by backend", 501);
-        let usedPersistentConnection = false;
         try {
-          usedPersistentConnection = await compactSession(session.id, session.directory);
-        } catch {
-          // Preserve the legacy best-effort compact behavior when the current
-          // persistent child rejects the RPC; do not fall back to ambient auth.
-          usedPersistentConnection = true;
-        }
-        if (!usedPersistentConnection) {
-          await withOmpRpc(session.directory, async (conn) => {
-            await conn.request("compact", {});
-          }).catch(() => {});
+          await compactSession(session.id, session.directory, session.path);
+        } catch (err) {
+          return jsonError(err instanceof Error ? err.message : "summarize failed", 409);
         }
         invalidateMessageCache(session.id, session.directory);
         emitSessionCompacted(session.id, session.directory);
@@ -3300,6 +3296,17 @@ function logStartupBanner(port?: number): void {
 }
 
 logStartupBanner(server.port);
+
+// Guest services spawn without the host environment, so they cannot learn a non-default
+// OC_SIDECAR_PORT. They read this file instead (extensions/omp-settings/service).
+try {
+  const endpointDir = join(openChamberDataDir, "omp-sidecar");
+  mkdirSync(endpointDir, { recursive: true });
+  const host = sidecarHost === "0.0.0.0" || sidecarHost === "::" ? "127.0.0.1" : sidecarHost;
+  writeFileSync(join(endpointDir, "endpoint.json"), JSON.stringify({ url: `http://${host}:${server.port}`, pid: process.pid }));
+} catch (err) {
+  logger.warn({ err }, "[sidecar] could not publish endpoint.json");
+}
 messageQueueRuntime.start();
 const stopOmpUpdateChecker = startOmpUpdateChecker();
 

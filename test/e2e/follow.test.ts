@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { OmpInstance } from "./omp";
 import { startStack, type Stack } from "./stack";
+import { appendFileSync } from "node:fs";
 
 let stack: Stack;
 beforeAll(async () => { stack = await startStack({ env: { OC_FOLLOW_POLL_MS: "100" } }); });
@@ -61,5 +62,56 @@ describe("a session a terminal omp owns is followed live", () => {
     // Read-only: following never wrote or forked anything.
     expect(stack.sessionFiles().filter((f) => JSON.stringify(f.records).includes("slow please")).length).toBe(1);
     await terminal.close();
+  });
+});
+
+describe("a dead turn left in a transcript stays idle", () => {
+  let dead: Stack;
+  // The slow boot makes the ownership probe take as long as a real omp's does: that window is the flap.
+  beforeAll(async () => { dead = await startStack({ env: { OC_FOLLOW_POLL_MS: "100", OC_FOLLOW_OWNER_CHECK_MS: "300", OMP_STUB_START_DELAY_MS: "700" } }); });
+  afterAll(() => dead.stop());
+
+  test("a mid-turn tail with no live owner is never reported busy", async () => {
+    const deadDir = encodeURIComponent(dead.project);
+    const terminal = await OmpInstance.start(dead, dead.project);
+    await terminal.prompt("seed dead turn");
+    await terminal.close();
+
+    const file = dead.sessionFiles().find((f) => JSON.stringify(f.records).includes("seed dead turn"))!;
+    const messages = file.records.filter((r) => r.type === "message");
+    const lastAssistant = [...messages].reverse().find((r) => r.message?.role === "assistant")!;
+    const id = ((await dead.http(`/session?directory=${deadDir}`)).body.data as any[]).find((s) => s.title === "seed dead turn").id;
+    const busy = async () => (await dead.http(`/session/status?directory=${deadDir}`)).body?.[id]?.type === "busy";
+
+    // A tool call with no result: the turn is dead, and no omp owns the transcript.
+    const dangling = structuredClone(lastAssistant);
+    dangling.id = "deadturn00000001";
+    dangling.parentId = messages.at(-1)!.id;
+    dangling.timestamp = new Date().toISOString();
+    dangling.message.timestamp = Date.now();
+    dangling.message.content = [{ type: "toolCall", id: "toolu_dead", name: "bash", arguments: { command: "sleep 999" } }];
+    dangling.message.stopReason = "toolUse";
+    appendFileSync(file.path, JSON.stringify(dangling) + "\n");
+
+    // The file keeps growing, as the OpenChamber turn heartbeat makes it do.
+    const heartbeat = setInterval(() => appendFileSync(file.path, JSON.stringify({ type: "metadata", metadata: { openchamber: { turn: { endedAt: Date.now(), durationMs: 31000 } } }, timestamp: new Date().toISOString() }) + "\n"), 100);
+    // OpenChamber reads the session on open and again at every busy → idle it sees. A dead tail
+    // must never be reported busy, however often it is read: reported busy until the ownership
+    // probe finished (seconds with a real omp), it made OpenChamber log a turn per read, forever.
+    const busySamples: boolean[] = [];
+    try {
+      for (let i = 0; i < 4; i++) {
+        await dead.http(`/session/${id}/message?directory=${deadDir}`);
+        const until = Date.now() + 1_000;
+        while (Date.now() < until) {
+          busySamples.push(await busy());
+          await Bun.sleep(50);
+        }
+      }
+    } finally {
+      clearInterval(heartbeat);
+    }
+    expect(busySamples.length).toBeGreaterThan(40);
+    expect(busySamples.filter(Boolean).length).toBe(0);
   });
 });

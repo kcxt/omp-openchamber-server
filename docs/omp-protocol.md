@@ -41,6 +41,10 @@ Commands sent to OMP `stdin` take the shape `{"type": "<command>", "id": "<corre
 | `new_session` | `{"parentSession"?: string}` | Starts a new session or forks from a parent session. |
 | `abort` | `{}` | Requests immediate interruption of active turn generation. |
 
+### Goal mode
+
+OpenChamber's goal (`metadata.openchamber.goal`) is served by omp's own goal, not by OpenChamber's audit loop. A `PATCH /session/:id` that arms, pauses, resumes or clears the record becomes an RPC `goal` command (`create`/`resume`/`pause`/`drop`, `src/adapters/openchamber/goal.ts`). The embedded child runs with `goal.continuationModes: [rpc]`, so omp starts each goal turn itself and the agent ends the goal by calling its `goal` tool. The sidecar keeps the session busy until omp settles, which keeps OpenChamber's loop (it only acts on an idle session with an active goal) from auditing or prompting. omp's `goal_updated` events are mirrored back into the record: `complete` ("reported by agent"), `budgetLimited`, token use, and `blocked` when omp stops continuing with the goal still open. OpenChamber's briefing synthetic reminder, which tells the agent its last message is judged by an independent check, is dropped from the prompt.
+
 ---
 
 ## 3. Event Vocabulary
@@ -74,7 +78,8 @@ OMP stores session transcripts under:
 
 - **Path Slug**: omp's bucket name for the canonical (realpath) cwd: `-<relative>` under `$HOME` (`/home/me/git/x` → `-git-x`), `-tmp-<relative>` under the temp root, and `--<absolute>--` for anything else (`/srv/x` → `--srv-x--`), with `/`, `\` and `:` turned into `-`. The sessions root is `$PI_CODING_AGENT_DIR/sessions`, default `~/.omp/agent/sessions`. `src/providers/omp/paths.ts` mirrors this.
 - **Tree**: entries carry `id`/`parentId`; the conversation is the path from the last entry back to the root, so branches abandoned by `/tree` or an edit stay in the file but are not shown.
-- **Leases and forks**: a process owns a session while it lives. A second process that writes it moves to a sibling file (new id, `parentSession` pointing back). When OpenChamber's child does this, the sidecar appends an `oc_alias` line carrying the OpenChamber session id to the sibling, and that id continues there. An idle child is released after `OC_CHILD_IDLE_MS` (default 120000) so a terminal omp can take the session over without forking. `parentSession` is lineage only; just artifact sub-sessions are children.
+- **Leases and forks**: a process owns a session while it lives. A second process that writes it moves to a sibling file (new id, `parentSession` pointing back). When OpenChamber's child does this, the sidecar records an `oc_alias` carrying the OpenChamber session id for the sibling, and that id continues there. An idle child is released after `OC_CHILD_IDLE_MS` (default 120000) so a terminal omp can take the session over without forking. `parentSession` is lineage only; just artifact sub-sessions are children.
+- **Sidecar records**: everything the sidecar itself records about a session (`oc_alias`, `oc_notice`, `agent_change`, `model_change`, `revert_change`, `metadata`, `archive`, `viewed`) lives in `<session>.jsonl.oc`, never in omp's transcript. omp replays the transcript as a tree whose active leaf is the last line's `id`; a line without an `id` leaves the leaf undefined and the next child to load the file sees an empty history. `src/providers/omp/oc-records.ts` owns the file and moves such lines out of transcripts older sidecars wrote them into, before a child loads one.
 - **File Format**: Append-only (or state-rewritten) JSON Lines.
 - **Header Line**: The first line contains a `type: "session"` metadata object:
   ```json

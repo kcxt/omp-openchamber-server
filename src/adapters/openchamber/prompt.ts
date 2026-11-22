@@ -2,6 +2,7 @@ import { allBackends, backendById, backendForSession, nativeProviderID, splitPro
 import type {
   BackendSubagentSnapshot,
   BackendCredentialInput,
+  BackendGoalSnapshot,
   BackendTurnConnection,
   ImageContent,
   ModelRef,
@@ -49,8 +50,10 @@ import {
 } from "./approvals";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { isBlobRef, readBlobBufferSync } from "../../shared/blobs";
-import { randomUUID } from "node:crypto";
-import { appendFile, readFile } from "node:fs/promises";
+import { randomIdSuffix, timeHexFromTimestamp, timeHexOfMessageId, timeSortableHex } from "../../shared/message-id";
+import { readFile } from "node:fs/promises";
+import { appendOcRecord } from "../../providers/omp/oc-records";
+import { goalChangeFor, ocGoalOf, ocPatchForOmpGoal, withGoalPatch, type GoalChange, type OcGoal } from "./goal";
 import { invalidateMessageCache } from "../../providers/omp/messages";
 import { isAbsolute, resolve } from "node:path";
 
@@ -106,6 +109,13 @@ interface SessionState {
   pendingInbox: string[];
   /** Releases the child once it has been idle for OC_CHILD_IDLE_MS. */
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** Set when abort had to kill the child; its pending prompt then rejects by design. */
+  killedOnAbort?: boolean;
+  /** A goal OpenChamber just armed, waiting for the prompt that carries its objective. */
+  pendingGoal?: { change: Extract<GoalChange, { op: "start" | "resume" }>; timer: ReturnType<typeof setTimeout> };
+  /** Last time omp's goal progress was mirrored into OpenChamber's metadata. */
+  goalSyncedAt?: number;
+  unsubscribeGoal?: () => void;
 }
 
 function sessionKey(openCodeId: string, cwd: string): string {
@@ -142,7 +152,7 @@ async function releaseIdleChild(state: SessionState): Promise<void> {
   const key = sessionKey(state.openCodeId, state.cwd);
   const release = await acquireSessionLock(key);
   try {
-    if (sessionStates.get(key) !== state || state.busy) return;
+    if (sessionStates.get(key) !== state || state.busy || state.pendingGoal) return;
     // Background work (an async task, a subagent) may still wake the session.
     const settled = await state.conn.isSettled?.().catch(() => false) ?? true;
     if (!settled) return scheduleIdleRelease(state);
@@ -529,7 +539,7 @@ async function extractPromptFileText(body: PromptBody, cwd: string): Promise<str
 }
 
 function makeMessageId(openCodeId: string, suffix?: string): string {
-  return `msg_${openCodeId}_${suffix ?? randomUUID().replace(/-/g, "")}`;
+  return `msg_${timeSortableHex()}_${openCodeId}_${suffix ?? randomIdSuffix()}`;
 }
 
 /**
@@ -808,10 +818,15 @@ export function createEventHandler(
     if (hasStarted) return;
     hasStarted = true;
     assistantStartTime = Date.now();
-    assistantMessageID = makeMessageId(
-      openCodeId,
-      currentParentID ? `asst_${currentParentID}` : `assistant_${assistantStartTime}`,
-    );
+    if (currentParentID) {
+      // `~` (RFC-3986 unreserved, above the base62 range OpenChamber ids use)
+      // keeps the assistant id after its parent user id when both share the
+      // same 12-hex turn token.
+      const asstHex = timeHexOfMessageId(currentParentID) ?? timeHexFromTimestamp(assistantStartTime);
+      assistantMessageID = `msg_${asstHex}~${openCodeId}_asst_${currentParentID}`;
+    } else {
+      assistantMessageID = `msg_${timeHexFromTimestamp(assistantStartTime)}_${openCodeId}_assistant_${assistantStartTime}`;
+    }
     emitAssistantInfo(openCodeId, assistantMessageID, currentParentID, model, undefined, cwd, assistantStartTime);
   };
 
@@ -1223,8 +1238,217 @@ async function getOrCreateSessionState(
     pendingInbox: [],
   };
 
+  state.unsubscribeGoal = conn.onGoalUpdate?.((goal) => void mirrorGoal(state, goal));
   sessionStates.set(key, state);
   return state;
+}
+
+/**
+ * Mirrors omp's goal into OpenChamber's goal record. omp settles a goal itself
+ * (the agent calls the `goal` tool); OpenChamber must learn it from here, as its
+ * own loop is not the one deciding. Progress writes are throttled, settling
+ * ones are not.
+ */
+async function mirrorGoal(state: SessionState, goal: BackendGoalSnapshot | null, extra?: Partial<OcGoal>): Promise<void> {
+  const patch = { ...ocPatchForOmpGoal(goal), ...extra };
+  if (Object.keys(patch).length === 0) return;
+  const settling = patch.status !== undefined;
+  if (!settling && Date.now() - (state.goalSyncedAt ?? 0) < 2_000) return;
+  try {
+    const backend = backendForSession(state.openCodeId);
+    const session = await backend.store.get(state.openCodeId, state.cwd);
+    const metadata = withGoalPatch(session?.metadata, patch);
+    if (!metadata) return;
+    state.goalSyncedAt = Date.now();
+    await backend.store.update(state.openCodeId, { metadata }, state.cwd);
+  } catch (err) {
+    promptLogger.warn({ err, sessionID: state.openCodeId }, "[goal] could not mirror omp's goal into the session metadata");
+  }
+}
+
+/**
+ * OpenChamber briefs the agent for its own goal loop: the final message is judged
+ * by an independent check and ends the run. omp's goal works the other way (the
+ * agent calls the `goal` tool), so omp's own goal prompt replaces that briefing.
+ */
+function isOpenChamberGoalBriefing(text: string): boolean {
+  return /^\s*<system-reminder>\s*Goal mode is active for this session/.test(text);
+}
+
+/** Attaches a fresh event handler for one omp turn; `onComplete` fires at its terminal event. */
+function attachTurn(state: SessionState, parentMessageID: string | undefined, onComplete: () => void): void {
+  const { openCodeId, cwd } = state;
+  state.unsubscribe();
+  state.unsubscribe = state.conn.onEvent(
+    createEventHandler(
+      openCodeId, parentMessageID, state.currentModel, onComplete, cwd, state.pendingInbox,
+      // omp keeps no record of a command's notify message; without one the
+      // reply vanishes on the next refetch and the turn reads as unanswered.
+      (text, level, timestamp) => {
+        void appendOcRecord(state.sessionPath, { type: "oc_notice", text, level, timestamp })
+          .then(() => invalidateMessageCache(openCodeId, cwd))
+          .catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, "[prompt] could not persist command notice"));
+      },
+    ),
+  );
+}
+
+/**
+ * Starts (or restarts) omp's goal from what OpenChamber armed. A goal omp still
+ * holds from an earlier arming is dropped first: omp allows one goal at a time.
+ */
+async function startOmpGoal(state: SessionState, change: Extract<GoalChange, { op: "start" | "resume" }>): Promise<void> {
+  const goal = state.conn.goal?.bind(state.conn);
+  if (!goal) return;
+  const held = await state.conn.getGoal?.().catch(() => null);
+  if (change.op === "resume" && held) {
+    if (held.status === "active") await goal("pause").catch(() => {}); // re-arms continuation, which omp stopped
+    if (held.status === "active" || held.status === "paused") {
+      await goal("resume");
+      return;
+    }
+  }
+  if (held && held.status !== "complete" && held.status !== "dropped") await goal("drop").catch(() => {});
+  await goal("create", { objective: change.objective, tokenBudget: change.tokenBudget });
+}
+
+/** How long a freshly armed goal on an idle session waits for the prompt that carries its objective. */
+const GOAL_PROMPT_GRACE_MS = 1_500;
+/** Hard stop for one run of goal turns; omp's own token budget and the agent normally end it far sooner. */
+const GOAL_MAX_TURNS = 500;
+
+/**
+ * After a terminal turn: while omp's goal is active omp starts the next turn
+ * by itself. Stream those turns into the same OpenChamber turn and keep the
+ * session busy, so OpenChamber's own goal loop (which only acts on an idle
+ * session) stays out. Returns once omp settled, with the goal ended or stalled.
+ */
+async function followGoalTurns(state: SessionState, parentMessageID: string | undefined): Promise<void> {
+  if (!state.conn.getGoal) return;
+  for (let turns = 0; turns < GOAL_MAX_TURNS; turns++) {
+    const goal = await state.conn.getGoal().catch(() => null);
+    if (goal?.status !== "active") return;
+
+    const next = Promise.withResolvers<void>();
+    attachTurn(state, parentMessageID, () => next.resolve());
+    let watching = true;
+    const settled = (async () => {
+      while (watching) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        if (!watching) return false;
+        if (state.conn.isAlive?.() === false) return false;
+        if (await state.conn.isSettled?.().catch(() => false)) return false;
+      }
+      return false;
+    })();
+    const ran = await Promise.race([next.promise.then(() => true), settled]);
+    watching = false;
+    if (!ran) {
+      // omp stopped continuing with the goal still open (no progress, or a host stop).
+      const still = await state.conn.getGoal().catch(() => null);
+      if (still?.status === "active") {
+        await mirrorGoal(state, still, {
+          status: "blocked",
+          statusReason: "The agent made no progress on its last goal turn. Send a message or resume the goal to continue.",
+        });
+      }
+      return;
+    }
+  }
+}
+
+/** Common end of a turn: follow a moved transcript, go idle, refresh usage. */
+async function finishTurn(state: SessionState): Promise<void> {
+  const { openCodeId, cwd } = state;
+  state.unsubscribe();
+  // Before going idle, so a refetch the idle event provokes already reads the right file.
+  if (state.conn.getSessionFile) {
+    await Promise.race([followMovedTranscript(state), new Promise((resolve) => setTimeout(resolve, 2_000).unref?.())]);
+  }
+  state.busy = false;
+  scheduleIdleRelease(state);
+  try {
+    const session = await backendForSession(openCodeId).store.get(openCodeId, cwd);
+    if (session) {
+      emitOpenCodeV2Event("session.usage.updated", {
+        sessionID: openCodeId,
+        cost: session.cost,
+        tokens: session.tokens,
+      }, cwd);
+    }
+  } catch {
+    // Usage refresh is best effort; completion events must still be delivered.
+  }
+  emitSessionStatus(openCodeId, { type: "idle" }, cwd);
+  emitSessionIdle(openCodeId, cwd);
+}
+
+/** A goal armed on an idle session with no prompt following: omp starts it on its own. */
+async function kickOffGoal(state: SessionState): Promise<void> {
+  const key = sessionKey(state.openCodeId, state.cwd);
+  const release = await acquireSessionLock(key);
+  try {
+    const pending = state.pendingGoal;
+    state.pendingGoal = undefined;
+    if (!pending || sessionStates.get(key) !== state || state.busy) return;
+    cancelIdleRelease(state);
+    state.busy = true;
+    emitSessionStatus(state.openCodeId, { type: "busy" }, state.cwd);
+    void (async () => {
+      try {
+        await startOmpGoal(state, pending.change);
+        await followGoalTurns(state, undefined);
+      } catch (err) {
+        emitSessionError(state.openCodeId, err, state.cwd);
+        promptLogger.error({ err, sessionID: state.openCodeId }, "[goal] could not start omp's goal");
+      } finally {
+        await finishTurn(state);
+      }
+    })();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Applies a change OpenChamber made to a session's goal record to omp's goal.
+ * Starting waits briefly for the prompt that carries the objective, so that
+ * prompt and the goal share one turn instead of racing a continuation.
+ */
+export async function applyGoalChange(
+  openCodeId: string,
+  cwd: string,
+  sessionPath: string,
+  prev: unknown,
+  next: unknown,
+): Promise<void> {
+  const change = await goalChangeFor(openCodeId, ocGoalOf({ openchamber: { goal: prev } }), ocGoalOf({ openchamber: { goal: next } }));
+  if (!change) return;
+  const key = sessionKey(openCodeId, cwd);
+  const release = await acquireSessionLock(key);
+  try {
+    if (change.op === "pause" || change.op === "drop") {
+      const state = sessionStates.get(key);
+      if (state?.pendingGoal) {
+        clearTimeout(state.pendingGoal.timer);
+        state.pendingGoal = undefined;
+      }
+      await state?.conn.goal?.(change.op).catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, `[goal] omp goal ${change.op} failed`));
+      return;
+    }
+    const state = await getOrCreateSessionState(openCodeId, cwd, sessionPath);
+    if (!state.conn.goal) return;
+    if (state.pendingGoal) clearTimeout(state.pendingGoal.timer);
+    if (state.busy) {
+      state.pendingGoal = undefined;
+      await startOmpGoal(state, change);
+      return;
+    }
+    cancelIdleRelease(state);
+    state.pendingGoal = { change, timer: setTimeout(() => void kickOffGoal(state), GOAL_PROMPT_GRACE_MS) };
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -1254,13 +1478,17 @@ async function applyModelRef(state: SessionState, model: ModelRef, strict: boole
     }
   }
   const level = ompThinkingLevel(model.variant);
-  // A model switch resets the effort to that model's default, so re-assert it.
-  if (level && state.conn.setThinkingLevel && (level !== ompThinkingLevel(state.currentModel.variant) || !sameModel)) {
+  // Always assert the picked effort: omp resets it on a model switch, restores
+  // its own on a session load, and a tracked copy of it goes stale. The call is
+  // idempotent and cheap.
+  let applied = true;
+  if (level && state.conn.setThinkingLevel) {
     await state.conn.setThinkingLevel(level).catch((err) => {
+      applied = false;
       promptLogger.warn({ err, sessionID: state.openCodeId, level }, `[prompt] ${state.openCodeId} thinking level ${level} rejected`);
     });
   }
-  state.currentModel = defaultModelRef(model);
+  state.currentModel = defaultModelRef(applied ? model : { ...model, variant: state.currentModel.variant });
 }
 
 /**
@@ -1302,8 +1530,8 @@ export async function promptSessionAsync(
   const queuedContext = syntheticContext.get(contextKey) ?? [];
   const fileContext = await extractPromptFileText(body, cwd);
   const promptText = [
-    ...queuedContext.map((item) => item.text),
-    ...promptTextParts.filter((part) => part.synthetic === true).map((part) => part.text),
+    ...queuedContext.map((item) => item.text).filter((text) => !isOpenChamberGoalBriefing(text)),
+    ...promptTextParts.filter((part) => part.synthetic === true && !isOpenChamberGoalBriefing(part.text)).map((part) => part.text),
     userPromptText,
     ...fileContext,
   ].filter(Boolean).join("\n\n");
@@ -1413,24 +1641,22 @@ export async function promptSessionAsync(
         // run on whatever model the child booted with (omp's default role).
         if (modelRef) await applyModelRef(state, modelRef, true);
 
-        state.unsubscribe();
-        state.unsubscribe = state.conn.onEvent(
-          createEventHandler(
-            openCodeId, parentMessageID, state.currentModel, complete, cwd, state.pendingInbox,
-            // omp keeps no record of a command's notify message; without one the
-            // reply vanishes on the next refetch and the turn reads as unanswered.
-            (text, level, timestamp) => {
-              void appendFile(sessionPath, JSON.stringify({ type: "oc_notice", text, level, timestamp }) + "\n")
-                .then(() => invalidateMessageCache(openCodeId, cwd))
-                .catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, "[prompt] could not persist command notice"));
-            },
-          ),
-        );
+        attachTurn(state, parentMessageID, complete);
 
         await state.conn.prompt(
           buildPromptPayload(promptText, images, body.delivery === "steer" ? "steer" : undefined),
         );
+        const armed = state.pendingGoal;
+        if (armed) {
+          clearTimeout(armed.timer);
+          state.pendingGoal = undefined;
+          await startOmpGoal(state, armed.change).catch((err) => {
+            emitSessionError(openCodeId, err, cwd);
+            promptLogger.error({ err, sessionID: openCodeId }, `[goal] ${openCodeId} could not start omp's goal`);
+          });
+        }
         await completion;
+        await followGoalTurns(state, parentMessageID);
 
         if (visiblePromptText && !isLowSignalTitleInput(visiblePromptText)) {
           (async () => {
@@ -1451,6 +1677,10 @@ export async function promptSessionAsync(
           })();
         }
       } catch (err) {
+        if (state.killedOnAbort) {
+          promptLogger.info({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} child killed by abort`);
+          return;
+        }
         // A terminal event is authoritative even if the RPC acknowledgement
         // fails afterward. Do not append a second assistant message that can
         // overwrite a provider error (or a successful terminal message) in
@@ -1478,27 +1708,7 @@ export async function promptSessionAsync(
         emitAssistantPart(openCodeId, messageID, makePartId(openCodeId, messageID, "text", 0), "text", `Prompt failed: ${errorMessage}`);
         promptLogger.error({ err, sessionID: openCodeId }, `[prompt] ${openCodeId} failed`);
       } finally {
-        state.unsubscribe();
-        // Before going idle, so a refetch the idle event provokes already reads the right file.
-        if (state.conn.getSessionFile) {
-          await Promise.race([followMovedTranscript(state), new Promise((resolve) => setTimeout(resolve, 2_000).unref?.())]);
-        }
-        state.busy = false;
-        scheduleIdleRelease(state);
-        try {
-          const session = await backendForSession(openCodeId).store.get(openCodeId, cwd);
-          if (session) {
-            emitOpenCodeV2Event("session.usage.updated", {
-              sessionID: openCodeId,
-              cost: session.cost,
-              tokens: session.tokens,
-            }, cwd);
-          }
-        } catch {
-          // Usage refresh is best effort; completion events must still be delivered.
-        }
-        emitSessionStatus(openCodeId, { type: "idle" }, cwd);
-        emitSessionIdle(openCodeId, cwd);
+        await finishTurn(state);
       }
     })();
 
@@ -1509,20 +1719,36 @@ export async function promptSessionAsync(
 }
 
 /**
- * Compact through a session's persistent connection only for credentialed
- * sessions. This is important because spawning a separate ambient OMP child
- * would silently lose the caller-owned provider configuration. Legacy
- * sessions deliberately return false so the HTTP route keeps its old
- * ephemeral-RPC behavior.
+ * Compacts the session through the omp child that holds it, starting one on the
+ * session's transcript when none is live. A bare child would compact omp's own
+ * fresh, empty session and leave this transcript untouched.
  *
- * Returns false when no persistent connection exists so the legacy caller can
- * retain its existing ephemeral-RPC behavior.
+ * Throws while a turn is running (omp cannot compact mid-stream) or when the
+ * child rejects the compaction.
  */
-export async function compactSession(openCodeId: string, cwd: string): Promise<boolean> {
-  const state = sessionStates.get(sessionKey(openCodeId, cwd));
-  if (!state?.credentialFingerprint || !state.conn.compact) return false;
-  await state.conn.compact();
-  return true;
+export async function compactSession(openCodeId: string, cwd: string, sessionPath: string): Promise<void> {
+  const key = sessionKey(openCodeId, cwd);
+  const release = await acquireSessionLock(key);
+  try {
+    const state = await getOrCreateSessionState(openCodeId, cwd, sessionPath);
+    if (state.busy) throw new Error("session is busy; wait for the turn to finish before compacting");
+    if (!state.conn.compact) throw new Error("backend cannot compact");
+    cancelIdleRelease(state);
+    state.busy = true;
+    emitSessionStatus(openCodeId, { type: "busy" }, cwd);
+    try {
+      await state.conn.compact();
+    } finally {
+      if (state.conn.getSessionFile) {
+        await Promise.race([followMovedTranscript(state), new Promise((resolve) => setTimeout(resolve, 2_000).unref?.())]);
+      }
+      state.busy = false;
+      scheduleIdleRelease(state);
+      emitSessionStatus(openCodeId, { type: "idle" }, cwd);
+    }
+  } finally {
+    release();
+  }
 }
 
 /**
@@ -1564,6 +1790,30 @@ export async function sessionOwnedElsewhere(openCodeId: string, cwd: string, tra
   return (await backendForSession(openCodeId).sessionOwnedElsewhere?.(cwd, transcriptPath)) ?? false;
 }
 
+/** How long omp gets to acknowledge an abort, and then to actually stop streaming, before its child is killed. */
+const ABORT_ACK_MS = 3_000;
+const ABORT_STOP_MS = 5_000;
+
+function within<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Resolves once omp stopped streaming; rejects past `ms` (a tool or stream ignoring the abort). */
+async function waitUntilStopped(conn: SessionState["conn"], ms: number): Promise<void> {
+  if (!conn.isStreaming) return;
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`omp still streaming ${ms}ms after abort`);
+    if (!(await within(conn.isStreaming(), left, "get_state timed out after abort"))) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 export async function abortSession(openCodeId: string, cwd: string): Promise<boolean> {
   const key = sessionKey(openCodeId, cwd);
   const release = await acquireSessionLock(key);
@@ -1572,9 +1822,13 @@ export async function abortSession(openCodeId: string, cwd: string): Promise<boo
     if (!state) return false;
 
     try {
-      await state.conn.abort();
+      await within(state.conn.abort(), ABORT_ACK_MS, "RPC abort not acknowledged");
+      await waitUntilStopped(state.conn, ABORT_STOP_MS);
     } catch (err) {
-      promptLogger.error({ err, sessionID: openCodeId }, `[abort] ${openCodeId} RPC abort failed`);
+      // omp ignored the abort (hung tool, wedged stream): Esc must still end the turn.
+      promptLogger.error({ err, sessionID: openCodeId }, `[abort] ${openCodeId} abort did not take effect; killing child`);
+      state.killedOnAbort = true;
+      cancelIdleRelease(state);
       state.conn.kill();
       clearSubagentStatuses(key);
       sessionStates.delete(key);

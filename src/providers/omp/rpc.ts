@@ -39,6 +39,9 @@ mcp:
 edit:
   autoRepair:
     enabled: true
+# The sidecar drives omp over RPC: without "rpc" an active goal never continues between turns.
+goal:
+  continuationModes: [rpc]
 browser:
   enabled: false
   relay: false
@@ -82,7 +85,7 @@ export interface OmpRpcChild {
 
 /** Anything able to carry one OMP RPC session: the real connection, or a fake. */
 export interface OmpRpcTransport {
-  request(method: string, params?: unknown): Promise<unknown>;
+  request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
   onEvent(handler: (event: OmpRpcEvent) => void): () => void;
   switchSession(sessionPath: string): Promise<unknown>;
   /** False once the child has exited; absent on transports that cannot tell. */
@@ -418,7 +421,7 @@ export class OmpRpcConnection {
     return this.#ready.promise;
   }
 
-  request(method: string, params?: unknown): Promise<unknown> {
+  request(method: string, params?: unknown, timeoutMs: number = this.#requestTimeoutMs): Promise<unknown> {
     if (this.#dead) {
       return Promise.reject(new Error(`RPC ${method}: connection dead`));
     }
@@ -444,7 +447,7 @@ export class OmpRpcConnection {
         this.#pending.delete(id);
         finish(() => reject(new Error(`RPC ${method} timeout`)));
       }
-    }, this.#requestTimeoutMs);
+    }, timeoutMs);
     this.#pending.set(id, {
       resolve: (value) => finish(() => resolve(value)),
       reject: (err) => finish(() => reject(err)),

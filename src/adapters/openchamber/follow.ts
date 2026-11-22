@@ -26,9 +26,9 @@ import { isSessionDriven, sessionOwnedElsewhere } from "./prompt";
 import { stat } from "node:fs/promises";
 
 const POLL_MS = Number(process.env.OC_FOLLOW_POLL_MS ?? 750);
-/** A followed session that has not grown for this long stops being polled (re-followed on the next read). */
+/** A followed session with no new messages for this long stops being polled (re-followed on the next read). */
 const EXPIRE_MS = 30 * 60_000;
-/** A session that looks busy but stopped growing is checked for a live owner this often. */
+/** A session that looks busy but has had no new messages is checked for a live owner this often. */
 const OWNER_CHECK_MS = Number(process.env.OC_FOLLOW_OWNER_CHECK_MS ?? 30_000);
 
 interface SeenMessage {
@@ -49,6 +49,8 @@ interface Followed {
   lastGrowth: number;
   lastOwnerCheck: number;
   ticking: boolean;
+  /** Signature of the message set last applied; only a change here counts as progress. */
+  messagesKey: string | null;
 }
 
 const followed = new Map<string, Followed>();
@@ -64,7 +66,7 @@ export function followSession(id: string, cwd: string, path: string): void {
     existing.path = path;
     return;
   }
-  followed.set(key, { id, cwd, path, seen: null, busy: false, lastGrowth: Date.now(), lastOwnerCheck: 0, ticking: false });
+  followed.set(key, { id, cwd, path, seen: null, messagesKey: null, busy: false, lastGrowth: Date.now(), lastOwnerCheck: 0, ticking: false });
   timer ??= setInterval(() => void tickAll(), POLL_MS);
   timer.unref?.();
 }
@@ -126,6 +128,7 @@ async function tick(entry: Followed): Promise<void> {
     if (isSessionDriven(entry.id, entry.cwd)) {
       // The sidecar's own child emits this session now; re-read the baseline when it lets go.
       entry.seen = null;
+      entry.messagesKey = null;
       entry.busy = false;
       entry.stamp = undefined;
       entry.lastGrowth = Date.now();
@@ -133,38 +136,56 @@ async function tick(entry: Followed): Promise<void> {
     }
     const stamp = await stampOf(entry.path);
     const now = Date.now();
-    if (stamp === entry.stamp && entry.seen) {
-      if (entry.busy && now - entry.lastGrowth > OWNER_CHECK_MS && now - entry.lastOwnerCheck > OWNER_CHECK_MS) {
+    if (stamp !== entry.stamp || !entry.seen) {
+      entry.stamp = stamp;
+      const records = await backendForSession(entry.id).store.transcript?.(entry.id, entry.cwd);
+      if (records && applyTranscript(entry, records, now)) {
         entry.lastOwnerCheck = now;
-        if (!(await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path))) setBusy(entry, false);
-      } else if (!entry.busy && now - entry.lastGrowth > EXPIRE_MS) {
-        followed.delete(keyOf(entry.id, entry.cwd));
+        if (await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) setBusy(entry, true);
       }
-      return;
     }
-    entry.stamp = stamp;
-    const records = await backendForSession(entry.id).store.transcript?.(entry.id, entry.cwd);
-    if (!records) return;
-    const ordered = [...records].sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0));
-    const baseline = entry.seen === null;
-    entry.seen ??= new Map();
-    if (!baseline) entry.lastGrowth = now;
-    let emittedAny = false;
-    for (const record of ordered) {
-      if (baseline) {
-        entry.seen.set(record.info.id, { signature: signatureOf(record), started: true, ended: true, announcedTools: new Set() });
-        continue;
-      }
-      if (emitRecord(entry, record)) emittedAny = true;
+    // Progress is a new message, never file growth: metadata appends must not keep a dead turn busy.
+    if (entry.busy && now - entry.lastGrowth > OWNER_CHECK_MS && now - entry.lastOwnerCheck > OWNER_CHECK_MS) {
+      entry.lastOwnerCheck = now;
+      if (!(await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path))) setBusy(entry, false);
+    } else if (entry.seen && !entry.busy && now - entry.lastGrowth > EXPIRE_MS) {
+      followed.delete(keyOf(entry.id, entry.cwd));
     }
-    if (!baseline) emitSessionUpdated({ id: entry.id, time: { updated: now } }, entry.cwd);
-    const busy = isBusy(ordered);
-    // A whole turn can land between two polls: still bracket it with busy → idle.
-    if (!baseline && !busy && !entry.busy && emittedAny) setBusy(entry, true);
-    setBusy(entry, busy);
   } finally {
     entry.ticking = false;
   }
+}
+
+/**
+ * Applies one transcript read: emits message deltas and recomputes busy when the message set changed.
+ * Returns true for a cold read ending mid-turn, whose busy state is left for the caller to settle.
+ */
+function applyTranscript(entry: Followed, records: OpenCodeMessageRecord[], now: number): boolean {
+  const ordered = [...records].sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0));
+  const messagesKey = ordered.map((record) => `${record.info.id}\0${signatureOf(record)}`).join("\n");
+  const changed = messagesKey !== entry.messagesKey;
+  const baseline = entry.seen === null;
+  entry.messagesKey = messagesKey;
+  entry.seen ??= new Map();
+  if (!baseline && changed) entry.lastGrowth = now;
+  let emittedAny = false;
+  for (const record of ordered) {
+    if (baseline) {
+      entry.seen.set(record.info.id, { signature: signatureOf(record), started: true, ended: true, announcedTools: new Set() });
+      continue;
+    }
+    if (emitRecord(entry, record)) emittedAny = true;
+  }
+  if (!baseline) emitSessionUpdated({ id: entry.id, time: { updated: now } }, entry.cwd);
+  if (!changed) return false;
+  const busy = isBusy(ordered);
+  // Read cold, a tail that ends mid-turn is as likely a dead child's leftovers as a live terminal
+  // turn. Nothing here can tell which, so the caller asks the owner before declaring it busy.
+  if (baseline) return busy;
+  // A whole turn can land between two polls: still bracket it with busy → idle.
+  if (!busy && !entry.busy && emittedAny) setBusy(entry, true);
+  setBusy(entry, busy);
+  return false;
 }
 
 function setBusy(entry: Followed, busy: boolean): void {

@@ -1,9 +1,20 @@
 // service/src/main.js
 import http from "node:http";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 var PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
-var SIDECAR = "http://127.0.0.1:4096";
+var sidecarUrl = () => {
+  try {
+    const dataDir = process.env.OPENCHAMBER_DATA_DIR || join(homedir(), ".config", "openchamber");
+    const { url } = JSON.parse(readFileSync(join(dataDir, "omp-sidecar", "endpoint.json"), "utf8"));
+    if (typeof url === "string" && url.startsWith("http://"))
+      return url;
+  } catch {}
+  return "http://127.0.0.1:4096";
+};
 var authorized = (header) => {
   const expected = Buffer.from(`Bearer ${TOKEN}`);
   const given = Buffer.from(typeof header === "string" ? header : "");
@@ -42,9 +53,10 @@ http.createServer(async (req, res) => {
   const target = ROUTES.get(`${req.method} ${path}`);
   if (!target)
     return send(res, 404, { error: "not found" });
+  const base = sidecarUrl();
   try {
     const body = req.method === "GET" ? undefined : await readBody(req);
-    const upstream = await fetch(SIDECAR + target, {
+    const upstream = await fetch(base + target, {
       method: req.method,
       headers: { "content-type": "application/json" },
       body,
@@ -53,6 +65,6 @@ http.createServer(async (req, res) => {
     res.writeHead(upstream.status, { "content-type": "application/json" });
     res.end(await upstream.text());
   } catch (error) {
-    send(res, 502, { error: `omp sidecar unreachable at ${SIDECAR}: ${error instanceof Error ? error.message : String(error)}` });
+    send(res, 502, { error: `omp sidecar unreachable at ${base}: ${error instanceof Error ? error.message : String(error)}` });
   }
 }).listen(PORT, "127.0.0.1");

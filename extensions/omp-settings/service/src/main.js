@@ -4,13 +4,23 @@
 // loopback, to the sidecar's `/api/omp/settings` routes. The sidecar owns the
 // config files; nothing is written from this process.
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
-// The service does not inherit the host environment, so this is fixed to the
-// sidecar's default loopback port (OC_SIDECAR_PORT).
-const SIDECAR = 'http://127.0.0.1:4096';
+// The service does not inherit the host environment, so a non-default
+// OC_SIDECAR_PORT cannot reach it. The sidecar publishes its address on start.
+const sidecarUrl = () => {
+  try {
+    const dataDir = process.env.OPENCHAMBER_DATA_DIR || join(homedir(), '.config', 'openchamber');
+    const { url } = JSON.parse(readFileSync(join(dataDir, 'omp-sidecar', 'endpoint.json'), 'utf8'));
+    if (typeof url === 'string' && url.startsWith('http://')) return url;
+  } catch { /* not published: fall back to the default port */ }
+  return 'http://127.0.0.1:4096';
+};
 
 const authorized = (header) => {
   const expected = Buffer.from(`Bearer ${TOKEN}`);
@@ -49,9 +59,10 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true });
   const target = ROUTES.get(`${req.method} ${path}`);
   if (!target) return send(res, 404, { error: 'not found' });
+  const base = sidecarUrl();
   try {
     const body = req.method === 'GET' ? undefined : await readBody(req);
-    const upstream = await fetch(SIDECAR + target, {
+    const upstream = await fetch(base + target, {
       method: req.method,
       headers: { 'content-type': 'application/json' },
       body,
@@ -60,6 +71,6 @@ http.createServer(async (req, res) => {
     res.writeHead(upstream.status, { 'content-type': 'application/json' });
     res.end(await upstream.text());
   } catch (error) {
-    send(res, 502, { error: `omp sidecar unreachable at ${SIDECAR}: ${error instanceof Error ? error.message : String(error)}` });
+    send(res, 502, { error: `omp sidecar unreachable at ${base}: ${error instanceof Error ? error.message : String(error)}` });
   }
 }).listen(PORT, '127.0.0.1');

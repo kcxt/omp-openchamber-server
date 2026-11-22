@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { getDefaultHistoryDbPath, listPersistedMessageIds } from "./title-db";
+import { timeHexFromTimestamp, timeHexOfMessageId } from "../../shared/message-id";
 import type { OpenCodeSession } from "../types";
 
 const RECAP_TTL_MS = 30_000;
@@ -120,7 +121,9 @@ function recapSubjectMessageID(session: OpenCodeSession): string | undefined {
   for (const item of recorded) {
     if (!newest || item.createdAt > newest.createdAt) newest = item;
   }
-  return newest ? `msg_${session.id}_asst_${newest.clientMessageId}` : undefined;
+  if (!newest) return undefined;
+  const asstHex = timeHexOfMessageId(newest.clientMessageId) ?? timeHexFromTimestamp(newest.createdAt);
+  return `msg_${asstHex}~${session.id}_asst_${newest.clientMessageId}`;
 }
 
 const hasAssist = (session: OpenCodeSession): boolean => {

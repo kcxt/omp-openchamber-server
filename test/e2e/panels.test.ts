@@ -15,7 +15,7 @@ const openChamberOwned = /\/api\/(source-control|git\/worktrees)\//;
 beforeAll(async () => {
   stack = await startStack();
   const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: stack.project });
-  git("init", "-q");
+  git("init", "-q", "-b", "main");
   writeFileSync(join(stack.project, "a.txt"), "hello\n");
   git("add", ".");
   git("commit", "-qm", "init");
@@ -43,7 +43,7 @@ async function openPanel(name: string) {
 describe("side panels", () => {
   test("Git shows the branch and the working-tree change", async () => {
     await openPanel("Git");
-    await page.getByText("master").first().waitFor();
+    await page.getByText("main", { exact: true }).first().waitFor();
     await page.getByText("a.txt").first().waitFor();
   });
 
@@ -77,6 +77,17 @@ describe("side panels", () => {
     await page.reload();
     await openPanel("Project knowledge");
     await page.getByText("remember the milk").first().waitFor();
+  });
+
+  test("Project todos keep an item", async () => {
+    await openPanel("Project knowledge");
+    await page.getByText("Todo", { exact: true }).first().click();
+    await page.getByPlaceholder("Add a todo").fill("buy bread");
+    await page.getByText("Add", { exact: true }).last().click();
+    await page.getByText("buy bread").first().waitFor();
+    const id = `path_${Buffer.from(stack.project).toString("base64url")}`;
+    await Bun.sleep(500);
+    expect(JSON.stringify((await stack.http(`/api/project-context/${id}`)).body)).toContain("buy bread");
   });
 
   test("Context, Walkthrough and Browser open", async () => {

@@ -8,6 +8,7 @@
 import { logger } from "../../shared/logger";
 import { readOmpConfigSmallModel } from "../../adapters/openchamber/small-model";
 import type {
+  BackendGoalSnapshot,
   AgentBackend,
   BackendCapabilities,
   BackendSubagentSnapshot,
@@ -19,6 +20,7 @@ import type {
   SessionStore,
   TurnPromptInput,
 } from "../types";
+import { quarantineLegacyOcRecords } from "./oc-records";
 import { resolveBackendCredentials } from "./credentials";
 import {
   OmpRpcConnection,
@@ -28,6 +30,7 @@ import {
   withOmpRpc,
   type OmpRpcTransport,
 } from "./rpc";
+import { rememberModelWindows } from "./context";
 import { createOmpEventNormalizer, OMP_DEFAULT_MODEL } from "./events";
 import { forkOmpSession, invalidateMessageCache, loadSessionMessages, recordUserMessageId, truncateOmpSessionAtMessage } from "./messages";
 import {
@@ -63,6 +66,11 @@ export type OmpTransportFactory = (
 ) => Promise<OmpRpcTransport>;
 
 const defaultOmpTransportFactory: OmpTransportFactory = async (cwd, sessionPath, credential) => {
+  // Older sidecars appended id-less records to omp's transcript, which leaves
+  // the session's active leaf undefined: the child would load an empty history.
+  await quarantineLegacyOcRecords(sessionPath).catch((err) => {
+    logger.warn({ err, sessionPath }, "[omp] could not move legacy sidecar records out of the transcript");
+  });
   const conn = credential
     ? await OmpRpcConnection.spawn(cwd, 3, { credential })
     : await OmpRpcConnection.spawn(cwd);
@@ -138,6 +146,19 @@ async function parseSubagentSnapshots(
   }));
 }
 
+function parseGoalSnapshot(value: unknown): BackendGoalSnapshot | null {
+  if (value === null || typeof value !== "object") return null;
+  const goal = value as Record<string, unknown>;
+  const status = goal.status;
+  if (status !== "active" && status !== "paused" && status !== "complete" && status !== "budget-limited" && status !== "dropped") return null;
+  return {
+    status,
+    objective: typeof goal.objective === "string" ? goal.objective : "",
+    tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
+    ...(typeof goal.tokenBudget === "number" ? { tokenBudget: goal.tokenBudget } : {}),
+  };
+}
+
 /**
  * Builds a turn connection over an existing transport. The normalizer owns
  * all backend-specific event translation; the returned object is exactly the
@@ -166,7 +187,8 @@ export function createOmpTurnConnection(transport: OmpRpcTransport, ctx: OmpTurn
       return transport.request("set_thinking_level", { level });
     },
     compact() {
-      return transport.request("compact", {});
+      // Summarising calls a model; the default 30s request deadline is far too short.
+      return transport.request("compact", {}, 10 * 60_000);
     },
     async getInitialModel() {
       try {
@@ -189,8 +211,29 @@ export function createOmpTurnConnection(transport: OmpRpcTransport, ctx: OmpTurn
       const state = (await transport.request("get_state", {})) as { isSettled?: unknown; hasPendingAsyncWork?: unknown } | undefined;
       return state?.isSettled !== false && state?.hasPendingAsyncWork !== true;
     },
+    async isStreaming() {
+      const state = (await transport.request("get_state", {})) as { isStreaming?: unknown } | undefined;
+      return state?.isStreaming === true;
+    },
     async getSubagentStatuses() {
       return parseSubagentSnapshots(await transport.request("get_subagents"), ctx.openCodeId, ctx.cwd);
+    },
+    async goal(op, input) {
+      await transport.request("goal", {
+        op,
+        ...(input?.objective !== undefined ? { objective: input.objective } : {}),
+        ...(input?.tokenBudget !== undefined ? { token_budget: input.tokenBudget } : {}),
+      });
+    },
+    async getGoal() {
+      const state = (await transport.request("get_state", {})) as { goal?: { goal?: unknown } | null } | undefined;
+      return parseGoalSnapshot(state?.goal?.goal);
+    },
+    onGoalUpdate(sink) {
+      return transport.onEvent((event) => {
+        if (event.type !== "goal_updated") return;
+        sink(parseGoalSnapshot((event as { goal?: unknown }).goal));
+      });
     },
     abort() {
       return transport.request("abort", {});
@@ -212,6 +255,7 @@ const ompCapabilities: BackendCapabilities = {
   skills: true,
   compact: true,
   shell: true,
+  goals: true,
 };
 
 /**
@@ -297,7 +341,9 @@ export const ompBackend: AgentBackend = {
       const rawModels = await conn.request("get_available_models");
       const models = normalizeModelsResponse(rawModels);
       const currentModel = await getCurrentModel(conn);
-      return mapRpcModelsToOpenCodeProviders(models, currentModel?.providerID, currentModel?.modelID);
+      const providers = mapRpcModelsToOpenCodeProviders(models, currentModel?.providerID, currentModel?.modelID);
+      rememberModelWindows(providers);
+      return providers;
     };
     return credential
       ? withOmpRpc(cwd, readModels, { credential })

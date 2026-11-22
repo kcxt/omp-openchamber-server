@@ -36,6 +36,9 @@ export function isRpcEventFrame(obj: Record<string, unknown>): boolean {
     obj.type === "turn_end" ||
     obj.type === "auto_compaction_start" ||
     obj.type === "auto_compaction_end" ||
+    obj.type === "manual_compaction_start" ||
+    obj.type === "manual_compaction_end" ||
+    obj.type === "command_output" ||
     obj.type === "custom"
   )) return true;
   if (typeof obj.customType === "string") return true;
@@ -721,6 +724,31 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       if (!aborted) {
         invalidateMessageCache(openCodeId, cwd);
       }
+      return;
+    }
+
+    // Manual compaction (`/compact`, extension `ctx.compact()`, e.g. `/pi-vcc`): omp starts
+    // no agent turn, so without these frames the command's user message stays unanswered.
+    if (type === "manual_compaction_start") {
+      pendingTurnError = undefined;
+      emit({ kind: "compaction_start" });
+      return;
+    }
+
+    if (type === "manual_compaction_end") {
+      pendingTurnError = undefined;
+      const aborted = Boolean(event.aborted);
+      emit({ kind: "compaction_end", aborted, willRetry: false });
+      if (!aborted) invalidateMessageCache(openCodeId, cwd);
+      const failure = typeof event.errorMessage === "string" ? event.errorMessage.trim() : "";
+      if (failure) emit({ kind: "notice", text: failure, level: event.skipped ? "info" : "warning" });
+      return;
+    }
+
+    // A builtin slash command's text (`/context`, `/session`, …) is the whole reply.
+    if (type === "command_output") {
+      const text = typeof event.text === "string" ? event.text.trim() : "";
+      if (text) emit({ kind: "notice", text, level: "info" });
       return;
     }
 

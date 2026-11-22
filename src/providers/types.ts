@@ -373,7 +373,19 @@ export interface BackendCapabilities {
   skills: boolean;
   compact: boolean;
   shell: boolean;
+  /** The backend runs goals itself (the agent ends them); the host must not drive its own loop. */
+  goals: boolean;
 }
+
+/** The backend's own goal for a session (omp goal mode): it, not the host, decides when the goal is done. */
+export interface BackendGoalSnapshot {
+  status: "active" | "paused" | "complete" | "budget-limited" | "dropped";
+  objective: string;
+  tokensUsed: number;
+  tokenBudget?: number;
+}
+
+export type BackendGoalOp = "create" | "resume" | "pause" | "drop";
 
 /** Per-session live connection to one backend turn. */
 export interface BackendTurnConnection {
@@ -394,6 +406,13 @@ export interface BackendTurnConnection {
   getSessionFile?(): Promise<string | undefined>;
   /** True when no turn, queued message or background work can still wake the session. */
   isSettled?(): Promise<boolean>;
+  /** True while the backend is still generating or running tools for a turn. */
+  isStreaming?(): Promise<boolean>;
+  /** Goal mode, when the backend drives goals itself. */
+  goal?(op: BackendGoalOp, input?: { objective?: string; tokenBudget?: number }): Promise<void>;
+  getGoal?(): Promise<BackendGoalSnapshot | null>;
+  /** Fires for every goal change, including the backend's own (the agent completing it). */
+  onGoalUpdate?(sink: (goal: BackendGoalSnapshot | null) => void): () => void;
   abort(): Promise<unknown>;
   kill(): void;
 }

@@ -20,10 +20,12 @@
 //                    has none) runs; with no match the stub echoes the prompt.
 //                    Steps: {"text"} ("{{users}}" expands to the number of user
 //                    messages in omp's current context) {"thinking"} {"sleep":ms} {"hang":true}
+//                    {"goalComplete":true} (the agent calls the goal tool; omp keeps running goal turns "(#n)" while a goal is active)
 //                    {"fail":"message"} {"crash":true} (process dies mid-turn) {"tool":"bash","args":{},"result":"text",
 //                    "isError":bool,"details":{}}
 //   OMP_STUB_RECORD  file that receives every inbound frame (JSONL)
 //   OMP_STUB_TICK_MS pause between streamed chunks (default 4)
+//   OMP_STUB_START_DELAY_MS  time before the first command is handled, like a slow-booting omp (default 0)
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -110,6 +112,20 @@ let model = MODELS[0]!;
 let thinking = "off";
 let todoPhases: any[] = [];
 let claimed = false;
+// omp's goal mode: the agent completes it with the `goal` tool; while it is active omp keeps
+// running continuation turns by itself (goal.continuationModes includes "rpc").
+let goal: { id: string; objective: string; status: string; tokenBudget?: number; tokensUsed: number } | null = null;
+let goalScheduled = false;
+let goalSuppressed = false;
+let lastTurnWasContinuation = false;
+let goalTurns = 0;
+const GOAL_CONTINUATION = "The session goal is still open. Take it through to the end in this run.";
+const goalEvent = () => out({ type: "goal_updated", goal, state: goal ? { enabled: goal.status === "active", mode: "active", goal } : undefined });
+function scheduleGoalContinuation(): void {
+  if (goalScheduled || goalSuppressed || busy || aborted || goal?.status !== "active") return;
+  goalScheduled = true;
+  setTimeout(() => { goalScheduled = false; if (!busy && goal?.status === "active" && !goalSuppressed) void runTurn(undefined, `${GOAL_CONTINUATION} (#${++goalTurns})`); }, 30);
+}
 
 function titleSlot(title = ""): string {
   const base = { type: "title", v: 1, title, updatedAt: now(), pad: "" };
@@ -234,6 +250,19 @@ function chunks(text: string): string[] {
 async function runTurn(promptId: string | undefined, text: string): Promise<void> {
   busy = true; aborted = false;
   // Like omp's extension commands: a notify frame and no agent turn at all.
+  if (text.startsWith("/pi-vcc skip")) {
+    out({ type: "manual_compaction_start" });
+    out({ type: "manual_compaction_end", aborted: false, skipped: true, errorMessage: "Nothing to compact: the session is empty." });
+    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
+    busy = false;
+    return;
+  }
+  if (text.startsWith("/pi-vcc output")) {
+    out({ type: "command_output", text: "Context: 40 of 100000 tokens used." });
+    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
+    busy = false;
+    return;
+  }
   if (text.startsWith("/pi-vcc")) {
     out({ type: "extension_ui_request", id: hex8(), method: "notify", message: "Nothing to compact yet.", notifyType: "warning" });
     out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
@@ -275,6 +304,10 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
       if (step.crash) process.exit(7); // dies like a segfault/OOM kill: no frames, no cleanup
       if (step.fail) { failure = String(step.fail); break; }
       if (step.sleep) { await pause(step.sleep); continue; }
+      if (step.goalComplete) {
+        if (goal) { goal = { ...goal, status: "complete" }; goalEvent(); }
+        continue;
+      }
       if (step.hang) { while (!aborted) await pause(60_000); break; }
       const kind = step.thinking !== undefined ? "thinking" : "text";
       // `{{users}}` lets a script show how much context omp itself still holds.
@@ -305,6 +338,7 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
     const final = {
       role: "assistant", content: blocks, api: "stub", provider: model.provider, model: model.id,
       usage: usage(blocks.length * 10),
+      contextSnapshot: { promptTokens: 100, nonMessageTokens: 40, toolSchemaTokens: 10 },
       stopReason: failure ? "error" : aborted ? "aborted" : calls.length ? "toolUse" : "stop",
       ...(failure ? { errorMessage: failure } : {}),
       ...(aborted ? { errorMessage: "Request was aborted" } : {}),
@@ -334,11 +368,20 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
     out({ type: "turn_end", message: final, toolResults: results });
   }
 
+  const toolCalls = newMessages.filter((m) => m.role === "toolResult").length;
+  if (lastTurnWasContinuation) goalSuppressed = toolCalls === 0; // no progress: omp stops continuing
+  lastTurnWasContinuation = text.startsWith(GOAL_CONTINUATION);
+  if (goal) goal = { ...goal, tokensUsed: goal.tokensUsed + 110 };
+  if (aborted && goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
+  if (goal?.status === "complete") { const done = goal; goal = null; out({ type: "goal_updated", goal: done, state: { enabled: false, mode: "exiting", reason: "completed", goal: done } }); }
+  else if (goal) goalEvent();
+  if (goal?.status === "active" && !aborted && !goalSuppressed) goalScheduled = true; // pending before settlement is reported
   out({ type: "agent_end", messages: newMessages, yielded: true });
   out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: true, status: aborted ? "aborted" : failure ? "error" : "completed", ...(failure ? { error: { message: failure, retryable: false } } : {}), sessionSettled: queued.length === 0 });
   busy = false;
   const next = queued.shift();
-  if (next) void runTurn(next.id, next.message);
+  if (next) { goalScheduled = false; void runTurn(next.id, next.message); }
+  else if (goalScheduled) { goalScheduled = false; scheduleGoalContinuation(); }
   else out({ type: "session_settled" });
 }
 
@@ -347,7 +390,7 @@ function stateData() {
   return {
     model: { provider: model.provider, id: model.id, name: model.name },
     thinkingLevel: thinking,
-    isStreaming: busy, isCompacting: false, isSettled: !busy, hasPendingAsyncWork: false,
+    isStreaming: busy, isCompacting: false, isSettled: !busy && !goalScheduled, hasPendingAsyncWork: false, goal: goal ? { enabled: goal.status === "active", mode: "active", goal } : null,
     sessionFile: file ?? undefined, sessionId: header.id, sessionName: header.title,
     cwd, messageCount: messages().length, queuedMessageCount: queued.length,
     todoPhases,
@@ -396,6 +439,11 @@ async function handle(frame: any): Promise<void> {
         return respond(id, type, {});
       case "get_subagents": return respond(id, type, { subagents: [] });
       case "get_session_stats": return respond(id, type, { tokens: { input: 100, output: 10, total: 110 }, cost: 0 });
+      case "get_context_breakdown": return respond(id, type, {
+        model: { provider: model.provider, modelId: model.id }, contextWindow: model.contextWindow ?? 100_000,
+        categories: [{ id: "systemPrompt", label: "System prompt", tokens: 30 }, { id: "messages", label: "Messages", tokens: 60 }],
+        usedTokens: 100, autoCompactBufferTokens: 10, freeTokens: 99_890,
+      });
       case "get_session_lease": {
         const ids: string[] = frame.sessionIds ?? [];
         return respond(id, type, { held: ids.filter((s) => s === header.id || leaseHeldByOther(s)), unknown: [] });
@@ -426,6 +474,26 @@ async function handle(frame: any): Promise<void> {
         respond(id, type, {});
         void runTurn(id, text);
         return;
+      }
+      case "goal": {
+        const op = String(frame.op);
+        if (op === "get") return respond(id, type, { goal, state: goal ? { enabled: goal.status === "active", mode: "active", goal } : null });
+        if (op === "create") {
+          if (goal && goal.status !== "complete") return fail(id, type, goal.status === "paused" ? "Resume or drop the paused goal before creating another." : "A goal is already active. Drop it before creating another.");
+          goal = { id: hex8(), objective: String(frame.objective ?? ""), status: "active", ...(frame.token_budget ? { tokenBudget: frame.token_budget } : {}), tokensUsed: 0 };
+          goalSuppressed = false; lastTurnWasContinuation = false; goalTurns = 0; goalEvent();
+          if (!busy) { goalScheduled = false; scheduleGoalContinuation(); }
+          return respond(id, type, { goal, state: { enabled: true, mode: "active", goal } });
+        }
+        if (op === "resume") {
+          if (goal?.status !== "paused") return fail(id, type, "No paused goal to resume.");
+          goal = { ...goal, status: "active" }; goalSuppressed = false; lastTurnWasContinuation = false; goalEvent();
+          if (!busy) scheduleGoalContinuation();
+          return respond(id, type, { goal, state: { enabled: true, mode: "active", goal } });
+        }
+        if (op === "pause") { if (goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); } return respond(id, type, { goal, state: null }); }
+        if (op === "drop") { const dropped = goal && { ...goal, status: "dropped" }; goal = null; if (dropped) out({ type: "goal_updated", goal: dropped, state: { enabled: false, mode: "active", goal: dropped } }); return respond(id, type, { goal: null, state: null }); }
+        return fail(id, type, `Unknown goal op: ${op}`);
       }
       case "abort": respond(id, type); if (busy) { aborted = true; wake?.(); } return;
       case "compact": append("compaction", { summary: "Stub summary", tokensBefore: 100, firstKeptEntryId: leaf ?? "" }); return respond(id, type, { summary: "Stub summary" });
@@ -459,6 +527,8 @@ async function handle(frame: any): Promise<void> {
 
 // ---------------------------------------------------------------- main loop
 const record = process.env.OMP_STUB_RECORD;
+// A real omp takes seconds to boot (the live sidecar's ownership probe waits ~3s on it).
+const booted = sleep(Number(process.env.OMP_STUB_START_DELAY_MS ?? 0));
 out({ type: "ready", protocolVersion: 1, supportedProtocolVersions: [1], maxFrameBytes: 1_048_576, maxReassembledFrameBytes: 67_108_864, supportsBashExcludeFromContext: true });
 
 let buffer = "";
@@ -472,7 +542,7 @@ process.stdin.on("data", (chunk) => {
     if (record) appendFileSync(record, line + "\n");
     let frame: any;
     try { frame = JSON.parse(line); } catch { fail(undefined, "parse", "Failed to parse command: invalid JSON"); continue; }
-    void handle(frame);
+    void booted.then(() => handle(frame));
   }
 });
 const shutdown = () => { releaseAll(); process.exit(0); };

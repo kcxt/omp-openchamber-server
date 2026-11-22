@@ -1,0 +1,33 @@
+{
+  "name": "@omp-openchamber/omp-context",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "omp's context map in OpenChamber: window fill, history curve, cache and compactions, read from the sidecar's published session metadata.",
+  "type": "module",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "omp-context",
+        "name": "omp context",
+        "icon": "pie-chart-2-line",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "provides": ["opencode"]
+      }
+    }
+  },
+  "scripts": {
+    "build": "bun build panel/src/main.js --target=browser --format=iife --outfile=panel/main.js && bun build service/src/main.js --target=node --format=esm --outfile=service/main.js"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.7.2"
+  }
+}

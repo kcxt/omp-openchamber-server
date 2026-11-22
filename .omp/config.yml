@@ -1,0 +1,4 @@
+modelRoles:
+  default: anthropic/claude-sonnet-5-5
+  task: anthropic/claude-sonnet-5-5:medium
+  smol: anthropic/claude-haiku-5-5:medium
