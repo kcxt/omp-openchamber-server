@@ -115,6 +115,8 @@ export async function startStack(options: { env?: Record<string, string>; binary
     OPENCODE_HOST: api,
     OPENCODE_SKIP_START: "true",
     OPENCODE_BINARY: join(REPO, "bin", "opencode-unused"),
+    // As bin/openchamber-serve: lists the sidecar's `/goal` in OpenChamber's command config.
+    OPENCODE_CONFIG: join(REPO, "resources", "opencode-config.json"),
   });
   const ui = `http://127.0.0.1:${uiPort}`;
   await waitFor("openchamber", async () => (await fetch(`${ui}/health`)).ok, 60_000);

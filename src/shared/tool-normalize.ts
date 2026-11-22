@@ -115,6 +115,26 @@ export function normalizeToolInput(
     if (typeof normalized.path === "string" && normalized.filePath === undefined) normalized.filePath = normalized.path;
   }
 
+  if (tool === "read") {
+    // omp's read takes line selectors in the path (`src/a.ts:50-80`, `:50+20`, `:-30`, `:5-16,90-99`, `:raw`).
+    // OpenChamber opens `path` in its file viewer, so it gets the bare file; the first range becomes
+    // OpenCode's `offset`/`limit`. URLs and internal schemes (`skill://`, `artifact://`) are left alone.
+    if (typeof normalized.path === "string" && !/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized.path)) {
+      const selector = /(?::(?:raw|\d[\d,+-]*|-\d+))+$/.exec(normalized.path);
+      if (selector && selector.index > 0) {
+        normalized.path = normalized.path.slice(0, selector.index);
+        const range = /:(\d+)(?:-(\d+)|\+(\d+))?/.exec(selector[0]);
+        if (range) {
+          const start = Number(range[1]);
+          normalized.offset = start;
+          if (range[2]) normalized.limit = Math.max(1, Number(range[2]) - start + 1);
+          else if (range[3]) normalized.limit = Number(range[3]);
+        }
+      }
+      normalized.filePath = normalized.path;
+    }
+  }
+
   if (tool === "hub" || tool === "job") {
     if (normalized.ids && Array.isArray(normalized.ids)) {
       if (normalized.ids.length === 1) {

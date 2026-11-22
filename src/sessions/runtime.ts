@@ -840,6 +840,11 @@ export class SessionRuntime {
       .catch((err) => this.#reportProblem(err, "could not keep a command's reply in the transcript"));
   }
 
+  /** Journals a command the sidecar ran itself (`/goal …`) as a user message (P2 `host-command`, rendered like `host-resume`). */
+  async journalUserCommand(text: string, hostMessageId: string): Promise<void> {
+    await this.#child.request("append_custom_entry", { customType: "host-command", data: { text, hostMessageId } });
+  }
+
   // ------------------------------------------------------------------ subagent stream
 
   #onSubagentFrame(frame: OmpFrame): void {

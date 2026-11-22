@@ -3,7 +3,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { Page } from "playwright-core";
 import { startStack, type Stack } from "./stack";
-import { newSession, send } from "./ui";
+import { composer, newSession, send } from "./ui";
 
 let stack: Stack;
 let page: Page;
@@ -53,6 +53,8 @@ describe("omp's goal mode via /goal", () => {
     await until("an active goal", async () => (await goalOf(id)).goal?.status === "active");
     expect((await goalOf(id)).live).toBe(true);
 
+    // The command is the user's message in the conversation.
+    await page.getByText("/goal ship it").first().waitFor();
     await page.getByText("all done").first().waitFor({ timeout: 30_000 });
     await until("the completed goal", async () => (await goalOf(id)).goal?.status === "complete");
     expect((await goalOf(id)).goal).toMatchObject({ status: "complete", objective: "ship it" });
@@ -60,9 +62,32 @@ describe("omp's goal mode via /goal", () => {
     // The command was the only thing sent: omp ran the continuations, nothing prompted from OpenChamber.
     expect(stack.frames().filter((f) => f.type === "prompt").map((f) => f.message)).toEqual(["hello"]);
 
-    // After a sidecar restart (no live omp), the transcript still says how the goal ended.
+    // After a sidecar restart (no live omp), the transcript still says how the goal ended, and the
+    // command is still the user's message, right before the goal's run.
     await stack.restartSidecar();
     expect(await goalOf(id)).toMatchObject({ live: false, goal: { status: "complete", objective: "ship it" } });
+    const users = ((await stack.http(`/session/${id}/message?directory=${dir()}&order=asc`)).body.data as any[]).filter((m) => m.type === "user").map((m) => m.text);
+    expect(users.slice(0, 2)).toEqual(["hello", "/goal ship it"]);
+  });
+
+  test("a /goal as the first message is refused, and its text stays in the composer", async () => {
+    await newSession(page);
+    const sessionsBefore = (await stack.http(`/session?directory=${dir()}`)).body.data.length;
+    await send(page, "/goal too early");
+    await page.getByText("A goal can't be the first message of a session").first().waitFor();
+    await until("the text back in the composer", async () => (await composer(page).innerText()).includes("/goal too early"), 5_000);
+    expect(stack.frames().some((f) => f.type === "goal" && f.objective === "too early")).toBe(false);
+    // OpenChamber created the session before the command was refused; nothing was started in it.
+    expect((await stack.http(`/session?directory=${dir()}`)).body.data.length).toBe(sessionsBefore + 1);
+  });
+
+  test("/goal is offered in the composer's command autocomplete", async () => {
+    await newSession(page);
+    await composer(page).click();
+    await page.keyboard.type("/goa");
+    await page.getByText("omp goal mode: /goal <objective> | pause | resume | drop", { exact: false }).first().waitFor();
+    await page.keyboard.press("Escape");
+    await composer(page).fill("");
   });
 
   test("pause, resume and drop; refusals explain themselves", async () => {
@@ -72,7 +97,7 @@ describe("omp's goal mode via /goal", () => {
     await page.getByText("Echo: start").waitFor();
     const id = await sessionId();
 
-    expect((await goalCommand(id, "pause")).status).toBe(409);
+    expect((await goalCommand(id, "pause")).body).toMatchObject({ _tag: "InvalidRequestError", message: "No active goal to pause." });
     expect((await goalCommand(id, "")).body).toMatchObject({ error: expect.stringContaining("No goal") });
     expect((await goalCommand(id, "set keep going")).status).toBe(204);
     await until("an active goal", async () => (await goalOf(id)).goal?.status === "active");

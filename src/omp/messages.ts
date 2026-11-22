@@ -900,8 +900,9 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: Session
       continue;
     }
     // P5: a `.` sent from OpenChamber is journaled as a `host-resume` marker (never shown to the model);
-    // it is the user message the continuation answers, under the client's id.
-    if (entry.type === "custom" && entry.customType === "host-resume") {
+    // it is the user message the continuation answers, under the client's id. A command the sidecar ran
+    // itself (`/goal …`) is journaled the same way as `host-command`.
+    if (entry.type === "custom" && (entry.customType === "host-resume" || entry.customType === "host-command")) {
       const data = entry.data as Record<string, unknown> | undefined;
       if (typeof data?.hostMessageId !== "string") continue;
       messages.push({

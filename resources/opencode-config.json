@@ -1,0 +1,8 @@
+{
+  "commands": {
+    "goal": {
+      "description": "omp goal mode: /goal <objective> | pause | resume | drop (status in the Oh-My-Pi panel)",
+      "template": "/goal $ARGUMENTS"
+    }
+  }
+}

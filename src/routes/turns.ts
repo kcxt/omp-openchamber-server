@@ -67,7 +67,10 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
         ...(body?.delivery === "steer" || body?.delivery === "queue" ? { delivery: body.delivery } : {}),
       });
       if (result.queued) return noContent();
-      return jsonError(result.error ?? "command failed", result.status ?? 400);
+      const message = result.error ?? "command failed";
+      // A refusal in OpenCode's tagged shape: OpenChamber shows its message (an untagged 4xx reads as "unexpected status").
+      if ((result.status ?? 400) < 500) return json({ _tag: "InvalidRequestError", message, error: message }, { status: 400 });
+      return jsonError(message, result.status ?? 500);
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "command failed", 500);
     }

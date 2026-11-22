@@ -523,11 +523,14 @@ omp's goal mode, run by the sidecar like `/aside` (typed, or sent as the `goal`
 command): `/goal <objective>` (or `/goal set <objective>`) creates omp's goal on
 the session's runtime, started when none is live; `/goal pause`, `/goal resume`
 (also re-arms an active goal omp stopped continuing) and `/goal drop` change it.
-Refusals are `409` (no goal, one already set) or `400` (usage, `/goal budget`:
-omp's RPC cannot change a budget) with the reason in `error`; a bare `/goal`
-answers with the goal's state that way. omp runs the continuations itself and
-the session stays busy through them; the agent completes the goal with its
-`goal` tool.
+Refusals are OpenCode's `400 InvalidRequestError` with the reason in `message`
+(no goal, one already set, usage, `/goal budget`: omp's RPC cannot change a
+budget), which OpenChamber shows while keeping the text in the composer; a bare
+`/goal` answers with the goal's state that way. A `/goal` as the first message
+of a session is refused (a goal works from an existing conversation). An
+accepted `/goal <objective>` is journalled as a `host-command` custom entry and
+shows as the user's message. omp runs the continuations itself and the session
+stays busy through them; the agent completes the goal with its `goal` tool.
 
 `GET /api/omp/goal/:sessionId?directory=` →
 `{ sessionId, live, goal: null | { status: "active"|"paused"|"complete"|"budget-limited"|"dropped", objective, tokensUsed, tokenBudget? } }`:

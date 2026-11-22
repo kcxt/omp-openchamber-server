@@ -7,18 +7,19 @@ import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { SessionDocs } from "../store/session-docs";
 import { CredentialInputError } from "../omp/credentials";
 import { asideMessageIds } from "../omp/btw-history";
-import { locateMessage } from "../omp/messages";
+import { loadSessionMessages, locateMessage } from "../omp/messages";
 import { getOmpSessionByOpenCodeId, readSessionIdSync, toOpenCodeSessionId } from "../store/sessions";
 import { OmpCli } from "../omp/cli";
 import { RpcChild } from "../omp/rpc-child";
 import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../shared/types";
-import { emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
+import { emitMessagePartUpdated, emitMessageUpdated, emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import {
   clearSessionSyntheticContext,
   emitUserPrompt,
   extractPromptTextParts,
   isPromptBody,
+  makeMessageId,
   preparePrompt,
 } from "./prompt-input";
 import { Registry, isSubagentTranscript } from "./registry";
@@ -234,6 +235,22 @@ function goalCommandOf(body: unknown): string | undefined {
   return match ? (match[1] ?? "").trim() : undefined;
 }
 
+/** A user message the sidecar journalled for a command it ran (`host-command`), echoed live under its id. */
+function emitCommandMessage(session: OpenCodeSession, model: ModelRef, messageID: string, text: string): void {
+  const created = Date.now() - 1;
+  emitMessageUpdated({
+    info: {
+      id: messageID,
+      sessionID: session.id,
+      role: "user",
+      agent: "omp",
+      model: { id: model.modelID, providerID: model.providerID, modelID: model.modelID, variant: model.variant },
+      time: { created, completed: created },
+    },
+  }, session.directory);
+  emitMessagePartUpdated(session.id, { id: `part_${session.id}_${messageID}_0`, type: "text", text, messageID, sessionID: session.id }, session.directory);
+}
+
 /**
  * `/goal`: omp's goal mode on the session's runtime, the RPC counterpart of
  * omp's interactive `/goal` (one goal at a time; omp runs the continuations
@@ -245,6 +262,9 @@ async function runGoalCommand(session: OpenCodeSession, args: string): Promise<P
   const [word = "", ...restWords] = args.split(/\s+/);
   const sub = word.toLowerCase();
   const refuse = (error: string, status = 409): PromptOutcome => ({ queued: false, status, error });
+  // Like omp, a goal does not open a session: it works from a conversation that exists.
+  const records = await loadSessionMessages(session.id, session.directory).catch(() => null);
+  if (!records?.length) return refuse("A goal can't be the first message of a session. Send a message first, then /goal <objective>.");
   try {
     const runtime = await Registry.ensure(session);
     const held = await runtime.getGoal();
@@ -273,6 +293,10 @@ async function runGoalCommand(session: OpenCodeSession, args: string): Promise<P
         const objective = (sub === "set" ? restWords.join(" ") : args).trim();
         if (!objective) return refuse(GOAL_USAGE, 400);
         if (current) return refuse(`A goal is already ${current.status}. Use /goal drop to start over.`);
+        // The command shows in the conversation as the user's message, then omp starts the goal's run.
+        const messageID = makeMessageId(session.id);
+        await runtime.journalUserCommand(`/goal ${args}`, messageID);
+        emitCommandMessage(session, runtime.model, messageID, `/goal ${args}`);
         await runtime.goal("create", { objective });
       }
     }

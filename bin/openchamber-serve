@@ -36,6 +36,10 @@ esac
 export OPENCODE_HOST=${OPENCODE_HOST:-http://127.0.0.1:$sidecar_port}
 export OPENCODE_SKIP_START=true
 export OPENCODE_BINARY=${OPENCODE_BINARY:-$repo/bin/opencode-unused}
+# OpenChamber hides a command named `goal` from autocomplete unless its own
+# command config lists it (stores/useCommandsStore.ts). This read-only config
+# layer lists the sidecar's `/goal`; nothing else reads it (no OpenCode runs).
+export OPENCODE_CONFIG=${OPENCODE_CONFIG:-$repo/resources/opencode-config.json}
 
 command -v openchamber >/dev/null 2>&1 || {
     echo "openchamber-serve: no openchamber on PATH (install @openchamber/web)" >&2
