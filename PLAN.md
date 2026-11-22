@@ -121,7 +121,7 @@ Merges today's `providers/omp/events.ts` normalizer and `prompt.ts#createEventHa
 ### 3.4 Abort (Esc)
 
 1. `state → aborting`; publish nothing new (still busy to OpenChamber).
-2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned to OpenChamber as un-sent queue items. This stops the parent run and its synchronous subagents. Async (background) subagents keep running, by design (user decision): Esc stops the agent, not delegated background work. Each can be stopped on its own session (`cancel_subagent`, §3.15).
+2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned in the interrupt response and its inbox bubbles are cancelled. This stops the parent run and its synchronous subagents. Async (background) subagents keep running, by design (user decision): Esc stops the agent, not delegated background work. Each can be stopped on its own session (`cancel_subagent`, §3.15).
 3. Wait until the parent run has stopped: the run's `agent_end`, or `get_state.isStreaming === false` polled after the abort response (R1: the `abort` response arrives after `agent_end`). Bounded by `ABORT_DEADLINE_MS` (5 s). Then `state → idle` (§3.1: background subagents or jobs left running do not keep the parent busy; their child sessions stay busy until they finish).
 4. On deadline (the parent run is still streaming): kill the child process group, `state → closed`, publish idle with `aborted: true`. The next prompt starts a fresh child on the same transcript. Settlement waits on background work are never a reason to kill.
 
@@ -303,7 +303,7 @@ Today a prompt to a child session can reach `promptSessionAsync`, which would sp
 |---|---|---|
 | D1 | Keep the multi-backend abstraction (`AgentBackend`, registry, fake backend, `ses_<backend>_` ids)? | Remove. Re-add when a second backend is real. |
 | D2 | Which omp? | The dev checkout on a `local` branch: upstream + the patches in §3.13, one commit each, rebased on upstream. The sidecar runs it through `--binary`; contract tests run against it. |
-| D3 | Esc with queued steer/follow-ups | `abort_and_restore_queue` (TUI Esc); withdrawn text goes back to OpenChamber as un-sent queue items. |
+| D3 | Esc with queued steer/follow-ups | `abort_and_restore_queue` (TUI Esc). The withdrawn text is returned in the `/interrupt` response (`withdrawn: {steering, followUp}`) and the pending inbox bubbles are cancelled; it is not put back into OpenChamber's message queue, which re-sends about 2 s after an abort and would undo the Esc. |
 | D4 | Titles | From omp: its title generation and `set_session_name`. Sidecar title generation and the title DB are deleted. |
 | D5 | Effort "default" | Send `set_thinking_level` with omp's default for the model, so the UI pick is what runs. |
 | D6 | Sidecar persistence | One JSON document per session (§3.10); no SQLite. |

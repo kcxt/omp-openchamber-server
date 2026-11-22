@@ -1,21 +1,12 @@
-import { readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { parseTranscript, mapOmpUsageToTokens, readTranscript, type TranscriptEntry } from "../../omp/transcript-reader";
+import { mapOmpUsageToTokens, readTranscript, type TranscriptEntry } from "../../omp/transcript-reader";
 import { SessionDocs, type SessionDocNotice } from "../../store/session-docs";
-import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId, readSessionHeader } from "./store";
-import {
-  deletePersistedMessageIdsFrom,
-  listPersistedMessageIds,
-  recordPersistedMessageId,
-} from "./title-db";
+import { getOmpSessionByOpenCodeId } from "./store";
 import { editToolMetadata } from "../../shared/edit-diff";
 import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-normalize";
 import { timeHexFromTimestamp, timeHexOfMessageId } from "../../shared/message-id";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
 import { resolveImageDataUrl, isBlobRef } from "../../shared/blobs";
 import type {
-  OpenCodeSession,
   OpenCodeFilePart,
   OpenCodeMessageRecord,
   OpenCodePart,
@@ -165,6 +156,8 @@ export interface AgentMessage {
   attribution?: "user" | "assistant";
   /** OpenChamber's client message id, stored on the user entry by omp (P1) or on a `host-resume` marker (P5). */
   hostMessageId?: string;
+  /** The transcript entry this message came from. */
+  entryId?: string;
   timestamp?: number;
   toolCallId?: string;
   toolName?: string;
@@ -180,213 +173,6 @@ export interface AgentMessage {
   ttft?: number;
   /** Provider prompt size and non-message estimate recorded with the request (see context.ts). */
   contextSnapshot?: unknown;
-}
-
-function timestampFromJsonlEntry(entry: Record<string, unknown>, message?: Record<string, unknown>): number | undefined {
-  const numeric = typeof message?.timestamp === "number"
-    ? message.timestamp
-    : typeof entry.timestamp === "number" ? entry.timestamp : undefined;
-  if (numeric !== undefined && Number.isFinite(numeric)) return numeric;
-  const raw = typeof message?.timestamp === "string"
-    ? message.timestamp
-    : typeof entry.timestamp === "string" ? entry.timestamp : undefined;
-  if (!raw) return undefined;
-  const parsed = Date.parse(raw);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function findRawMessageBoundary(
-  lines: string[],
-  target: OpenCodeMessageRecord,
-  messageId: string,
-  persisted: ReturnType<typeof listPersistedMessageIds>,
-): number {
-  const mapping = persisted.find((item) => item.clientMessageId === messageId);
-  const rawIds = new Set([messageId, mapping?.ompMessageId].filter((value): value is string => !!value));
-  const targetTime = target.info.time.created;
-  let firstAfterTime = -1;
-
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]?.trim();
-    if (!line) continue;
-    let entry: Record<string, unknown>;
-    try {
-      entry = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (entry.type !== "message") continue;
-    const rawMessage = entry.message && typeof entry.message === "object"
-      ? entry.message as Record<string, unknown>
-      : entry;
-    const rawId = typeof rawMessage.id === "string"
-      ? rawMessage.id
-      : typeof entry.id === "string" ? entry.id : undefined;
-    if (rawId && rawIds.has(rawId)) return index;
-    const timestamp = timestampFromJsonlEntry(entry, rawMessage);
-    if (timestamp !== undefined && timestamp >= targetTime && firstAfterTime === -1) firstAfterTime = index;
-    if (timestamp === targetTime && rawMessage.role === target.info.role) return index;
-  }
-
-  return firstAfterTime;
-}
-
-/**
- * The lines to keep when cutting the transcript at `boundary` (a line index).
- * omp reads the last tree entry of the file as the conversation's leaf, so
- * branches abandoned earlier (`/tree`, an earlier edit) must not end up last:
- * they stay, but ahead of the entries of the active branch, whose last kept
- * entry is then the leaf. Header, title slot and the sidecar's own markers
- * (no `id`) stay first, in their original order.
- */
-function retainBeforeBoundary(lines: string[], boundary: number): string[] {
-  const parsed = lines.map((line) => {
-    try {
-      return line.trim() ? (JSON.parse(line) as Record<string, unknown>) : null;
-    } catch {
-      return null;
-    }
-  });
-  const activeIds = new Set(parseTranscript(lines.join("\n")).activeBranch.map((entry) => entry.id));
-  const flat: string[] = [];
-  const abandoned: string[] = [];
-  const active: string[] = [];
-  for (let index = 0; index < boundary; index++) {
-    const line = lines[index]!;
-    if (line.length === 0) continue;
-    const record = parsed[index];
-    if (!record || typeof record.id !== "string" || record.type === "session") flat.push(line);
-    else (activeIds.has(record.id) ? active : abandoned).push(line);
-  }
-  return [...flat, ...abandoned, ...active];
-}
-
-/**
- * Commit a staged revert by removing its boundary message and everything after
- * it from OMP's append-only transcript. The target id exposed to OpenCode may
- * be the optimistic client id, so resolve it through the persisted message map
- * before falling back to its timestamp and role.
- */
-export async function truncateOmpSessionAtMessage(
-  openCodeId: string,
-  cwd: string,
-  messageId: string,
-): Promise<boolean> {
-  const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
-  if (!session) return false;
-
-  const transcript = await loadSessionMessages(openCodeId, cwd);
-  const target = transcript.find((message) => message.info.id === messageId);
-  if (!target) return false;
-
-  let original: string;
-  try {
-    original = await readFile(session.path, "utf8");
-  } catch {
-    return false;
-  }
-
-  const lines = original.split("\n");
-  const targetTime = target.info.time.created;
-  const boundary = findRawMessageBoundary(lines, target, messageId, listPersistedMessageIds(openCodeId));
-  if (boundary === -1) return false;
-
-  // Preserve all prior records (including the OMP session header and title
-  // slot), then append a durable clear marker for any staged revert.
-  const retained = retainBeforeBoundary(lines, boundary);
-  const tempPath = join(dirname(session.path), `.${randomUUID()}.revert.tmp`);
-  try {
-    await writeFile(tempPath, `${retained.join("\n")}\n`, "utf8");
-    await rename(tempPath, session.path);
-    const header = await readSessionHeader(session.path);
-    if (header) await SessionDocs.update(header.id, (doc) => { delete doc.revert; });
-  } catch {
-    await unlink(tempPath).catch(() => {});
-    return false;
-  }
-
-  const recorded = recordedUserMessagesBySession.get(openCodeId);
-  if (recorded) {
-    recordedUserMessagesBySession.set(openCodeId, recorded.filter((item) => item.timestamp < targetTime));
-  }
-  deletePersistedMessageIdsFrom(openCodeId, targetTime);
-  return true;
-}
-
-/** Create a fork with copied OMP transcript records, honoring v2's `before` id. */
-export async function forkOmpSession(
-  openCodeId: string,
-  cwd: string,
-  before?: string,
-): Promise<OpenCodeSession | null> {
-  const parent = await getOmpSessionByOpenCodeId(openCodeId, cwd);
-  if (!parent) return null;
-
-  let sourceText: string;
-  try {
-    sourceText = await readFile(parent.path, "utf8");
-  } catch {
-    return null;
-  }
-  const sourceLines = sourceText.split("\n");
-  const sourceHeaderIndex = sourceLines.findIndex((line) => {
-    try {
-      return (JSON.parse(line) as Record<string, unknown>).type === "session";
-    } catch {
-      return false;
-    }
-  });
-  if (sourceHeaderIndex === -1) return null;
-
-  let boundary = sourceLines.length;
-  if (before) {
-    const transcript = await loadSessionMessages(openCodeId, cwd);
-    const target = transcript.find((message) => message.info.id === before);
-    if (!target) return null;
-    boundary = findRawMessageBoundary(sourceLines, target, before, listPersistedMessageIds(openCodeId));
-    if (boundary === -1) return null;
-  }
-
-  const copiedRecords = sourceLines.slice(sourceHeaderIndex + 1, boundary).filter((line) => {
-    try {
-      const entry = JSON.parse(line) as Record<string, unknown>;
-      return entry.type === "message" || entry.type === "compaction";
-    } catch {
-      return false;
-    }
-  });
-
-  const child = await createOmpSession(parent.directory, {
-    forkOf: parent.id,
-    title: `Fork of ${parent.title ?? parent.id}`,
-    agent: parent.agent,
-    model: parent.model,
-    metadata: parent.metadata,
-  });
-  try {
-    const childLines = (await readFile(child.path, "utf8")).split("\n");
-    const childHeaderIndex = childLines.findIndex((line) => {
-      try {
-        return (JSON.parse(line) as Record<string, unknown>).type === "session";
-      } catch {
-        return false;
-      }
-    });
-    if (childHeaderIndex === -1) throw new Error("fork session header not found");
-    const contents = [...childLines.slice(0, childHeaderIndex + 1), ...copiedRecords].join("\n") + "\n";
-    const tempPath = join(dirname(child.path), `.${randomUUID()}.fork.tmp`);
-    try {
-      await writeFile(tempPath, contents, "utf8");
-      await rename(tempPath, child.path);
-    } catch (error) {
-      await unlink(tempPath).catch(() => {});
-      throw error;
-    }
-    return await getOmpSessionByOpenCodeId(child.id, child.directory);
-  } catch {
-    await deleteOmpSession(child.id, child.directory);
-    return null;
-  }
 }
 
 function openCodeRoleFor(msg: AgentMessage): "user" | "assistant" | null {
@@ -755,100 +541,27 @@ function buildPromptTextParts(
   }));
 }
 
-interface RecordedUserMessage {
-  text: string;
-  clientMessageId: string;
-  timestamp: number;
-  ompMessageId?: string;
-  promptParts?: OpenCodePromptTextPart[];
-}
-
-const recordedUserMessagesBySession = new Map<string, RecordedUserMessage[]>();
-
-export function clearRecordedUserMessagesMemoryCache(openCodeId?: string): void {
-  if (openCodeId) {
-    recordedUserMessagesBySession.delete(openCodeId);
-  } else {
-    recordedUserMessagesBySession.clear();
-  }
-}
-
-export function recordUserMessageId(
-  openCodeId: string,
-  promptTextOrMessageId: string,
-  messageId?: string,
-  dbPath?: string,
-  promptParts?: OpenCodePromptTextPart[],
-): void {
-  const actualMessageId = messageId ?? promptTextOrMessageId;
-  const promptText = messageId ? promptTextOrMessageId : "";
-  const now = Date.now();
-  const list = recordedUserMessagesBySession.get(openCodeId) ?? [];
-  const filtered = list.filter((item) => item.clientMessageId !== actualMessageId);
-  filtered.push({
-    text: promptText.trim(),
-    clientMessageId: actualMessageId,
-    timestamp: now,
-    ...(promptParts && promptParts.length > 0 ? { promptParts: promptParts.map((part) => ({ ...part })) } : {}),
-  });
-  recordedUserMessagesBySession.set(openCodeId, filtered);
-
-  recordPersistedMessageId(openCodeId, actualMessageId, promptText.trim(), now, undefined, dbPath, promptParts);
-}
-
-function getRecordedUserMessages(openCodeId: string, dbPath?: string): RecordedUserMessage[] {
-  const inMemory = recordedUserMessagesBySession.get(openCodeId);
-  if (inMemory && inMemory.length > 0) {
-    return inMemory;
-  }
-
-  const persisted = listPersistedMessageIds(openCodeId, dbPath);
-  if (persisted.length > 0) {
-    const list: RecordedUserMessage[] = persisted.map((p) => ({
-      text: p.promptText,
-      clientMessageId: p.clientMessageId,
-      timestamp: p.createdAt,
-      ompMessageId: p.ompMessageId,
-      promptParts: p.promptParts,
-    }));
-    recordedUserMessagesBySession.set(openCodeId, list);
-    return list;
-  }
-
-  return [];
-}
-
-export function extractUserMessageText(msg: AgentMessage): string {
-  if (typeof msg.content === "string") return msg.content.trim();
-  if (Array.isArray(msg.content)) {
-    for (const block of msg.content) {
-      if (block && typeof block === "object" && typeof block.text === "string") {
-        return block.text.trim();
-      }
-    }
-  }
-  return "";
-}
-
 /**
  * User message ids are exact, never matched by text or position: P1 stores the
  * client id on omp's entry (`hostMessageId`); a message from before the
  * migration uses the id the importer recorded for its entry
  * (`legacyIdsByEntry`); anything else gets an id derived from its entry id.
- * The ledger keyed by client id only supplies the visible prompt parts.
+ * `visibleParts` (by client id) only supplies what the user typed for a prompt
+ * whose message to the model carried more. `entryIds`, when given, receives
+ * the omp entry that opens each record.
  */
 export function mapRpcMessagesToOpenCodeRecords(
   messages: AgentMessage[],
   openCodeId: string,
-  dbPath?: string,
   legacyIdsByEntry: Record<string, string> = {},
+  visibleParts: Record<string, OpenCodePromptTextPart[]> = {},
+  entryIds?: Map<string, string>,
 ): OpenCodeMessageRecord[] {
   const records: OpenCodeMessageRecord[] = [];
   let lastUserMessageId: string | undefined;
   let lastUserMatched = false;
   let lastAssistantRecord: OpenCodeMessageRecord | undefined;
   let visibleIndex = 0;
-  const recordedById = new Map(getRecordedUserMessages(openCodeId, dbPath).map((r) => [r.clientMessageId, r]));
   let assistantSegmentIndex = 0;
   /** Developer messages waiting for the assistant record they lead into. */
   let pendingDeveloper: OpenCodeToolPart[] = [];
@@ -923,7 +636,7 @@ export function mapRpcMessagesToOpenCodeRecords(
       }
 
       visibleIndex++;
-      const matchedPromptParts = clientId ? recordedById.get(clientId)?.promptParts : undefined;
+      const matchedPromptParts = clientId ? visibleParts[clientId] : undefined;
       const parts = matchedPromptParts && matchedPromptParts.length > 0
         ? buildPromptTextParts(matchedPromptParts, openCodeId, messageId, createdAt)
         : buildParts(msg, openCodeId, messageId);
@@ -936,6 +649,7 @@ export function mapRpcMessagesToOpenCodeRecords(
         time: { created: createdAt, completed: createdAt },
       };
       records.push({ info: baseInfo, parts });
+      if (msg.entryId) entryIds?.set(messageId, msg.entryId);
       lastUserMessageId = messageId;
       lastAssistantRecord = undefined;
     } else {
@@ -1072,6 +786,7 @@ export function mapRpcMessagesToOpenCodeRecords(
         };
         updateAssistantCompletion(record, assistantCompletionAt ?? createdAt, terminalAssistantCompletion || isCompaction);
         records.push(record);
+        if (msg.entryId) entryIds?.set(messageId, msg.entryId);
         lastAssistantRecord = isCompaction ? undefined : record;
       }
     }
@@ -1092,8 +807,9 @@ function timestampOf(value: unknown): number | undefined {
 
 /**
  * The conversation as AgentMessages: the messages and compactions of the
- * transcript's active branch (see `transcript-reader.ts`), with the sidecar's
- * command notices placed among them by timestamp.
+ * transcript's active branch (see `transcript-reader.ts`), with command notices
+ * placed where omp journaled them (P2 `oc-notice` entries; replies from before
+ * P2 sit in the doc's read-only `legacyNotices` and go in by timestamp).
  *
  * Record shapes (omp session file format):
  *   {"type":"message","id","parentId","timestamp":"<iso>","message":{"role","content":[...],
@@ -1102,12 +818,14 @@ function timestampOf(value: unknown): number | undefined {
  * The inner `message` object matches the AgentMessage shape the `get_messages`
  * RPC returns, so it flows through the same mapper.
  */
-function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNotice[] = []): AgentMessage[] {
+function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: SessionDocNotice[] = []): AgentMessage[] {
   const messages: AgentMessage[] = [];
   for (const entry of branch) {
+    const entryId = typeof entry.id === "string" ? entry.id : undefined;
     if (entry.type === "compaction") {
       messages.push({
-        id: typeof entry.id === "string" ? entry.id : undefined,
+        id: entryId,
+        entryId,
         role: "compactionSummary",
         summary: typeof entry.summary === "string" ? entry.summary : "",
         shortSummary: typeof entry.shortSummary === "string" ? entry.shortSummary : undefined,
@@ -1124,7 +842,8 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNot
       const data = entry.data as Record<string, unknown> | undefined;
       if (typeof data?.hostMessageId !== "string") continue;
       messages.push({
-        id: typeof entry.id === "string" ? entry.id : undefined,
+        id: entryId,
+        entryId,
         role: "user",
         content: [{ type: "text", text: typeof data.text === "string" ? data.text : "." }],
         hostMessageId: data.hostMessageId,
@@ -1132,23 +851,24 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNot
       });
       continue;
     }
+    // P2: a command's reply the runtime journaled; it reads as an assistant message.
+    if (entry.type === "custom" && entry.customType === "oc-notice") {
+      const data = entry.data as Record<string, unknown> | undefined;
+      if (typeof data?.text !== "string") continue;
+      messages.push(noticeMessage(entryId, data.text, typeof data.level === "string" ? data.level : "info", timestampOf(entry.timestamp) ?? Date.now()));
+      continue;
+    }
     if (entry.type !== "message") continue;
     const raw = entry.message;
     if (raw == null || typeof raw !== "object") continue;
     const message = raw as Record<string, unknown>;
-    const id = typeof message.id === "string" ? message.id : typeof entry.id === "string" ? entry.id : undefined;
+    const id = typeof message.id === "string" ? message.id : entryId;
     const timestamp = typeof message.timestamp === "number" ? message.timestamp : timestampOf(entry.timestamp);
-    messages.push({ ...message, id, timestamp } as unknown as AgentMessage);
+    messages.push({ ...message, id, entryId, timestamp } as unknown as AgentMessage);
   }
 
-  for (const notice of notices) {
-    const message = {
-      id: `notice_${notice.timestamp}`,
-      role: "assistant",
-      content: [{ type: "text", text: notice.level === "info" ? notice.text : `⚠️ ${notice.text}` }],
-      stopReason: "stop",
-      timestamp: notice.timestamp,
-    } as unknown as AgentMessage;
+  for (const notice of legacyNotices) {
+    const message = noticeMessage(`notice_${notice.timestamp}`, notice.text, notice.level, notice.timestamp);
     const index = messages.findIndex((m) => typeof m.timestamp === "number" && m.timestamp > notice.timestamp);
     if (index === -1) messages.push(message);
     else messages.splice(index, 0, message);
@@ -1156,16 +876,63 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNot
   return messages;
 }
 
-/** Messages of the session's transcript, read through the memoised `TranscriptReader`. */
-export async function loadSessionMessages(
-  openCodeId: string,
-  cwd: string,
-  dbPath?: string,
-): Promise<OpenCodeMessageRecord[]> {
-  const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
-  if (!session) throw new Error(`Failed to load messages for ${openCodeId}: no session found in ${cwd}`);
-  const transcript = await readTranscript(session.path);
+function noticeMessage(id: string | undefined, text: string, level: string, timestamp: number): AgentMessage {
+  return {
+    id,
+    role: "assistant",
+    content: [{ type: "text", text: level === "info" ? text : `⚠️ ${text}` }],
+    stopReason: "stop",
+    timestamp,
+  } as unknown as AgentMessage;
+}
+
+async function readBranch(openCodeId: string, path: string) {
+  const transcript = await readTranscript(path);
   if (!transcript?.header) throw new Error(`Failed to load messages for ${openCodeId}: transcript unreadable`);
   const doc = await SessionDocs.get(transcript.header.id);
-  return mapRpcMessagesToOpenCodeRecords(agentMessagesOfBranch(transcript.activeBranch, doc.notices), openCodeId, dbPath, doc.legacyMessageIds);
+  const messages = agentMessagesOfBranch(transcript.activeBranch, doc.legacyNotices);
+  return { transcript, doc, messages };
+}
+
+/** Messages of the session's transcript, read through the memoised `TranscriptReader`. */
+export async function loadSessionMessages(openCodeId: string, cwd: string): Promise<OpenCodeMessageRecord[]> {
+  const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
+  if (!session) throw new Error(`Failed to load messages for ${openCodeId}: no session found in ${cwd}`);
+  const { doc, messages } = await readBranch(openCodeId, session.path);
+  return mapRpcMessagesToOpenCodeRecords(messages, openCodeId, doc.legacyMessageIds, doc.visibleParts);
+}
+
+/** Where a visible message sits in omp's tree. */
+export interface MessageLocation {
+  /** The omp entry that opens the message. */
+  entryId: string;
+  parentId: string | null;
+  /** A user message omp's `navigate_tree` rewinds past (it moves the leaf to its parent). */
+  userMessage: boolean;
+  /** A `.` marker (P5): a user message to OpenChamber, a `custom` entry to omp. */
+  resumeMarker: boolean;
+  /** The session's leaf in the file (omp's last line). */
+  leafId: string | null;
+  /** omp session uuid (the SessionDoc key). */
+  uuid: string;
+}
+
+/** Maps a message id OpenChamber knows (client id, legacy id, derived id) to its entry in the active branch. */
+export async function locateMessage(openCodeId: string, transcriptPath: string, messageID: string): Promise<MessageLocation | undefined> {
+  const { transcript, doc, messages } = await readBranch(openCodeId, transcriptPath);
+  const entryIds = new Map<string, string>();
+  mapRpcMessagesToOpenCodeRecords(messages, openCodeId, doc.legacyMessageIds, doc.visibleParts, entryIds);
+  const entryId = entryIds.get(messageID);
+  if (!entryId) return undefined;
+  const entry = transcript.entries.find((candidate) => candidate.id === entryId);
+  if (!entry) return undefined;
+  const message = entry.type === "message" ? entry.message as Record<string, unknown> | undefined : undefined;
+  return {
+    entryId,
+    parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+    userMessage: message?.role === "user",
+    resumeMarker: entry.type === "custom" && entry.customType === "host-resume",
+    leafId: transcript.leafId,
+    uuid: transcript.header!.id,
+  };
 }

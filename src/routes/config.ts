@@ -7,7 +7,6 @@ import { listAvailableSkills } from "../adapters/openchamber/discovery";
 import { defaultBackend } from "../providers/registry";
 import { apiOrGet, type RouteContext } from "../http/router";
 import { readJson } from "../http/response";
-import { clearProviderCache } from "../services/provider-cache";
 import { readOmpConfig, writeOmpConfig } from "../services/settings-file";
 
 function toV2ConfigEntries(directory: string): Array<{ type: "document"; path: string; info: Record<string, unknown> }> {
@@ -138,7 +137,6 @@ export async function handleConfig(ctx: RouteContext): Promise<Response | undefi
 
   // Config reload
   if (path === "/api/config/reload" || path === "/config/reload") {
-    clearProviderCache();
     return json({ success: true });
   }
 

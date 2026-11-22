@@ -1,7 +1,7 @@
-/** Session lifecycle: create, list, get, update, delete, fork, status, view/move/model/agent. */
-import { applyGoalChange, applySessionModel, removeSession, resumeAfterRestart } from "../sessions/service";
+/** Session lifecycle: create, list, get, update, delete, fork, status, view/move/model. */
+import { applyGoalChange, applySessionModel, forkSession, moveSession, removeSession, renameSession, resumeAfterRestart, SessionOpError } from "../sessions/service";
 import { addSessionSyntheticContext } from "../sessions/prompt-input";
-import { sessionStatusMap } from "../sessions/status";
+import { assertStatusesKnown, SessionStatusUnknownError, sessionStatusMap } from "../sessions/status";
 import { getPendingBlockingRequestsSnapshot, toOpenCodeFormRequest, toOpenCodePermissionRequest } from "../adapters/openchamber/approvals";
 import { ocGoalOf } from "../adapters/openchamber/goal";
 import { attachOmpSessionContext } from "../adapters/openchamber/omp-context";
@@ -61,7 +61,6 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         id: typeof body.id === "string" ? body.id : undefined,
         title: typeof body.title === "string" ? body.title : undefined,
         parentID: typeof body.parentID === "string" ? body.parentID : undefined,
-        agent: typeof body.agent === "string" ? body.agent : undefined,
         model: modelID && requestedProvider ? {
           providerID: prefix.native,
           modelID,
@@ -91,7 +90,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         limit: limit != null ? parseInt(limit, 10) : undefined,
         search,
       });
-      return json(attachOmpRecapAssist(sessions));
+      return json(await attachOmpRecapAssist(sessions));
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "list failed", 500);
     }
@@ -144,7 +143,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       const requestedLimit = limit == null ? 100 : Number.parseInt(limit, 10);
       const pageLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 500)) : 100;
       const currentPage = page(ordered, pageLimit, url.searchParams.get("cursor"), order);
-      return json({ data: attachOmpRecapAssist(currentPage.data).map(toV2Session), cursor: currentPage.cursor });
+      return json({ data: (await attachOmpRecapAssist(currentPage.data)).map(toV2Session), cursor: currentPage.cursor });
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "list failed", 500);
     }
@@ -159,6 +158,12 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   // loop and uses "running" as its status value. The SDK unwraps `data`,
   // so an unenveloped map reads as a failed call on the client.
   if (p === "/session/active" && req.method === "GET") {
+    try {
+      assertStatusesKnown();
+    } catch (err) {
+      if (err instanceof SessionStatusUnknownError) return jsonError(err.message, 503);
+      throw err;
+    }
     const statuses = sessionStatusMap();
     return json({
       data: Object.fromEntries(Object.keys(statuses).map((sessionID) => [sessionID, { type: "running" }])),
@@ -210,12 +215,11 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   if (sessionMoveMatch && req.method === "POST") {
     try {
       const sessionID = decodeURIComponent(sessionMoveMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
       const body = asRecord(await readJson(req));
       if (typeof body?.directory !== "string" || !body.directory.trim()) return jsonError("directory required", 400);
-      const moved = await backend.store.move(sessionID, body.directory, session.directory);
-      if (!moved) return jsonError("session move failed", 500);
+      const moved = await moveSession(session, body.directory.trim());
       emitOpenCodeV2Event("session.moved", {
         sessionID,
         projectID: moved.projectID,
@@ -223,7 +227,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       }, moved.directory);
       return noContent();
     } catch (err) {
-      return jsonError(err instanceof Error ? err.message : "session move failed", 500);
+      return jsonError(err instanceof Error ? err.message : "session move failed", err instanceof SessionOpError ? err.status : 500);
     }
   }
 
@@ -291,8 +295,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         // or the picker would show a model the session never runs.
         return jsonError(applied.error, 502);
       }
-      const updated = await backend.store.update(sessionID, { model: modelRef }, session.directory);
-      if (!updated) return jsonError("session not found", 404);
+      if (!(await backend.store.get(sessionID, session.directory))) return jsonError("session not found", 404);
       emitOpenCodeV2Event("session.model.selected", {
         sessionID,
         model: { id: modelID, providerID, variant: modelRef.variant },
@@ -300,24 +303,6 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       return noContent();
     } catch (err) {
       return jsonError(err instanceof Error ? err.message : "model switch failed", 500);
-    }
-  }
-
-  const sessionAgentMatch = p.match(/^\/session\/([^/]+)\/agent$/);
-  if (sessionAgentMatch && req.method === "POST") {
-    try {
-      const sessionID = decodeURIComponent(sessionAgentMatch[1]!);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
-      if (!session) return jsonError("session not found", 404);
-      const body = asRecord(await readJson(req));
-      if (typeof body?.agent !== "string" || !body.agent) return jsonError("agent required", 400);
-      const previous = session.agent;
-      const updated = await backend.store.update(sessionID, { agent: body.agent }, session.directory);
-      if (!updated) return jsonError("session not found", 404);
-      emitOpenCodeV2Event("session.agent.selected", { sessionID, agent: body.agent, previous }, session.directory);
-      return noContent();
-    } catch (err) {
-      return jsonError(err instanceof Error ? err.message : "agent switch failed", 500);
     }
   }
 
@@ -329,7 +314,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
       try {
         const { backend, session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
-        const withContext = await attachOmpSessionContext(backend, attachOmpRecapAssist([session])[0] ?? session);
+        const withContext = await attachOmpSessionContext(backend, (await attachOmpRecapAssist([session]))[0] ?? session);
         return json({ data: toV2Session(withContext) });
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "lookup failed", 500);
@@ -357,10 +342,13 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
           time?: { archived?: number | null };
         } | undefined;
         const { backend, session } = await resolveSessionRoute(openCodeId, dir);
-        const previousGoal = ocGoalOf(session?.metadata);
+        if (!session) return jsonError("session not found", 404);
+        const previousGoal = ocGoalOf(session.metadata);
+        // A rename is omp's: `set_session_name` on the session's runtime.
+        if (typeof body?.title === "string" && body.title !== session.title) await renameSession(session, body.title);
         const updated = await backend.store.update(
           openCodeId,
-          { title: body?.title, metadata: body?.metadata, time: body?.time },
+          { metadata: body?.metadata, time: body?.time },
           dir,
         );
         if (!updated) return jsonError("session not found", 404);
@@ -371,7 +359,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         }
         return noContent();
       } catch (err) {
-        return jsonError(err instanceof Error ? err.message : "update failed", 500);
+        return jsonError(err instanceof Error ? err.message : "update failed", err instanceof SessionOpError ? err.status : 500);
       }
     }
   }
@@ -391,16 +379,15 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
   const forkMatch = p.match(/^\/session\/([^/]+)\/fork$/);
   if (forkMatch && req.method === "POST") {
     try {
-      const { backend, session } = await resolveSessionRoute(forkMatch[1], dir);
+      const { session } = await resolveSessionRoute(forkMatch[1], dir);
       if (!session) return jsonError("session not found", 404);
       const body = asRecord(await readJson(req));
       const before = typeof body?.before === "string" ? body.before : undefined;
-      const forked = await backend.store.fork(forkMatch[1]!, session.directory, before);
-      if (!forked) return jsonError(before ? "fork boundary not found" : "session fork failed", before ? 404 : 500);
+      const forked = await forkSession(session, before);
       emitSessionCreated(forked as unknown as Record<string, unknown>, forked.directory);
       return json({ data: toV2Session(forked) });
     } catch (err) {
-      return jsonError(err instanceof Error ? err.message : "fork failed", 500);
+      return jsonError(err instanceof Error ? err.message : "fork failed", err instanceof SessionOpError ? err.status : 500);
     }
   }
 

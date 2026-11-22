@@ -4,9 +4,10 @@
  * (default data dir as OpenChamber's: `~/.config/openchamber`).
  *
  * Fields (PLAN.md §3.10): `metadata`, `archivedAt`, `viewedAt`, `revert`,
- * `legacyMessageIds`. `notices`, `alias`, `agent` are the documented fallback
- * until omp patches P2 (journaled command notices), P3 (no transcript moves)
- * and the single-agent rule land; delete them with those patches.
+ * `legacyMessageIds`, `visibleParts`, `legacyNotices`. The last two are what omp
+ * cannot hold: the typed text of a prompt whose message to the model carried
+ * more (synthetic context), and command replies the old sidecar kept before
+ * omp journaled them (P2). `legacyNotices` is written only by the importer.
  *
  * Rules: written only through this module, by temp file + rename, serialised
  * per uuid (read-merge-write through `update`). The process is the only writer,
@@ -18,6 +19,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { OpenCodePromptTextPart } from "../providers/types";
 
 export interface SessionDocRevert {
   messageID: string;
@@ -28,7 +30,7 @@ export interface SessionDocRevert {
   files?: unknown[];
 }
 
-/** A command reply omp keeps no record of, shown in the transcript at `timestamp`. */
+/** A command reply the old sidecar kept because omp had no record of it, shown in the transcript at `timestamp`. Read-only. */
 export interface SessionDocNotice {
   text: string;
   level: string;
@@ -43,10 +45,14 @@ export interface SessionDoc {
   revert?: SessionDocRevert;
   /** omp entry id → client message id, pre-migration messages only. */
   legacyMessageIds?: Record<string, string>;
-  notices?: SessionDocNotice[];
-  /** OpenChamber session id this transcript continues (it moved off a contested lease). */
-  alias?: string;
-  agent?: string;
+  /**
+   * Client message id → the text parts the user saw, for prompts whose message
+   * to the model held more than that (pending synthetic context). The
+   * transcript holds the full message.
+   */
+  visibleParts?: Record<string, OpenCodePromptTextPart[]>;
+  /** Command replies from before omp journaled them (P2). Written by the importer only. */
+  legacyNotices?: SessionDocNotice[];
 }
 
 export function openChamberDataDir(): string {
@@ -66,12 +72,15 @@ function validUuid(uuid: string): string {
 
 function normalize(raw: unknown): SessionDoc {
   const source = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  // Docs the importer wrote before P2/P3 hold `notices`, `alias` and `agent`: the notices stay, read-only.
+  const { notices, alias: _alias, agent: _agent, ...rest } = source;
   const doc: SessionDoc = {
-    ...(source as Partial<SessionDoc>),
+    ...(rest as Partial<SessionDoc>),
     metadata: source.metadata && typeof source.metadata === "object" && !Array.isArray(source.metadata)
       ? source.metadata as Record<string, unknown>
       : {},
   };
+  if (Array.isArray(notices) && doc.legacyNotices === undefined) doc.legacyNotices = notices as SessionDocNotice[];
   return doc;
 }
 

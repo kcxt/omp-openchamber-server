@@ -11,13 +11,11 @@
  * busy instead.
  */
 import { RpcChild } from "../omp/rpc-child";
-import { readTranscriptSummary } from "../omp/transcript-reader";
 import { readOmpConfigSmallModel } from "../adapters/openchamber/small-model";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
 import { readSessionIdSync, toOpenCodeSessionId } from "../providers/omp/store";
 import { extractTodosFromOmpDetails } from "../providers/omp/todo";
 import type { BackendCredentials, BackendGoalOp, BackendGoalSnapshot, ImageContent, ModelRef } from "../providers/types";
-import { SessionDocs } from "../store/session-docs";
 import { logger, promptLogger } from "../shared/logger";
 import {
   emitSessionCreated,
@@ -132,6 +130,22 @@ function ompThinkingLevel(variant: string | undefined): string | undefined {
   return ompThinkingLevels.has(level) ? level : undefined;
 }
 
+/** OpenChamber's "default" effort: no pick of its own, omp's default for the model applies. */
+function isDefaultVariant(variant: string | undefined): boolean {
+  const level = variant?.trim().toLowerCase();
+  return !level || level === "default";
+}
+
+/**
+ * omp's default level for the model it runs: the catalog's `thinking.defaultLevel`
+ * (carried on `get_state.model`), else omp's own fallback, high. omp clamps
+ * the level to what the model supports (a model without reasoning stays off).
+ */
+function defaultThinkingLevel(model: Record<string, unknown> | undefined): string {
+  const declared = record(model?.thinking)?.defaultLevel;
+  return typeof declared === "string" && ompThinkingLevels.has(declared) ? declared : "high";
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -176,6 +190,8 @@ export class SessionRuntime {
   #busyCommands = 0;
   /** Client ids of prompts omp accepted and has not journaled yet, in send order (output assembly). */
   #undelivered: string[] = [];
+  /** Collects `command_output` while the runtime runs a command itself (`/move`). */
+  #capture?: string[];
 
   #pollTimer?: ReturnType<typeof setTimeout>;
   #releaseTimer?: ReturnType<typeof setTimeout>;
@@ -198,7 +214,7 @@ export class SessionRuntime {
       host: {
         respond: (frame) => child.sendFrame(frame),
         readTodos: async () => extractTodosFromOmpDetails({ phases: (await this.#getState())?.todoPhases }) ?? undefined,
-        persistNotice: (text, level, timestamp) => this.#persistNotice(text, level, timestamp),
+        journalNotice: (text, level) => this.#journalNotice(text, level),
         delivered: (id) => {
           this.#undelivered = this.#undelivered.filter((entry) => entry !== id);
         },
@@ -377,23 +393,25 @@ export class SessionRuntime {
   }
 
   /**
-   * Applies a model pick: `set_model` when omp runs another model, and the
-   * effort whenever the pick names one (omp resets it on a model switch).
+   * Applies a model pick: `set_model` when omp runs another model, then the
+   * effort (omp resets it on a model switch). A pick of `default` sends omp's
+   * default level for the model, so the UI's pick is what runs.
    * Throws when omp refuses the model.
    */
   setModel(pick: ModelPick): Promise<void> {
     return this.#serial(async () => {
       this.#assertOpen();
-      const current = record((await this.#getState())?.model);
-      if (current?.provider !== pick.providerID || current?.id !== pick.modelID) {
+      let live = record((await this.#getState())?.model);
+      if (live?.provider !== pick.providerID || live?.id !== pick.modelID) {
         try {
           await this.#child.request("set_model", { provider: pick.providerID, modelId: pick.modelID });
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           throw new Error(`could not switch to ${pick.providerID}/${pick.modelID}: ${reason}`);
         }
+        if (isDefaultVariant(pick.variant)) live = record((await this.#getState())?.model);
       }
-      const level = ompThinkingLevel(pick.variant);
+      const level = isDefaultVariant(pick.variant) ? defaultThinkingLevel(live) : ompThinkingLevel(pick.variant);
       let variant = pick.variant ?? "default";
       if (level) {
         await this.#child.request("set_thinking_level", { level }).catch((err) => {
@@ -418,6 +436,77 @@ export class SessionRuntime {
 
   async getGoal(): Promise<BackendGoalSnapshot | null> {
     return parseGoal(record((await this.#getState())?.goal)?.goal);
+  }
+
+  /**
+   * Revert / redo (§3.9): `navigate_tree` moves omp's leaf in memory only, so
+   * the `host-revert` entry appended on the new leaf is what makes the branch
+   * durable (a child that dies now, or another omp opening the file, sees it).
+   * `entryId` is a user message to rewind past (omp moves the leaf to its
+   * parent), or the abandoned leaf on redo.
+   */
+  navigateTo(entryId: string, journal: { action: "revert" | "redo"; messageID: string }): Promise<void> {
+    return this.#serial(async () => {
+      this.#assertOpen();
+      if (this.#state !== "idle") throw new Error("session is busy; wait for the turn to finish");
+      await this.#child.request("navigate_tree", { entryId });
+      await this.#child.request("append_custom_entry", { customType: "host-revert", data: journal });
+    });
+  }
+
+  /**
+   * omp's `fork` (whole history, or up to `entryId`) or `branch` (before the
+   * user message `entryId`). The child moves onto the new transcript, so the
+   * runtime names it, reports where it is and closes: the original session is
+   * opened afresh by its next prompt, the fork by its own.
+   */
+  fork(target?: { entryId: string; before: boolean }, name?: string): Promise<{ transcriptPath: string; sessionId: string }> {
+    return this.#serial(async () => {
+      this.#assertOpen();
+      if (this.#state !== "idle") throw new Error("session is busy; wait for the turn to finish");
+      await this.#child.request(target?.before ? "branch" : "fork", target ? { entryId: target.entryId } : {});
+      const state = await this.#getState();
+      if (typeof state?.sessionFile !== "string" || typeof state.sessionId !== "string") throw new Error("omp did not report the forked session");
+      if (name) await this.#child.request("set_session_name", { name });
+      this.close("replaced");
+      return { transcriptPath: state.sessionFile, sessionId: state.sessionId };
+    });
+  }
+
+  /**
+   * omp's builtin `/move <dir>` (R5): no model call, same session id, the
+   * transcript moves to the directory's bucket. A refusal arrives only as
+   * `command_output` with `success: true`, so the reply text is the verdict.
+   * On success the child (re-scoped to the new directory) is closed.
+   */
+  move(directory: string): Promise<{ transcriptPath: string }> {
+    return this.#serial(async () => {
+      this.#assertOpen();
+      if (this.#state !== "idle") throw new Error("Cannot move while the session is running.");
+      const before = this.#transcriptPath;
+      const replies: string[] = [];
+      this.#capture = replies;
+      try {
+        await this.#child.request("prompt", { message: `/move ${directory}` });
+      } finally {
+        this.#capture = undefined;
+      }
+      const text = replies.join("\n").trim();
+      const state = await this.#getState();
+      const moved = typeof state?.sessionFile === "string" ? state.sessionFile : undefined;
+      if (!/^Moved to /i.test(text) || !moved || moved === before) throw new Error(text || "omp did not move the session");
+      this.#transcriptPath = moved;
+      this.close("replaced");
+      return { transcriptPath: moved };
+    });
+  }
+
+  /** omp's `set_session_name`: the title slot of the transcript is omp's to write. */
+  setName(name: string): Promise<void> {
+    return this.#serial(async () => {
+      this.#assertOpen();
+      await this.#child.request("set_session_name", { name });
+    });
   }
 
   /** Runs a shell command in the session's child (`/session/:id/shell`). */
@@ -579,6 +668,11 @@ export class SessionRuntime {
         this.#onExit();
         return;
     }
+    // A command the runtime itself sent (`/move`): its reply is the answer, not a notice.
+    if (frame.type === "command_output" && this.#capture) {
+      if (typeof frame.text === "string") this.#capture.push(frame.text);
+      return;
+    }
     // The translator first: a run's closing events go out before the idle they lead to.
     this.#translator.handle(frame);
     switch (frame.type) {
@@ -720,16 +814,16 @@ export class SessionRuntime {
     return { steering, followUp, inboxIDs };
   }
 
-  #persistNotice(text: string, level: string, timestamp: number): void {
-    // omp keeps no record of a command's notify message; without one the
-    // reply vanishes on the next refetch and the turn reads as unanswered.
-    void (async () => {
-      const header = (await readTranscriptSummary(this.#transcriptPath))?.header;
-      if (!header) throw new Error(`no session header in ${this.#transcriptPath}`);
-      await SessionDocs.update(header.id, (doc) => {
-        doc.notices = [...(doc.notices ?? []), { text, level, timestamp }];
-      });
-    })().catch((err) => promptLogger.warn({ err, sessionID: this.sessionId }, "[runtime] could not persist command notice"));
+  /**
+   * omp keeps no record of a command's notify message; journaling it as a
+   * custom entry (P2) keeps the reply in the transcript, so it survives a
+   * refetch and the turn does not read as unanswered.
+   */
+  #journalNotice(text: string, level: string): void {
+    if (!this.#child.isAlive()) return;
+    void this.#child
+      .request("append_custom_entry", { customType: "oc-notice", data: { text, level } })
+      .catch((err) => promptLogger.warn({ err, sessionID: this.sessionId }, "[runtime] could not journal command notice"));
   }
 
   // ------------------------------------------------------------------ subagent stream

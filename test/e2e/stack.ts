@@ -23,7 +23,8 @@ export type Step =
   | { hang: true }
   | { fail: string }
   | { crash: true }
-  | { tool: string; args?: Record<string, unknown>; result?: string; isError?: boolean; details?: unknown; sleep?: number };
+  | { goalComplete: true }
+  | { tool: string; args?: Record<string, unknown>; result?: string; isError?: boolean; details?: unknown; sleep?: number; asyncMs?: number };
 export type Turn = { when?: string; steps: Step[] };
 
 async function freePort(): Promise<number> {
@@ -44,7 +45,7 @@ async function waitFor(what: string, probe: () => Promise<boolean>, timeoutMs = 
 
 export type Stack = Awaited<ReturnType<typeof startStack>>;
 
-export async function startStack(options: { env?: Record<string, string> } = {}) {
+export async function startStack(options: { env?: Record<string, string>; binary?: string } = {}) {
   // Outside the repo: OpenChamber lists the git worktrees of any checkout it finds above a project.
   const root = mkdtempSync(join(tmpdir(), "omp-e2e-"));
   const home = join(root, "home");
@@ -98,7 +99,7 @@ export async function startStack(options: { env?: Record<string, string> } = {})
 
   let sidecar = startSidecar();
   function startSidecar() {
-    return spawn("sidecar", ["bun", "src/main.ts", "--binary", STUB, "--port", String(sidecarPort)], {
+    return spawn("sidecar", ["bun", "src/main.ts", "--binary", options.binary ?? STUB, "--port", String(sidecarPort)], {
       ...baseEnv,
       OC_SIDECAR_PORT: String(sidecarPort),
       OC_SIDECAR_HOST: "127.0.0.1",

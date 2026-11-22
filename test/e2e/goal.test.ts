@@ -95,4 +95,48 @@ describe("omp's own goal mode", () => {
     for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(100);
     expect(await status(id)).toBe("idle");
   });
+
+  test("goal with background work: the parent is idle while the job runs, the goal resumes after the wake", async () => {
+    stack.script([
+      { when: "(#2)", steps: [{ text: "goal reached" }, { goalComplete: true }] },
+      { when: "(#1)", steps: [{ text: "starting the job" }, { tool: "bash", args: { command: "sleep 2", async: true }, result: "job output", asyncMs: 2_500 }, { text: "job started" }] },
+      { when: "Background job", steps: [{ tool: "bash", args: { command: "cat out" }, result: "used the result" }, { text: "digested the result" }] },
+    ]);
+    await newSession(page);
+    await send(page, "kickoff");
+    await page.getByText("Echo: kickoff").waitFor();
+    const id = await sessionId();
+    const now = Date.now();
+    const goal = { id: "goal3", objective: "run the job", objectiveFile: false, status: "active", tokenBudget: null, tokensUsed: 0, turnsUsed: 0, blockedStreak: 0, note: "", statusReason: "", lastAccountedMessageID: "", createdAt: now, updatedAt: now };
+    await fetch(`${stack.ui}/api/session/${id}?directory=${dir()}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ metadata: { openchamber: { goal } } }),
+    });
+    const record = async () => (await stack.http(`/session/${id}?directory=${dir()}`)).body?.data?.metadata?.openchamber?.goal;
+
+    // The job is running in the background: the parent run is over, so the parent is idle and the goal still active.
+    await page.getByText("job started").first().waitFor({ timeout: 30_000 });
+    for (let i = 0; i < 40 && (await status(id)) !== "idle"; i++) await sleep(50);
+    const gap: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      gap.push(await status(id));
+      await sleep(100);
+    }
+    expect(gap).toEqual(Array(8).fill("idle"));
+    expect((await record())?.status).toBe("active");
+    expect(await page.getByText("digested the result").first().isVisible()).toBe(false);
+
+    // The job's result wakes the parent; it made progress, so omp continues the goal and the agent completes it.
+    await page.getByText("goal reached").first().waitFor({ timeout: 30_000 });
+    let settled: any;
+    for (let i = 0; i < 40 && settled?.status !== "complete"; i++) {
+      settled = await record();
+      await sleep(250);
+    }
+    expect(settled?.status).toBe("complete");
+    expect(settled?.statusReason).toBe("reported by agent");
+    expect(await page.getByText("digested the result").first().isVisible()).toBe(true);
+    expect(stack.frames().filter((f) => f.type === "prompt").map((f) => f.message).at(-1)).toBe("kickoff");
+  });
 });

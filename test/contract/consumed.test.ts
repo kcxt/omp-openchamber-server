@@ -1,7 +1,7 @@
 // R7: stub fidelity. Every frame field the sidecar reads must be present, with the right type, in the stub
 // and in the real omp. The manifest below is the sidecar's actual consumption, read from
 //   src/providers/omp/events.ts (handleFrame), src/providers/omp/backend.ts, src/providers/omp/rpc.ts,
-//   src/adapters/openchamber/prompt.ts, follow.ts, src/omp/utility.ts
+//   src/adapters/openchamber/prompt.ts, follow.ts, src/omp/cli.ts
 // (see docs/research/R7.md for the per-field citations). A field added to the sidecar belongs here too.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { join } from "node:path";

@@ -14,8 +14,7 @@
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Utility } from "../omp/utility";
-import { normalizeModelsResponse } from "../providers/omp/rpc";
+import { OmpCli } from "../omp/cli";
 import { listOmpConfig, listOmpSetKeys, resetOmpConfigKey, setOmpConfigValue } from "../vendor/kabmo/config-cli";
 import { loadSettingsSchema, refreshSettingsSchema, runningOmpVersion, schemaRefreshStatus } from "./omp-settings-schema";
 
@@ -54,22 +53,16 @@ function listCustomThemes(): string[] {
   }
 }
 
-const MODELS_TTL_MS = 5 * 60_000;
-let modelsCache: { at: number; models: Array<{ selector: string; name: string }> } | undefined;
-
 /** `provider/id` selectors omp can resolve, for the model pickers. Empty when omp cannot be asked. */
 async function listModelSelectors(): Promise<Array<{ selector: string; name: string }>> {
-  if (modelsCache && Date.now() - modelsCache.at < MODELS_TTL_MS) return modelsCache.models;
   try {
-    const raw = await Utility.for(process.cwd()).availableModels();
-    const models = normalizeModelsResponse(raw)
-      .filter((model) => typeof model.provider === "string" && typeof model.id === "string")
-      .map((model) => ({ selector: `${model.provider}/${model.id}`, name: typeof model.name === "string" ? model.name : model.id }))
+    const { models } = await OmpCli.models();
+    return models
+      .filter((model) => typeof model.selector === "string" && model.selector.length > 0)
+      .map((model) => ({ selector: model.selector, name: typeof model.name === "string" ? model.name : model.id }))
       .sort((a, b) => a.selector.localeCompare(b.selector));
-    modelsCache = { at: Date.now(), models };
-    return models;
   } catch {
-    return modelsCache?.models ?? [];
+    return [];
   }
 }
 

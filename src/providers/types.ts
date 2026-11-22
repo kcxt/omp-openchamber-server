@@ -281,7 +281,6 @@ export interface BackendCapabilities {
   approvals: boolean;
   subagents: boolean;
   todo: boolean;
-  titleGeneration: boolean;
   skills: boolean;
   compact: boolean;
   shell: boolean;
@@ -300,11 +299,9 @@ export interface BackendGoalSnapshot {
 export type BackendGoalOp = "create" | "resume" | "pause" | "drop";
 
 export interface SessionUpdateInput {
-  title?: string;
   metadata?: Record<string, unknown>;
-  agent?: string;
-  model?: ModelRef;
-  revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
+  /** Staged revert, with the leaf redo returns to (§3.9). */
+  revert?: { messageID: string; redoLeafId?: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
   time?: { created?: number; updated?: number; archived?: number | null; viewed?: number };
 }
 
@@ -312,7 +309,7 @@ export interface SessionUpdateInput {
 export interface SessionStore {
   create(
     directory: string | null | undefined,
-    init?: { id?: string; title?: string; parentID?: string; agent?: string; model?: ModelRef; metadata?: Record<string, unknown> },
+    init?: { id?: string; title?: string; parentID?: string; model?: ModelRef; metadata?: Record<string, unknown> },
   ): Promise<OpenCodeSession>;
   get(openCodeId: string, directory?: string | null): Promise<OpenCodeSession | null>;
   list(
@@ -325,18 +322,8 @@ export interface SessionStore {
     updates: SessionUpdateInput,
     directory?: string | null,
   ): Promise<OpenCodeSession | null>;
-  /** Commit a staged revert by removing the boundary message and its tail. */
-  commitRevert(openCodeId: string, messageID: string, directory?: string | null): Promise<boolean>;
-  /** The backend moved this session to another transcript file: keep answering to the same id from there. */
-  adoptTranscript?(openCodeId: string, transcriptPath: string, cwd: string): Promise<void>;
-  /** Create a session forked from `openCodeId`, optionally excluding the transcript from `before` onward. */
-  fork(openCodeId: string, directory: string, before?: string): Promise<OpenCodeSession | null>;
-  move(openCodeId: string, directory: string, sourceDirectory?: string | null): Promise<OpenCodeSession | null>;
-  setTitle(openCodeId: string, title: string, source: "auto" | "user", cwd: string): Promise<void>;
   children(parentOpenCodeId: string, directory?: string | null): Promise<OpenCodeSession[]>;
   transcript(openCodeId: string, cwd: string): Promise<OpenCodeMessageRecord[] | null>;
-  /** Records the visible prompt parts a client message id was sent with (the transcript holds the full prompt). */
-  recordUserMessage?(openCodeId: string, text: string, messageId?: string, parts?: OpenCodePromptTextPart[]): void;
   getTodos?(openCodeId: string, cwd: string): Promise<OpenCodeTodo[] | undefined>;
 }
 
@@ -349,10 +336,5 @@ export interface AgentBackend {
   defaultModel: ModelRef;
   listModels(cwd: string, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse>;
   store: SessionStore;
-  /**
-   * True when another live process (a terminal omp) owns the session's transcript.
-   * `undefined` when ownership could not be determined (probe failed or omp reported the id unknown).
-   */
-  sessionOwnedElsewhere?(cwd: string, transcriptPath: string): Promise<boolean | undefined>;
   shutdownAll(): void;
 }

@@ -55,8 +55,8 @@ export interface TranslatorHost {
   respond?(frame: Record<string, unknown>): void;
   /** omp's todo list, for a todo tool that ended without details. */
   readTodos?(): Promise<OpenCodeTodo[] | undefined>;
-  /** Keeps a command notice so the reply survives a transcript refetch. */
-  persistNotice?(text: string, level: string, timestamp: number): void;
+  /** Journals a command notice in the transcript (P2 `oc-notice`) so the reply survives a refetch. */
+  journalNotice?(text: string, level: string): void;
   /** omp journaled a user message carrying this host message id. */
   delivered?(hostMessageId: string): void;
 }
@@ -376,7 +376,7 @@ export class TurnTranslator {
     const now = Date.now();
     this.#emitPart(id, partId(this.sessionId, id, "text", this.#ordinals.text++), "text", level === "info" ? text : `⚠️ ${text}`, now, now);
     this.#partCount++;
-    this.#host.persistNotice?.(text, level, now);
+    this.#host.journalNotice?.(text, level);
   }
 
   #emitTool(callID: string, tool: string | undefined, state: ToolPartState): void {

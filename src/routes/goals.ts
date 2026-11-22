@@ -1,11 +1,19 @@
 /** Goal objective files and todo lists. */
-import { mkdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { goalObjectivePath } from "../adapters/openchamber/goal";
 import { readSessionTodos } from "../providers/omp/todo";
 import { nextSessionTodosRevision } from "../shared/sse";
 import type { RouteContext } from "../http/router";
 import { readJson } from "../http/response";
 import { resolveSessionRoute } from "../services/session-route";
+
+// OpenChamber's own objective-file semantics (server/lib/session-goal/objectives.js):
+// one `<session id>.md` under its data dir, trimmed and clamped, invalid ids rejected.
+const OBJECTIVE_CHAR_LIMIT = 5_000;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{4,128}$/;
+
+const clamp = (content: unknown): string => String(content ?? "").trim().slice(0, OBJECTIVE_CHAR_LIMIT);
 
 export async function handleGoals(ctx: RouteContext): Promise<Response | undefined> {
   const { req, p, dir, json, jsonError } = ctx;
@@ -33,23 +41,18 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
   // Goal objective endpoints
   const goalObjMatch = p.match(/^\/(?:api\/)?goals\/objective\/([^/]+)$/);
   if (goalObjMatch) {
-    const sessionId = decodeURIComponent(goalObjMatch[1]);
-    const home = Bun.env.HOME || process.env.HOME || "/tmp";
-    const ocDataDir = Bun.env.OPENCHAMBER_DATA_DIR || process.env.OPENCHAMBER_DATA_DIR;
-    const ocGoalsDir = ocDataDir ? join(ocDataDir, "goals") : join(home, ".config", "openchamber", "goals");
-    const ompGoalsDir = join(home, ".omp", "goals");
-
-    const ocGoalPath = join(ocGoalsDir, `${sessionId}.md`);
-    const ompGoalPath = join(ompGoalsDir, `${sessionId}.txt`);
+    const sessionId = decodeURIComponent(goalObjMatch[1]!);
+    const valid = SESSION_ID_PATTERN.test(sessionId);
+    const file = valid ? goalObjectivePath(sessionId) : "";
 
     if (req.method === "PUT") {
+      if (!valid) return jsonError("invalid session id", 400);
+      const body = (await readJson(req).catch(() => undefined)) as { content?: unknown } | undefined;
+      const text = clamp(body?.content);
+      if (!text) return jsonError("objective content is required", 400);
       try {
-        await mkdir(ocGoalsDir, { recursive: true });
-        await mkdir(ompGoalsDir, { recursive: true });
-        const body = (await readJson(req)) as { content?: string } | undefined;
-        const text = body?.content ?? "";
-        await Bun.write(ocGoalPath, text);
-        await Bun.write(ompGoalPath, text);
+        await mkdir(dirname(file), { recursive: true });
+        await writeFile(file, text, "utf8");
         return json({ ok: true });
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "failed to write objective", 500);
@@ -57,30 +60,16 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
     }
 
     if (req.method === "GET") {
+      if (!valid) return jsonError("objective not found", 404);
       try {
-        const ocFile = Bun.file(ocGoalPath);
-        if (await ocFile.exists()) {
-          const content = await ocFile.text();
-          return json({ content });
-        }
-        const ompFile = Bun.file(ompGoalPath);
-        if (await ompFile.exists()) {
-          const content = await ompFile.text();
-          return json({ content });
-        }
-        return jsonError("objective not found", 404);
+        return json({ content: clamp(await readFile(file, "utf8")) });
       } catch {
         return jsonError("objective not found", 404);
       }
     }
 
     if (req.method === "DELETE") {
-      try {
-        await unlink(ocGoalPath).catch(() => {});
-        await unlink(ompGoalPath).catch(() => {});
-      } catch {
-        // ignore
-      }
+      if (valid) await unlink(file).catch(() => undefined);
       return json({ ok: true });
     }
   }
@@ -89,7 +78,7 @@ export async function handleGoals(ctx: RouteContext): Promise<Response | undefin
   const todoMatch = p.match(/^\/session\/([^/]+)\/todo$/);
   if (todoMatch && req.method === "GET") {
     try {
-      const { backend, session } = await resolveSessionRoute(todoMatch[1], dir);
+      const { backend, session } = await resolveSessionRoute(todoMatch[1]!, dir);
       if (!session) return jsonError("session not found", 404);
       if (!backend.capabilities.todo) return json([]);
       const todos = await readSessionTodos(session.path);

@@ -104,7 +104,7 @@ export class RpcChild implements OmpRpcTransport {
         // detached: the child leads its own process group so kill() can take
         // down MCP/LSP grandchildren instead of orphaning them.
         const proc = Bun.spawn(
-          [omp, "--mode", "rpc", "--cwd", cwd, "--no-title", "--no-pty", "--config", embeddedOmpConfigOverlay(), ...toolArgs, ...extArgs],
+          [omp, "--mode", "rpc", "--cwd", cwd, "--no-pty", "--config", embeddedOmpConfigOverlay(), ...toolArgs, ...extArgs],
           {
             stdin: "pipe",
             stdout: "pipe",
@@ -113,7 +113,6 @@ export class RpcChild implements OmpRpcTransport {
             env: {
               ...Bun.env,
               ...(credentialRuntime?.env ?? {}),
-              PI_NO_TITLE: "1",
               PI_SKIP_VERSION_CHECK: "1",
             },
           },

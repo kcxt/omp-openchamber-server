@@ -61,7 +61,7 @@ async function publishRecap(runtime: SessionRuntime, recap: string, createdAt: n
   try {
     const store = backendForSession(runtime.sessionId).store;
     const session = await store.get(runtime.sessionId, runtime.cwd);
-    const metadata = session ? withOmpRecapAssist(session, recap, createdAt, forMessageID) : null;
+    const metadata = session ? await withOmpRecapAssist(session, recap, createdAt, forMessageID) : null;
     if (metadata) await store.update(runtime.sessionId, { metadata }, runtime.cwd);
   } catch (err) {
     promptLogger.warn({ err, sessionID: runtime.sessionId }, "[recap] could not publish omp's recap");

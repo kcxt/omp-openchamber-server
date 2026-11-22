@@ -197,11 +197,11 @@ export async function handleTurns(ctx: RouteContext): Promise<Response | undefin
       const sessionID = decodeURIComponent(promptMatch[1]!);
       const body = await readJson(req);
       const input = asRecord(body);
-      const { backend, session } = await resolveSessionRoute(sessionID, dir);
+      const { session } = await resolveSessionRoute(sessionID, dir);
       if (!session) return jsonError("session not found", 404);
       const held = await refuseIfOpenElsewhere(sessionID, session);
       if (held) return json({ _tag: "InvalidRequestError", message: held, error: held }, { status: 400 });
-      await commitStagedRevert(sessionID, backend, session);
+      await commitStagedRevert(sessionID, session);
       const result = await promptSession(session, body);
       if (!result.queued) return jsonError(result.error ?? "prompt failed", result.status ?? 400);
       if (promptMatch[2] !== "prompt") return json({ queued: true });

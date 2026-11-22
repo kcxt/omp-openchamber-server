@@ -10,7 +10,8 @@ const createSession = async (): Promise<string> =>
   (await stack.http(`/session?${dir()}`, { json: {} })).body.data.id;
 
 describe("slash commands", () => {
-  test("omp's plugin commands are listed", async () => {
+  test("omp's plugin commands are listed (read from omp's inspection of a session in the directory)", async () => {
+    await createSession();
     const { body } = await stack.http(`/command?${dir()}`);
     expect(body.data.map((c: any) => c.name)).toContain("pi-vcc");
   });

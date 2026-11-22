@@ -29,9 +29,9 @@ function collect() {
   return { events, stop: async () => { ctl.abort(); await done; } };
 }
 
-const until = async (what: string, probe: () => boolean, ms = 15_000) => {
+const until = async (what: string, probe: () => boolean | Promise<boolean>, ms = 15_000) => {
   const start = Date.now();
-  while (!probe()) {
+  while (!(await probe())) {
     if (Date.now() - start > ms) throw new Error(`timed out waiting for ${what}`);
     await Bun.sleep(50);
   }
@@ -49,10 +49,15 @@ describe("a session a terminal omp owns is followed live", () => {
     const stream = collect();
     await Bun.sleep(300);
 
-    await terminal.prompt("slow please");
+    const turn = terminal.prompt("slow please");
+    // A held lease with a tail mid-turn is busy for as long as the terminal works.
+    await until("busy", async () => (await stack.http(`/session/status?directory=${dir()}`)).body?.[id]?.type === "busy");
+    await turn;
     await until("followed text", () => stream.events.some((e) => e.type === "session.text.ended" && String(e.data?.text).includes("Slow answer.")));
     await until("idle", () => stream.events.some((e) => e.type === "session.execution.succeeded" && e.data?.sessionID === id));
     await stream.stop();
+    // The terminal still holds the lease, but its tail is settled: idle.
+    expect((await stack.http(`/session/status?directory=${dir()}`)).body?.[id]).toBeUndefined();
 
     const types = stream.events.map((e) => e.type);
     expect(stream.events.some((e) => e.type === "session.inbox.enqueued" && e.data?.item?.payload?.text === "slow please")).toBe(true);
@@ -67,8 +72,7 @@ describe("a session a terminal omp owns is followed live", () => {
 
 describe("a dead turn left in a transcript stays idle", () => {
   let dead: Stack;
-  // The slow boot makes the ownership probe take as long as a real omp's does: that window is the flap.
-  beforeAll(async () => { dead = await startStack({ env: { OC_FOLLOW_POLL_MS: "100", OC_FOLLOW_OWNER_CHECK_MS: "300", OMP_STUB_START_DELAY_MS: "700" } }); });
+  beforeAll(async () => { dead = await startStack({ env: { OC_FOLLOW_POLL_MS: "100" } }); });
   afterAll(() => dead.stop());
 
   test("a mid-turn tail with no live owner is never reported busy", async () => {

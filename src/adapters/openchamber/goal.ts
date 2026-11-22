@@ -11,7 +11,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { BackendGoalSnapshot } from "../../providers/types";
 
 export interface OcGoal {
@@ -52,15 +52,16 @@ export function goalTransition(prev: OcGoal | undefined, next: OcGoal | undefine
   return undefined;
 }
 
-function goalsDir(): string {
+/** OpenChamber's objective file for a session: `<data dir>/goals/<session id>.md` (server/lib/session-goal/objectives.js). */
+export function goalObjectivePath(sessionID: string): string {
   const dataDir = process.env.OPENCHAMBER_DATA_DIR;
-  return join(dataDir ? dataDir : join(process.env.HOME || homedir(), ".config", "openchamber"), "goals");
+  return join(dataDir ? resolve(dataDir) : join(process.env.HOME || homedir(), ".config", "openchamber"), "goals", `${sessionID}.md`);
 }
 
 /** The objective text: the file OpenChamber wrote for the session, else the inline copy. */
 export async function readGoalObjective(sessionID: string, goal: OcGoal): Promise<string> {
   if (goal.objectiveFile) {
-    const text = await readFile(join(goalsDir(), `${sessionID}.md`), "utf8").catch(() => "");
+    const text = await readFile(goalObjectivePath(sessionID), "utf8").catch(() => "");
     if (text.trim()) return text.trim();
   }
   return (goal.objective ?? "").trim();

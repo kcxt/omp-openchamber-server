@@ -9,8 +9,11 @@
  *   2. moves those lines out of the transcript by atomic rewrite (an id-less line
  *      leaves omp's leaf undefined, so the next load would see an empty branch);
  *   3. copies the title DB's client message ids for the session into
- *      `legacyMessageIds` (omp entry id → client id), so revert-to on messages
- *      from before the migration keeps working;
+ *      `legacyMessageIds` (omp entry id → client id) and the typed text of
+ *      prompts sent with extra context into `visibleParts`, so revert-to and
+ *      the visible bubble on messages from before the migration keep working;
+ *      `oc_notice` records become the read-only `legacyNotices`; `agent_change`
+ *      and `oc_alias` records are consumed and dropped (one agent; P3);
  *   4. renames `.jsonl.oc` to `.jsonl.oc.migrated`.
  * `model_change` records are dropped: the model comes from omp's own entries.
  *
@@ -25,8 +28,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { ompSessionsRoot } from "../providers/omp/paths";
-import { getDefaultHistoryDbPath, listPersistedMessageIds, type PersistedMessageMapping } from "../providers/omp/title-db";
+import { Database } from "bun:sqlite";
+import { ompAgentDir, ompSessionsRoot } from "../providers/omp/paths";
 import { isSidecarRecord, parseTranscript, SIDECAR_RECORD_TYPES, type TranscriptEntry } from "../omp/transcript-reader";
 import { openChamberDataDir, SessionDocs, type SessionDoc } from "./session-docs";
 
@@ -129,15 +132,10 @@ function applyRecords(doc: SessionDoc, records: TranscriptEntry[]): void {
         }
         break;
       }
-      case "agent_change":
-        if (typeof record.agent === "string") doc.agent = record.agent;
-        break;
-      case "oc_alias":
-        if (typeof record.openCodeId === "string") doc.alias = record.openCodeId;
-        break;
+      // agent_change, oc_alias: omp has one agent and, with P3, never moves a session; dropped.
       case "oc_notice": {
         if (typeof record.text !== "string" || typeof record.timestamp !== "number") break;
-        const notices = doc.notices ?? [];
+        const notices = doc.legacyNotices ?? [];
         // A crash between the two writes of an older quarantine could duplicate a record.
         if (!notices.some((n) => n.timestamp === record.timestamp && n.text === record.text)) {
           notices.push({
@@ -146,7 +144,7 @@ function applyRecords(doc: SessionDoc, records: TranscriptEntry[]): void {
             timestamp: record.timestamp,
           });
         }
-        doc.notices = notices;
+        doc.legacyNotices = notices;
         break;
       }
       // model_change: the model is read from omp's own entries.
@@ -165,6 +163,52 @@ function firstText(message: Record<string, unknown>): string {
     }
   }
   return "";
+}
+
+/** One row of the old title DB's `session_message_ids` table. */
+interface PersistedMessageMapping {
+  clientMessageId: string;
+  promptText: string;
+  promptParts?: Array<{ text: string; synthetic?: boolean }>;
+  ompMessageId?: string;
+}
+
+/** Read-only handle on the old message-id table in omp's `history.db`; undefined when there is none. */
+function openLegacyMessageIds(): { list: (sessionId: string) => PersistedMessageMapping[]; close: () => void } | undefined {
+  const path = join(ompAgentDir(), "history.db");
+  // Opening a missing database would create it: only read one that exists.
+  if (!existsSync(path)) return undefined;
+  let db: Database;
+  try {
+    db = new Database(path, { readonly: true });
+  } catch {
+    return undefined;
+  }
+  const list = (sessionId: string): PersistedMessageMapping[] => {
+    try {
+      const rows = db.query(
+        "SELECT client_message_id, prompt_text, prompt_parts_json, omp_message_id FROM session_message_ids WHERE session_id = ? ORDER BY created_at",
+      ).all(sessionId) as Array<{ client_message_id: string; prompt_text: string; prompt_parts_json?: string | null; omp_message_id?: string | null }>;
+      return rows.map((row) => {
+        let promptParts: PersistedMessageMapping["promptParts"];
+        try {
+          const parsed = row.prompt_parts_json ? JSON.parse(row.prompt_parts_json) as unknown : undefined;
+          if (Array.isArray(parsed)) {
+            promptParts = parsed.flatMap((part) => part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+              ? [{ text: (part as { text: string }).text, ...((part as { synthetic?: unknown }).synthetic === true ? { synthetic: true } : {}) }]
+              : []);
+          }
+        } catch {
+          promptParts = undefined;
+        }
+        return { clientMessageId: row.client_message_id, promptText: row.prompt_text, promptParts, ompMessageId: row.omp_message_id || undefined };
+      });
+    } catch {
+      // No such table: nothing was ever recorded.
+      return [];
+    }
+  };
+  return { list, close: () => db.close() };
 }
 
 /**
@@ -193,7 +237,12 @@ function legacyIdsFor(rows: PersistedMessageMapping[], userMessages: Array<{ id:
   return map;
 }
 
-async function importSession(transcript: string, report: ImporterReport, dryRun: boolean, historyDb: boolean): Promise<void> {
+async function importSession(
+  transcript: string,
+  report: ImporterReport,
+  dryRun: boolean,
+  listLegacyIds: ((sessionId: string) => PersistedMessageMapping[]) | undefined,
+): Promise<void> {
   const ocPath = `${transcript}.oc`;
   const before = await stat(transcript);
   const text = await readFile(transcript, "utf8");
@@ -225,13 +274,14 @@ async function importSession(transcript: string, report: ImporterReport, dryRun:
   const ocRecords = parseLines(ocText.split("\n"));
 
   let legacy: Record<string, string> = {};
-  if (historyDb) {
+  const parts: Record<string, Array<{ text: string; synthetic?: boolean }>> = {};
+  if (listLegacyIds) {
     // The title DB keyed messages by OpenCode id: `ses_` + the uuid without dashes (store.ts#toOpenCodeSessionId,
     // not imported here so the importer stays independent of the server module graph), or a client-minted id.
     const keys = new Set<string>([`ses_${uuid.replace(/-/g, "").toLowerCase()}`, uuid]);
     if (parsed.header?.openCodeId) keys.add(parsed.header.openCodeId);
     for (const record of ocRecords) if (record.type === "oc_alias" && typeof record.openCodeId === "string") keys.add(record.openCodeId);
-    const rows = [...keys].flatMap((key) => listPersistedMessageIds(key));
+    const rows = [...keys].flatMap((key) => listLegacyIds(key));
     if (rows.length > 0) {
       const userMessages: Array<{ id: string; text: string }> = [];
       for (const entry of parsed.activeBranch) {
@@ -239,6 +289,8 @@ async function importSession(transcript: string, report: ImporterReport, dryRun:
         if (message?.role === "user" && typeof entry.id === "string") userMessages.push({ id: entry.id, text: firstText(message) });
       }
       legacy = legacyIdsFor(rows, userMessages);
+      // The typed text a prompt was sent with, where the model's message held more (synthetic context).
+      for (const row of rows) if (row.promptParts && row.promptParts.length > 0) parts[row.clientMessageId] = row.promptParts;
     }
   }
 
@@ -249,6 +301,7 @@ async function importSession(transcript: string, report: ImporterReport, dryRun:
   const fold = (doc: SessionDoc): void => {
     applyRecords(doc, records);
     if (Object.keys(legacy).length > 0) doc.legacyMessageIds = { ...legacy, ...doc.legacyMessageIds };
+    if (Object.keys(parts).length > 0) doc.visibleParts = { ...parts, ...doc.visibleParts };
   };
   let doc: SessionDoc;
   if (dryRun) {
@@ -302,18 +355,19 @@ export async function runImporter(options: { dryRun?: boolean } = {}): Promise<I
   for (const file of files) {
     if (file.endsWith(".jsonl.oc") && !transcripts.has(file.slice(0, -3))) report.orphanOcFiles.push(file);
   }
-  // Opening the title DB creates it when absent: only read one that exists.
-  const historyDb = existsSync(getDefaultHistoryDbPath());
+  // Only read a history.db that exists: opening one would create it.
+  const legacyIds = openLegacyMessageIds();
 
   const work = done ? [...transcripts].filter((file) => existsSync(`${file}.oc`)) : [...transcripts];
   report.transcripts = work.length;
   for (const transcript of work) {
     try {
-      await importSession(transcript, report, dryRun, historyDb);
+      await importSession(transcript, report, dryRun, legacyIds?.list);
     } catch (error) {
       report.errors.push({ transcript, error: error instanceof Error ? error.message : String(error) });
     }
   }
+  legacyIds?.close();
 
   if (!dryRun && !done && report.errors.length === 0) {
     await mkdir(dirname(doneMarkerPath()), { recursive: true });

@@ -50,7 +50,7 @@ describe("omp's context map", () => {
     const id = await createSession();
     await prompt(id, "hello");
     const { body } = await stack.http(`/api/omp/context/${id}?${dir()}&breakdown=1`);
-    expect(body.breakdown?.categories?.map((c: any) => c.id)).toEqual(["systemPrompt", "messages"]);
+    expect(body.breakdown?.categories?.map((c: any) => c.id)).toEqual(["systemPrompt", "systemTools", "systemContext", "instructionFiles", "skills", "messages"]);
   });
 
   test("the session record and its messages publish what the extension panel reads", async () => {

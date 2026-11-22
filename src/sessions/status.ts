@@ -6,10 +6,13 @@
  *    busy iff the transcript tail is mid-turn; a failed probe → unknown.
  * A parent's status never includes its children's.
  */
-import { followedStatuses } from "../adapters/openchamber/follow";
+import { basename, dirname } from "node:path";
+import { followedStatuses, unknownFollowed } from "../adapters/openchamber/follow";
+import { OmpCli } from "../omp/cli";
+import { readSessionIdSync } from "../providers/omp/store";
 import { backendForSession } from "../providers/registry";
 import type { OpenCodeMessageRecord } from "../providers/types";
-import { Registry } from "./registry";
+import { isSubagentTranscript, Registry } from "./registry";
 import type { BackgroundJob, RuntimeState } from "./runtime";
 
 export type SessionStatus = "busy" | "idle" | "unknown";
@@ -26,9 +29,34 @@ export function isMidTurn(records: OpenCodeMessageRecord[]): boolean {
   return last.info.finish === "toolUse" || last.info.finish === "tool-calls" || last.info.finish === "tool_calls";
 }
 
-/** Whether this sidecar holds a live omp child for the session (it, not a transcript tail, emits its events). */
+/** Whether this sidecar's runtime emits the session's events: its own child, or a parent child running it as a subagent. */
 export function isSessionDriven(sessionId: string, cwd: string): boolean {
-  return Registry.get(sessionId, cwd) !== undefined || Registry.isStarting(sessionId, cwd);
+  return Registry.get(sessionId, cwd) !== undefined || Registry.isStarting(sessionId, cwd) || Registry.findSubagent(sessionId) !== undefined;
+}
+
+const UUID_IN_FILE_NAME = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/;
+
+/** The session whose lease governs a transcript: its own, or for a subagent artifact the root parent's (the child runs inside the parent's omp). */
+function leaseIdOf(transcriptPath: string): string | undefined {
+  let root = transcriptPath;
+  while (isSubagentTranscript(root)) root = `${dirname(root)}.jsonl`;
+  return basename(root).match(UUID_IN_FILE_NAME)?.[1] ?? readSessionIdSync(root);
+}
+
+/**
+ * Whether a process other than this sidecar's runtime holds the transcript's
+ * lease (`omp session lease`: the prober never owns one). `undefined` when omp
+ * could not be asked; callers must not read it as free.
+ */
+async function leaseHeld(transcriptPath: string): Promise<boolean | undefined> {
+  const id = leaseIdOf(transcriptPath);
+  if (!id) return false;
+  try {
+    const report = await OmpCli.leaseHeld([id]);
+    return report.held.includes(id) ? true : report.unknown.includes(id) ? undefined : false;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -39,19 +67,19 @@ export function isSessionDriven(sessionId: string, cwd: string): boolean {
  */
 export async function sessionOwnedElsewhere(sessionId: string, cwd: string, transcriptPath: string): Promise<boolean | undefined> {
   if (isSessionDriven(sessionId, cwd)) return false;
-  const backend = backendForSession(sessionId);
-  return backend.sessionOwnedElsewhere ? backend.sessionOwnedElsewhere(cwd, transcriptPath) : false;
+  return leaseHeld(transcriptPath);
 }
 
+/** Lease first, tail second (PLAN §3.5): a session no process holds is idle whatever its tail says. */
 export async function statusOf(sessionId: string, cwd: string, transcriptPath: string): Promise<SessionStatus> {
   const runtime = Registry.get(sessionId, cwd);
   if (runtime) return statusOfState(runtime.state);
   if (Registry.isStarting(sessionId, cwd)) return "busy";
   const child = Registry.findSubagent(sessionId);
   if (child) return child.subagent.status === "running" ? "busy" : "idle";
-  const lease = await sessionOwnedElsewhere(sessionId, cwd, transcriptPath);
-  if (lease === undefined) return "unknown";
-  if (!lease) return "idle";
+  const held = await leaseHeld(transcriptPath);
+  if (held === undefined) return "unknown";
+  if (!held) return "idle";
   const records = await backendForSession(sessionId).store.transcript(sessionId, cwd).catch(() => null);
   return records ? (isMidTurn(records) ? "busy" : "idle") : "unknown";
 }
@@ -72,6 +100,23 @@ export function drivenStatuses(directory?: string): Record<string, { type: "busy
 /** `/session/status`: driven sessions, their children, and sessions followed in another omp. Idle sessions are absent. */
 export function sessionStatusMap(directory?: string): Record<string, { type: string }> {
   return { ...followedStatuses(directory), ...drivenStatuses(directory) };
+}
+
+/** A followed session whose lease probe failed: neither idle nor busy is a safe answer for it. */
+export class SessionStatusUnknownError extends Error {
+  readonly sessionIds: string[];
+
+  constructor(sessionIds: string[]) {
+    super(`The status of ${sessionIds.length === 1 ? "a session" : `${sessionIds.length} sessions`} could not be determined (omp could not be asked who owns them)`);
+    this.name = "SessionStatusUnknownError";
+    this.sessionIds = sessionIds;
+  }
+}
+
+/** Throws when any followed session's status is unknown: OpenChamber reads an empty `/session/active` as "all idle". */
+export function assertStatusesKnown(directory?: string): void {
+  const unknown = unknownFollowed(directory);
+  if (unknown.length > 0) throw new SessionStatusUnknownError(unknown);
 }
 
 export interface JobFilter {

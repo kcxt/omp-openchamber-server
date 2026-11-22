@@ -5,12 +5,13 @@
  */
 import { goalChangeFor, ocGoalOf, type GoalChange } from "../adapters/openchamber/goal";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
-import { Utility } from "../omp/utility";
+import { SessionDocs } from "../store/session-docs";
 import { CredentialInputError } from "../providers/omp/credentials";
-import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../providers/omp/title";
+import { locateMessage } from "../providers/omp/messages";
+import { readSessionIdSync, toOpenCodeSessionId } from "../providers/omp/store";
 import { allBackends, backendById, backendForSession, nativeProviderID, splitProviderPrefix } from "../providers/registry";
 import type { BackendCredentialInput, ModelRef, OpenCodeSession } from "../providers/types";
-import { emitOpenCodeV2Event, emitSessionError } from "../shared/sse";
+import { emitOpenCodeV2Event, emitSessionError, emitSessionUpdated } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import {
   clearSessionSyntheticContext,
@@ -37,15 +38,6 @@ function failure(err: unknown): PromptOutcome {
   if (err instanceof CredentialInputError) return { queued: false, error: err.message, status: err.statusCode };
   if (err instanceof OwnedElsewhereError) return { queued: false, error: err.message, status: 400 };
   return { queued: false, error: err instanceof Error ? err.message : String(err), status: 500 };
-}
-
-async function generateTitle(session: OpenCodeSession, text: string): Promise<void> {
-  if (!text || isLowSignalTitleInput(text)) return;
-  const backend = backendForSession(session.id);
-  const current = await backend.store.get(session.id, session.directory);
-  if (!current || (current.title && !current.title.startsWith("Session ")) || !backend.capabilities.titleGeneration) return;
-  const title = normalizeGeneratedTitle(text, text);
-  if (title) await backend.store.setTitle(session.id, title, "auto", session.directory);
 }
 
 /** A prompt to a subagent's session goes to its parent's runtime: steer while it runs, `.` resumes it. */
@@ -114,7 +106,15 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
   }
 
   emitUserPrompt(session.id, session.directory, prepared, body, runtime.model);
-  backendForSession(session.id).store.recordUserMessage?.(session.id, prepared.visibleText, prepared.messageID, prepared.visibleParts);
+  if (prepared.message !== prepared.visibleText || prepared.visibleParts.length > 1) {
+    // The transcript holds the whole message; what the user typed is the sidecar's to remember.
+    const uuid = readSessionIdSync(session.path);
+    if (uuid) {
+      await SessionDocs.update(uuid, (draft) => {
+        draft.visibleParts = { ...draft.visibleParts, [prepared.messageID]: prepared.visibleParts };
+      }).catch((err) => promptLogger.warn({ err, sessionID: session.id }, "[prompt] could not record the visible prompt parts"));
+    }
+  }
 
   try {
     // `.` alone is omp's continue (P5): no message reaches the model.
@@ -133,16 +133,6 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
     emitSessionError(session.id, err, session.directory);
     promptLogger.error({ err, sessionID: session.id }, "[prompt] omp refused the prompt");
     return failure(err);
-  }
-  // The title slot lives in omp's transcript: write it only once the run is over, never while omp appends.
-  const title = () => void generateTitle(session, prepared.visibleText).catch(() => {});
-  if (runtime.state === "idle") title();
-  else {
-    const unsubscribe = runtime.onStateChange(({ state }) => {
-      if (state !== "idle" && state !== "closed") return;
-      unsubscribe();
-      title();
-    });
   }
   return { queued: true, messageID: prepared.messageID };
 }
@@ -225,18 +215,152 @@ export async function applyGoalChange(session: OpenCodeSession, prev: unknown, n
   await startOmpGoal(await Registry.ensure(session), change);
 }
 
-/** `/session/:id/shell`: through the session's runtime when it has one, else the shared utility child. */
-export function runShell(session: OpenCodeSession, command: string): Promise<unknown> {
+/** `/session/:id/shell`: through the session's runtime when it has one, else a plain shell in the session's directory. */
+export async function runShell(session: OpenCodeSession, command: string): Promise<unknown> {
   const runtime = Registry.get(session.id, session.directory);
-  return runtime ? runtime.bash(command) : Utility.for(session.directory).bash(command);
+  if (runtime) return runtime.bash(command);
+  const proc = Bun.spawn(["bash", "-c", command], { cwd: session.directory, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { output: stdout + stderr, exitCode };
+}
+
+/** A failure of a session operation the HTTP layer reports with `status`. */
+export class SessionOpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "SessionOpError";
+  }
+}
+
+/** The runtime for an operation that needs omp: an owner elsewhere is a 409, not a crash. */
+async function runtimeFor(session: OpenCodeSession): Promise<SessionRuntime> {
+  try {
+    return await Registry.ensure(session);
+  } catch (err) {
+    if (err instanceof OwnedElsewhereError) throw new SessionOpError(err.message, 409);
+    throw err;
+  }
+}
+
+/** omp refusing while a run is live (`session_busy`) is a conflict. */
+function asConflict(err: unknown): never {
+  if (err instanceof SessionOpError) throw err;
+  const message = err instanceof Error ? err.message : String(err);
+  throw new SessionOpError(message, /busy|running|streaming/i.test(message) ? 409 : 500);
+}
+
+function docKeyOf(session: OpenCodeSession): string {
+  const uuid = readSessionIdSync(session.path);
+  if (!uuid) throw new SessionOpError("session transcript has no header", 500);
+  return uuid;
 }
 
 /**
- * Drops the runtime holding a session (after the transcript changed under it,
- * or to release its lease). The next prompt opens the session afresh.
+ * Staged revert (§3.9): omp's leaf moves to the message's parent now and a
+ * `host-revert` entry makes it durable; the abandoned leaf is kept in the doc
+ * so redo can go back. A second stage while one is staged keeps the first redo leaf.
  */
-export function discardSession(sessionId: string, cwd: string): void {
-  Registry.close(sessionId, cwd, "replaced");
+export async function stageRevert(session: OpenCodeSession, messageID: string): Promise<{ messageID: string }> {
+  const located = await locateMessage(session.id, session.path, messageID);
+  if (!located) throw new SessionOpError("revert boundary not found", 404);
+  if (!located.userMessage) throw new SessionOpError("only a user message can be reverted to", 400);
+  const doc = await SessionDocs.get(located.uuid);
+  if (doc.revert?.messageID === messageID) return { messageID };
+  const runtime = await runtimeFor(session);
+  const redoLeafId = doc.revert?.redoLeafId ?? located.leafId ?? undefined;
+  try {
+    await runtime.navigateTo(located.entryId, { action: "revert", messageID });
+  } catch (err) {
+    asConflict(err);
+  }
+  await SessionDocs.update(located.uuid, (draft) => {
+    draft.revert = { messageID, ...(redoLeafId ? { redoLeafId } : {}) };
+  });
+  return { messageID };
+}
+
+/** Redo: back to the leaf the staged revert abandoned, then the marker goes. A marker with no redo leaf (migrated) is only dropped. */
+export async function clearRevert(session: OpenCodeSession): Promise<boolean> {
+  const uuid = docKeyOf(session);
+  const staged = (await SessionDocs.get(uuid)).revert;
+  if (!staged) return false;
+  if (staged.redoLeafId) {
+    const runtime = await runtimeFor(session);
+    try {
+      await runtime.navigateTo(staged.redoLeafId, { action: "redo", messageID: staged.messageID });
+    } catch (err) {
+      asConflict(err);
+    }
+  }
+  await SessionDocs.update(uuid, (draft) => { delete draft.revert; });
+  return true;
+}
+
+/** The staged revert is accepted: the transcript already holds it, only the marker goes. */
+export async function commitRevert(session: OpenCodeSession): Promise<boolean> {
+  const uuid = docKeyOf(session);
+  if (!(await SessionDocs.get(uuid)).revert) return false;
+  await SessionDocs.update(uuid, (draft) => { delete draft.revert; });
+  return true;
+}
+
+/**
+ * omp's `fork` (the whole conversation) or, with `before`, the history before
+ * that message (`branch` for a user message, `fork` at the entry before it
+ * otherwise). OpenChamber's metadata goes with it; the title is omp's slot.
+ */
+export async function forkSession(session: OpenCodeSession, before?: string): Promise<OpenCodeSession> {
+  let target: { entryId: string; before: boolean } | undefined;
+  if (before) {
+    const located = await locateMessage(session.id, session.path, before);
+    if (!located) throw new SessionOpError("fork boundary not found", 404);
+    if (located.userMessage) target = { entryId: located.entryId, before: true };
+    else if (located.parentId) target = { entryId: located.parentId, before: false };
+    else throw new SessionOpError("nothing before this message to fork", 400);
+  }
+  const uuid = docKeyOf(session);
+  const runtime = await runtimeFor(session);
+  const parentDoc = await SessionDocs.get(uuid);
+  let forked: { transcriptPath: string; sessionId: string };
+  try {
+    forked = await runtime.fork(target, `Fork of ${session.title ?? session.id}`);
+  } catch (err) {
+    asConflict(err);
+  }
+  await SessionDocs.update(forked.sessionId, (draft) => {
+    draft.metadata = { ...parentDoc.metadata };
+    // Entry ids and client ids carry over into the copy, so their maps do too.
+    if (parentDoc.legacyMessageIds) draft.legacyMessageIds = { ...parentDoc.legacyMessageIds };
+    if (parentDoc.visibleParts) draft.visibleParts = { ...parentDoc.visibleParts };
+  });
+  const created = await backendForSession(session.id).store.get(toOpenCodeSessionId(forked.sessionId), session.directory);
+  if (!created) throw new SessionOpError("the forked session was not found", 500);
+  return created;
+}
+
+/** omp's `/move <dir>`; its refusal text becomes the error. */
+export async function moveSession(session: OpenCodeSession, directory: string): Promise<OpenCodeSession> {
+  const runtime = await runtimeFor(session);
+  try {
+    await runtime.move(directory);
+  } catch (err) {
+    asConflict(err);
+  }
+  const moved = await backendForSession(session.id).store.get(session.id);
+  if (!moved) throw new SessionOpError("the moved session was not found", 500);
+  return moved;
+}
+
+/** A rename is omp's `set_session_name`: a runtime is started when none is live. */
+export async function renameSession(session: OpenCodeSession, title: string): Promise<OpenCodeSession> {
+  const clean = title.replace(/\r?\n/g, " ").trim();
+  if (!clean) throw new SessionOpError("title required", 400);
+  const runtime = await runtimeFor(session);
+  await runtime.setName(clean);
+  const updated = (await backendForSession(session.id).store.get(session.id, session.directory)) ?? { ...session, title: clean };
+  emitSessionUpdated(updated as unknown as Record<string, unknown>, updated.directory);
+  emitOpenCodeV2Event("session.renamed", { sessionID: session.id, title: clean }, updated.directory);
+  return updated;
 }
 
 /** The session was deleted: its runtime, pending synthetic context and approvals go. */

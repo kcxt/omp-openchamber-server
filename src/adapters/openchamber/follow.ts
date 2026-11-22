@@ -4,13 +4,19 @@
  * Such a session cannot be driven from here, but its transcript is still the
  * truth: omp appends a message to the JSONL as soon as it completes. A followed
  * session is polled by file stamp; each growth is turned into the same events a
- * live turn would have produced (user message, step, text/reasoning/tool parts,
- * busy/idle) so OpenChamber shows the terminal's work as it lands. The grain is
- * one message, not one token: omp streams tokens only to its own process.
+ * live turn would have produced (user message, step, text/reasoning/tool parts)
+ * so OpenChamber shows the terminal's work as it lands. The grain is one
+ * message, not one token: omp streams tokens only to its own process.
+ *
+ * Busy/idle is `statusOf` (lease first, tail second), re-evaluated whenever the
+ * stamp changes and, while the answer is not "idle", at a slow interval: the
+ * lease can drop without the file changing. An event goes out when that answer
+ * changes. What was last published is output dedupe, never a decision input.
  *
  * Followed from the moment a client reads the session's messages. A session the
  * sidecar itself drives (it has a live child) is never emitted from here.
  */
+import { OmpCli } from "../../omp/cli";
 import { backendForSession } from "../../providers/registry";
 import type { OpenCodeMessageRecord } from "../../providers/types";
 import { logger } from "../../shared/logger";
@@ -22,14 +28,14 @@ import {
   emitSessionStatus,
   emitSessionUpdated,
 } from "../../shared/sse";
-import { isSessionDriven, sessionOwnedElsewhere } from "../../sessions/status";
+import { isSessionDriven, statusOf, type SessionStatus } from "../../sessions/status";
 import { stat } from "node:fs/promises";
 
 const POLL_MS = Number(process.env.OC_FOLLOW_POLL_MS ?? 750);
-/** A followed session with no new messages for this long stops being polled (re-followed on the next read). */
+/** A followed session OpenChamber has not read for this long, with no lease holder, stops being polled (re-followed on the next read). */
 const EXPIRE_MS = 30 * 60_000;
-/** A session that looks busy but has had no new messages is checked for a live owner this often. */
-const OWNER_CHECK_MS = Number(process.env.OC_FOLLOW_OWNER_CHECK_MS ?? 30_000);
+/** A busy or unknown session is re-evaluated this often even when its transcript is unchanged. */
+const RECHECK_MS = Number(process.env.OC_FOLLOW_RECHECK_MS ?? 15_000);
 
 interface SeenMessage {
   signature: string;
@@ -45,12 +51,13 @@ interface Followed {
   path: string;
   stamp?: string;
   seen: Map<string, SeenMessage> | null;
-  busy: boolean;
-  lastGrowth: number;
-  lastOwnerCheck: number;
+  /** Latest `statusOf` answer, served to `/session/status` and `/session/active`. */
+  status: SessionStatus;
+  /** The busy/idle last published to OpenChamber. */
+  published: "busy" | "idle";
+  evaluatedAt: number;
+  lastRead: number;
   ticking: boolean;
-  /** Signature of the message set last applied; only a change here counts as progress. */
-  messagesKey: string | null;
 }
 
 const followed = new Map<string, Followed>();
@@ -58,26 +65,41 @@ let timer: ReturnType<typeof setInterval> | undefined;
 
 const keyOf = (id: string, cwd: string) => `${id}\0${cwd}`;
 
-/** Start (or keep) following a session. Cheap to call on every read. */
+/**
+ * Start (or keep) following a session. Cheap to call on every read. The first
+ * read of a session no runtime drives also starts omp's read-only inspection
+ * in the background, so the context panel usually answers from its memo.
+ */
 export function followSession(id: string, cwd: string, path: string): void {
   const key = keyOf(id, cwd);
   const existing = followed.get(key);
   if (existing) {
     existing.path = path;
+    existing.lastRead = Date.now();
     return;
   }
-  followed.set(key, { id, cwd, path, seen: null, messagesKey: null, busy: false, lastGrowth: Date.now(), lastOwnerCheck: 0, ticking: false });
+  followed.set(key, { id, cwd, path, seen: null, status: "idle", published: "idle", evaluatedAt: 0, lastRead: Date.now(), ticking: false });
   timer ??= setInterval(() => void tickAll(), POLL_MS);
   timer.unref?.();
+  if (!isSessionDriven(id, cwd)) {
+    OmpCli.inspect(path, cwd).catch((err) => logger.debug({ err, sessionID: id }, "[follow] inspect prefetch failed"));
+  }
 }
 
-/** Sessions currently believed busy in another omp, for `/session/status`. */
+/** Sessions currently busy in another omp, for `/session/status`. */
 export function followedStatuses(directory?: string): Record<string, { type: string }> {
   const result: Record<string, { type: string }> = {};
   for (const entry of followed.values()) {
-    if (entry.busy && (directory === undefined || entry.cwd === directory)) result[entry.id] = { type: "busy" };
+    if (entry.status === "busy" && (directory === undefined || entry.cwd === directory)) result[entry.id] = { type: "busy" };
   }
   return result;
+}
+
+/** Followed sessions whose latest status probe failed. */
+export function unknownFollowed(directory?: string): string[] {
+  return [...followed.values()]
+    .filter((entry) => entry.status === "unknown" && (directory === undefined || entry.cwd === directory))
+    .map((entry) => entry.id);
 }
 
 export function stopFollowingAll(): void {
@@ -105,15 +127,6 @@ async function stampOf(path: string): Promise<string | undefined> {
   }
 }
 
-function isBusy(records: OpenCodeMessageRecord[]): boolean {
-  const last = records.at(-1);
-  if (!last) return false;
-  if (last.info.role === "user") return true;
-  if (last.info.role !== "assistant") return false;
-  if (last.parts.some((part) => part.type === "tool" && (part.state.status === "pending" || part.state.status === "running"))) return true;
-  return last.info.finish === "toolUse" || last.info.finish === "tool-calls" || last.info.finish === "tool_calls";
-}
-
 function signatureOf(record: OpenCodeMessageRecord): string {
   const parts = record.parts.map((part) => (
     part.type === "tool" ? [part.id, part.state.status, part.state.output?.length ?? 0] : [part.id, part.type, "text" in part ? part.text.length : 0]
@@ -128,47 +141,39 @@ async function tick(entry: Followed): Promise<void> {
     if (isSessionDriven(entry.id, entry.cwd)) {
       // The sidecar's own child emits this session now; re-read the baseline when it lets go.
       entry.seen = null;
-      entry.messagesKey = null;
-      entry.busy = false;
       entry.stamp = undefined;
-      entry.lastGrowth = Date.now();
+      entry.status = "idle";
+      entry.published = "idle";
+      entry.evaluatedAt = 0;
       return;
     }
     const stamp = await stampOf(entry.path);
-    const now = Date.now();
+    let emitted = false;
+    let evaluate = false;
     if (stamp !== entry.stamp || !entry.seen) {
       entry.stamp = stamp;
       const records = await backendForSession(entry.id).store.transcript?.(entry.id, entry.cwd);
-      if (records && applyTranscript(entry, records, now)) {
-        entry.lastOwnerCheck = now;
-        if ((await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) === true) setBusy(entry, true);
-      }
+      if (records) emitted = applyTranscript(entry, records, Date.now());
+      evaluate = true;
+    } else if (entry.status !== "idle" && Date.now() - entry.evaluatedAt >= RECHECK_MS) {
+      evaluate = true;
     }
-    // Progress is a new message, never file growth: metadata appends must not keep a dead turn busy.
-    if (entry.busy && now - entry.lastGrowth > OWNER_CHECK_MS && now - entry.lastOwnerCheck > OWNER_CHECK_MS) {
-      entry.lastOwnerCheck = now;
-      // Unknown ownership keeps the turn busy; the next owner check asks again.
-      if ((await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) === false) setBusy(entry, false);
-    } else if (entry.seen && !entry.busy && now - entry.lastGrowth > EXPIRE_MS) {
-      followed.delete(keyOf(entry.id, entry.cwd));
+    if (evaluate) {
+      entry.status = await statusOf(entry.id, entry.cwd, entry.path);
+      entry.evaluatedAt = Date.now();
+      publish(entry, emitted);
     }
+    if (entry.status === "idle" && Date.now() - entry.lastRead > EXPIRE_MS) followed.delete(keyOf(entry.id, entry.cwd));
   } finally {
     entry.ticking = false;
   }
 }
 
-/**
- * Applies one transcript read: emits message deltas and recomputes busy when the message set changed.
- * Returns true for a cold read ending mid-turn, whose busy state is left for the caller to settle.
- */
+/** Emits the message deltas one transcript read produced; whether any went out. The first read is the silent baseline. */
 function applyTranscript(entry: Followed, records: OpenCodeMessageRecord[], now: number): boolean {
   const ordered = [...records].sort((a, b) => (a.info.time?.created ?? 0) - (b.info.time?.created ?? 0));
-  const messagesKey = ordered.map((record) => `${record.info.id}\0${signatureOf(record)}`).join("\n");
-  const changed = messagesKey !== entry.messagesKey;
   const baseline = entry.seen === null;
-  entry.messagesKey = messagesKey;
   entry.seen ??= new Map();
-  if (!baseline && changed) entry.lastGrowth = now;
   let emittedAny = false;
   for (const record of ordered) {
     if (baseline) {
@@ -178,22 +183,22 @@ function applyTranscript(entry: Followed, records: OpenCodeMessageRecord[], now:
     if (emitRecord(entry, record)) emittedAny = true;
   }
   if (!baseline) emitSessionUpdated({ id: entry.id, time: { updated: now } }, entry.cwd);
-  if (!changed) return false;
-  const busy = isBusy(ordered);
-  // Read cold, a tail that ends mid-turn is as likely a dead child's leftovers as a live terminal
-  // turn. Nothing here can tell which, so the caller asks the owner before declaring it busy.
-  if (baseline) return busy;
-  // A whole turn can land between two polls: still bracket it with busy → idle.
-  if (!busy && !entry.busy && emittedAny) setBusy(entry, true);
-  setBusy(entry, busy);
-  return false;
+  return emittedAny;
 }
 
-function setBusy(entry: Followed, busy: boolean): void {
-  if (entry.busy === busy) return;
-  entry.busy = busy;
-  emitSessionStatus(entry.id, { type: busy ? "busy" : "idle" }, entry.cwd);
-  if (!busy) emitSessionIdle(entry.id, entry.cwd);
+/** Publishes a change of the busy/idle answer; `unknown` publishes nothing (it is not idle, and not provably busy). */
+function publish(entry: Followed, emittedMessages: boolean): void {
+  if (entry.status === "unknown") return;
+  // A whole turn can land between two polls: still bracket it with busy → idle.
+  if (entry.status === "idle" && emittedMessages && entry.published === "idle") setPublished(entry, "busy");
+  setPublished(entry, entry.status);
+}
+
+function setPublished(entry: Followed, status: "busy" | "idle"): void {
+  if (entry.published === status) return;
+  entry.published = status;
+  emitSessionStatus(entry.id, { type: status }, entry.cwd);
+  if (status === "idle") emitSessionIdle(entry.id, entry.cwd);
 }
 
 /** Emits what changed in one record; whether anything was sent. */

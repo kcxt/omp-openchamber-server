@@ -1,26 +1,15 @@
-import { readdir, stat, mkdir, unlink, rename } from "node:fs/promises";
 import { readFileSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { readdir, stat, mkdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import {
-  overlayTitleSlotContent,
-  serializeTitleSlot,
-} from "./title";
-import {
-  deleteIndexedTitle,
-  deletePersistedMessageIds,
-  lookupIndexedTitle,
-  recordIndexedTitle,
-  searchMatchingSessionIds,
-} from "./title-db";
+import { serializeTitleSlot } from "./title";
 import { emitOpenCodeV2Event, emitSessionUpdated } from "../../shared/sse";
 import { readTranscriptSummary } from "../../omp/transcript-reader";
-import { SessionDocs, type SessionDoc } from "../../store/session-docs";
+import { SessionDocs, type SessionDoc, type SessionDocRevert } from "../../store/session-docs";
 import type { OpenCodeSession, TokenBreakdown } from "../types";
 
 import {
-  bucketOfSessionPath,
   encodeCwd,
   isSessionBucketOf,
   ompSessionsRoot,
@@ -41,15 +30,12 @@ interface SessionHeader {
   archived?: number;
   viewed?: number;
   parentSession?: string;
-  agent?: string;
   model?: { providerID: string; modelID: string; variant?: string };
   tokens?: TokenBreakdown;
   cost?: number;
-  revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] };
-  /** Client-minted OpenCode id (nanoid form) this omp session must answer to. */
+  revert?: SessionDocRevert;
+  /** Client-minted OpenCode id (nanoid form) this omp session answers to. */
   openCodeId?: string;
-  /** True when `openCodeId` was bound by an `oc_alias` marker: this file continues another session's OpenChamber identity. */
-  aliased?: boolean;
   /** OpenCode parent (a child session created through the API); `parentSession` alone is only omp lineage. */
   childOf?: string;
 }
@@ -170,69 +156,6 @@ export function readSessionIdSync(filePath: string): string | undefined {
 }
 
 /**
- * Resolve an OMP subagent name/id to the canonical OpenCode session id.
- *
- * OMP lifecycle snapshots may identify a child by its task name (for example
- * `RecentActivity`), while the JSONL header owns the UUID used by every
- * session route. Keep the name fallback for backends that do not persist a
- * child artifact, but prefer the authoritative child header whenever one is
- * available.
- */
-export async function resolveOmpSubagentOpenCodeId(
-  rawId: string,
-  parentOpenCodeId: string,
-  directory?: string | null,
-): Promise<string> {
-  const fallback = toOpenCodeSessionId(rawId);
-  if (isCanonicalOpenCodeSessionId(fallback)) return fallback;
-
-  try {
-    const alias = normalizeSessionAlias(rawId);
-    if (!alias) return fallback;
-    const children = await listOmpChildSessions(parentOpenCodeId, directory);
-    const match = children.find((session) => (
-      normalizeSessionAlias(session.title ?? "") === alias ||
-      normalizeSessionAlias(basename(session.path)) === alias
-    ));
-    return match?.id ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-/**
- * An OpenChamber session that moved to a sibling transcript. omp never writes
- * a session another live process holds: it moves to a new file (new id,
- * `parentSession` pointing back) on its first write. The sidecar marks that
- * transcript's SessionDoc with the OpenChamber id (`alias`), so the same
- * OpenChamber session continues in it while the original stays the other
- * process's. Among files claiming one id the alias wins, newest first.
- * (Fallback until omp patch P3 makes such moves impossible.)
- */
-const aliasedSessions = new WeakSet<OpenCodeSession>();
-const aliasIndex = new Map<string, string>();
-
-/** Bind OpenChamber session `openCodeId` to the transcript omp moved it to. */
-export async function adoptOmpTranscript(openCodeId: string, transcriptPath: string): Promise<void> {
-  const uuid = readSessionIdSync(transcriptPath);
-  if (!uuid) throw new Error(`cannot adopt ${transcriptPath}: no session header`);
-  await SessionDocs.update(uuid, (doc) => { doc.alias = openCodeId; });
-  aliasIndex.set(openCodeId, transcriptPath);
-}
-
-/** Drops sessions whose id an alias file has taken over; of several aliases the newest stays. */
-function dropSupersededSessions(sessions: OpenCodeSession[]): OpenCodeSession[] {
-  const winners = new Map<string, OpenCodeSession>();
-  for (const session of sessions) {
-    if (!aliasedSessions.has(session)) continue;
-    const current = winners.get(session.id);
-    if (!current || session.time.updated > current.time.updated) winners.set(session.id, session);
-  }
-  if (winners.size === 0) return sessions;
-  return sessions.filter((session) => !winners.has(session.id) || winners.get(session.id) === session);
-}
-
-/**
  * A session's list-facing header: the memoised TranscriptReader summary of the
  * transcript (omp's own records) overlaid with the session's SessionDoc
  * (OpenChamber-owned data). The reader memoises on the file's size and mtime, so
@@ -257,12 +180,10 @@ export async function readSessionHeader(filePath: string): Promise<SessionHeader
     timestamp: raw.timestamp,
     version: raw.version,
     parentSession: raw.parentSession,
-    title: summary.title ?? lookupIndexedTitle(raw.id),
+    title: summary.title,
     firstUserPrompt: summary.firstUserPrompt,
-    agent: doc.agent ?? raw.agent,
     model,
-    openCodeId: doc.alias ?? raw.openCodeId,
-    aliased: doc.alias !== undefined ? true : undefined,
+    openCodeId: raw.openCodeId,
     childOf: raw.openCodeParent,
     tokens: summary.usage.tokens,
     cost: summary.usage.cost,
@@ -274,16 +195,22 @@ export async function readSessionHeader(filePath: string): Promise<SessionHeader
   return header;
 }
 
+/** The OpenCode shape of a staged revert: the redo leaf is the sidecar's own. */
+function publicRevert(revert: SessionDocRevert): NonNullable<OpenCodeSession["revert"]> {
+  const { redoLeafId: _redoLeafId, ...visible } = revert;
+  return visible;
+}
+
 async function buildOpenCodeSession(
   header: SessionHeader,
   filePath: string,
   artifactParentReference?: string,
 ): Promise<OpenCodeSession> {
   const openCodeId = header.openCodeId ?? toOpenCodeSessionId(header.id);
-  // `parentSession` is omp lineage (a /fork, a session moved off a contested
-  // lease): such a session is an ordinary top-level one. Only an artifact
-  // sub-session (a subagent) or one created through the API as a child has a parent.
-  const parentID = header.aliased ? undefined : normalizeParentSessionId(header.childOf, artifactParentReference);
+  // `parentSession` is omp lineage (a /fork): such a session is an ordinary
+  // top-level one. Only an artifact sub-session (a subagent) or one created
+  // through the API as a child has a parent.
+  const parentID = normalizeParentSessionId(header.childOf, artifactParentReference);
   const compactId = header.id.replace(/-/g, "");
   const first8 = compactId.slice(0, 8);
   const created = Date.parse(header.timestamp) || Date.now();
@@ -311,7 +238,7 @@ async function buildOpenCodeSession(
     path: filePath,
     title,
     ...(parentID ? { parentID } : {}),
-    agent: header.agent || "omp",
+    agent: "omp",
     model: header.model
       ? {
           id: header.model.modelID,
@@ -330,9 +257,8 @@ async function buildOpenCodeSession(
     cost: header.cost ?? 0,
     tokens: header.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     metadata: header.metadata,
-    revert: header.revert,
+    revert: header.revert ? publicRevert(header.revert) : undefined,
   };
-  if (header.aliased) aliasedSessions.add(session);
   return session;
 }
 
@@ -350,7 +276,7 @@ async function resolveOmpParentId(parentID?: string): Promise<string | undefined
 
 export async function createOmpSession(
   directory?: string | null,
-  options?: { id?: string; title?: string; parentID?: string; forkOf?: string; agent?: string; model?: { providerID: string; modelID: string; variant: string }; metadata?: Record<string, unknown> },
+  options?: { id?: string; title?: string; parentID?: string; model?: { providerID: string; modelID: string; variant: string }; metadata?: Record<string, unknown> },
 ): Promise<OpenCodeSession> {
   const cwd = directory || process.cwd();
   const canonicalID = options?.id && isCanonicalOpenCodeSessionId(options.id)
@@ -361,7 +287,6 @@ export async function createOmpSession(
     : undefined;
   const uuid = canonicalID ?? randomUUID();
   const parentOmpID = await resolveOmpParentId(options?.parentID);
-  const lineageOmpID = parentOmpID ?? (options?.forkOf ? await resolveOmpParentId(options.forkOf) : undefined);
   const timestamp = new Date().toISOString();
   const fileTimestamp = timestamp.replace(/[:.]/g, "-");
   const fileName = `${fileTimestamp}_${uuid}.jsonl`;
@@ -371,6 +296,7 @@ export async function createOmpSession(
   await mkdir(dirPath, { recursive: true });
 
   const filePath = join(dirPath, fileName);
+  // The one write the sidecar makes to a transcript: the new file's slot and header, before any omp has it open.
   const titleSlot = serializeTitleSlot({
     title: options?.title ?? "",
     source: options?.title ? "user" : undefined,
@@ -386,20 +312,16 @@ export async function createOmpSession(
     providerID: options?.model?.providerID ?? "omp",
     modelId: options?.model?.modelID ?? "omp",
     variant: options?.model?.variant ?? "default",
-    agent: options?.agent ?? "omp",
     thinkingLevel: "off",
     version: 3,
     openCodeId: externalID,
-    parentSession: lineageOmpID,
+    parentSession: parentOmpID,
     ...(parentOmpID ? { openCodeParent: parentOmpID } : {}),
   };
 
   await Bun.write(filePath, titleSlot + JSON.stringify(headerRecord) + "\n");
   // OpenChamber's blob lives in the session doc, not in omp's header.
   if (options?.metadata) await SessionDocs.update(uuid, (doc) => { doc.metadata = { ...options.metadata }; });
-  if (options?.title) {
-    recordIndexedTitle(uuid, options.title);
-  }
   return buildOpenCodeSession(
     {
       id: uuid,
@@ -407,11 +329,10 @@ export async function createOmpSession(
       title: options?.title,
       timestamp,
       version: "3",
-      agent: options?.agent ?? "omp",
       model: options?.model ?? { providerID: "omp", modelID: "omp", variant: "default" },
       metadata: options?.metadata,
       openCodeId: externalID,
-      parentSession: lineageOmpID,
+      parentSession: parentOmpID,
       childOf: parentOmpID,
     },
     filePath,
@@ -425,9 +346,6 @@ export async function deleteOmpSession(
   const session = (await getOmpSessionByOpenCodeId(openCodeId, directory)) || (await getOmpSessionByOpenCodeId(openCodeId));
   if (!session) return false;
   try {
-    deleteIndexedTitle(fromOpenCodeSessionId(openCodeId));
-    deletePersistedMessageIds(openCodeId);
-    deletePersistedMessageIds(fromOpenCodeSessionId(openCodeId));
     const docKey = (await readSessionHeader(session.path))?.id;
     await unlink(session.path);
     if (docKey) await SessionDocs.remove(docKey);
@@ -437,99 +355,16 @@ export async function deleteOmpSession(
   }
 }
 
-export async function moveOmpSession(
-  openCodeId: string,
-  destinationDirectory: string,
-  sourceDirectory?: string | null,
-): Promise<OpenCodeSession | null> {
-  const session = (await getOmpSessionByOpenCodeId(openCodeId, sourceDirectory)) || (await getOmpSessionByOpenCodeId(openCodeId));
-  if (!session) return null;
-  const destination = destinationDirectory.trim();
-  if (!destination) return null;
-
-  try {
-    const content = await Bun.file(session.path).text();
-    const lines = content.split("\n");
-    let updatedHeader = false;
-    const rewritten = lines.map((line) => {
-      if (updatedHeader || !line.trim()) return line;
-      try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        if (entry.type !== "session") return line;
-        entry.cwd = destination;
-        updatedHeader = true;
-        return JSON.stringify(entry);
-      } catch {
-        return line;
-      }
-    }).join("\n");
-    if (!updatedHeader) return null;
-
-    const sourceRoot = join(ompSessionsRoot(), bucketOfSessionPath(session.path));
-    const destinationRoot = join(ompSessionsRoot(), encodeCwd(destination));
-    const destinationPath = join(destinationRoot, relative(sourceRoot, session.path));
-    await mkdir(destinationRoot, { recursive: true });
-    if (destinationPath === session.path) {
-      await Bun.write(session.path, rewritten);
-    } else {
-      const temporaryPath = `${destinationPath}.tmp-${randomUUID()}`;
-      await Bun.write(temporaryPath, rewritten);
-      await rename(temporaryPath, destinationPath);
-      await unlink(session.path);
-    }
-
-    session.directory = destination;
-    session.path = destinationPath;
-    session.time.updated = Date.now();
-    return session;
-  } catch {
-    return null;
-  }
-}
-
-export async function setOmpSessionTitle(
-  openCodeId: string,
-  newTitle: string,
-  source: "auto" | "user" = "auto",
-  directory?: string | null,
-): Promise<OpenCodeSession | null> {
-  const session = (await getOmpSessionByOpenCodeId(openCodeId, directory)) || (await getOmpSessionByOpenCodeId(openCodeId));
-  if (!session) return null;
-
-  try {
-    const existing = await Bun.file(session.path).text();
-    const cleanTitle = newTitle.replace(/\r?\n/g, " ").trim();
-    const updatedContent = overlayTitleSlotContent(existing, {
-      title: cleanTitle,
-      source,
-      updatedAt: new Date().toISOString(),
-    });
-    await Bun.write(session.path, updatedContent);
-    recordIndexedTitle(fromOpenCodeSessionId(openCodeId), cleanTitle);
-
-    session.title = cleanTitle;
-    session.time.updated = Date.now();
-    emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
-    emitOpenCodeV2Event("session.renamed", { sessionID: openCodeId, title: cleanTitle }, session.directory);
-    return session;
-  } catch {
-    return null;
-  }
-}
-
 export async function updateOmpSession(
   openCodeId: string,
   updates: {
-    title?: string;
     metadata?: Record<string, unknown>;
-    agent?: string;
-    model?: { providerID: string; modelID: string; variant: string };
-    revert?: { messageID: string; partID?: string; snapshot?: string; files?: unknown[] } | null;
+    revert?: SessionDocRevert | null;
     time?: { archived?: number | null; viewed?: number };
   },
   directory?: string | null,
 ): Promise<OpenCodeSession | null> {
-  let session = (await getOmpSessionByOpenCodeId(openCodeId, directory)) || (await getOmpSessionByOpenCodeId(openCodeId));
+  const session = (await getOmpSessionByOpenCodeId(openCodeId, directory)) || (await getOmpSessionByOpenCodeId(openCodeId));
   if (!session) return null;
 
   const docKey = (await readSessionHeader(session.path))?.id;
@@ -544,40 +379,15 @@ export async function updateOmpSession(
     }
   };
 
-  if (updates.agent !== undefined && updates.agent !== session.agent) {
-    const agent = updates.agent;
-    if (await persist((doc) => { doc.agent = agent; })) {
-      session.agent = agent;
-      session.time.updated = Date.now();
-    }
-  }
-
-  // A model pick is not persisted here: omp journals `model_change` and
-  // `thinking_level_change` when the pick is applied to a running session, and
-  // the session's model is read back from the transcript (TranscriptReader.lastModel).
-  if (updates.model !== undefined) {
-    session.model = {
-      id: `${updates.model.providerID}/${updates.model.modelID}`,
-      providerID: updates.model.providerID,
-      modelID: updates.model.modelID,
-      variant: updates.model.variant,
-    };
-    session.time.updated = Date.now();
-  }
-
   if (updates.revert !== undefined) {
     const revert = updates.revert;
     if (await persist((doc) => {
       if (revert) doc.revert = revert;
       else delete doc.revert;
     })) {
-      session.revert = revert ?? undefined;
+      session.revert = revert ? publicRevert(revert) : undefined;
       session.time.updated = Date.now();
     }
-  }
-
-  if (updates.title !== undefined && updates.title !== session.title) {
-    session = (await setOmpSessionTitle(openCodeId, updates.title, "user", session.directory)) || session;
   }
 
   if (updates.metadata !== undefined && typeof updates.metadata === "object") {
@@ -624,7 +434,6 @@ export async function listOmpSessions(
   const archived = options?.archived;
   const search = options?.search?.trim();
   const searchLower = search ? search.toLowerCase() : undefined;
-  const matchingOmpIds = search ? searchMatchingSessionIds(search) : undefined;
   const sessions: OpenCodeSession[] = [];
 
   let entries: { name: string; isDirectory(): boolean }[];
@@ -667,13 +476,11 @@ export async function listOmpSessions(
           const promptMatch = header.firstUserPrompt?.toLowerCase().includes(searchLower);
           const idMatch = header.id.toLowerCase().includes(searchLower);
           const cwdMatch = header.cwd.toLowerCase().includes(searchLower);
-          const ftsMatch = matchingOmpIds?.has(header.id);
-          if (!titleMatch && !promptMatch && !idMatch && !cwdMatch && !ftsMatch) {
+          if (!titleMatch && !promptMatch && !idMatch && !cwdMatch) {
             continue;
           }
         }
 
-        if (header.aliased && header.openCodeId) aliasIndex.set(header.openCodeId, filePath);
         sessions.push(await buildOpenCodeSession(header, filePath));
         if (limit !== undefined && sessions.length >= limit) break;
       } else if (ent.isDirectory()) {
@@ -703,8 +510,7 @@ export async function listOmpSessions(
             const promptMatch = subHeader.firstUserPrompt?.toLowerCase().includes(searchLower);
             const idMatch = subHeader.id.toLowerCase().includes(searchLower);
             const cwdMatch = subHeader.cwd.toLowerCase().includes(searchLower);
-            const ftsMatch = matchingOmpIds?.has(subHeader.id);
-            if (!titleMatch && !promptMatch && !idMatch && !cwdMatch && !ftsMatch) {
+            if (!titleMatch && !promptMatch && !idMatch && !cwdMatch) {
               continue;
             }
           }
@@ -717,22 +523,13 @@ export async function listOmpSessions(
     if (limit !== undefined && sessions.length >= limit) break;
   }
 
-  return dropSupersededSessions(sessions);
+  return sessions;
 }
 
 export async function getOmpSessionByOpenCodeId(
   openCodeId: string,
   directory?: string | null,
 ): Promise<OpenCodeSession | null> {
-  const aliasPath = aliasIndex.get(openCodeId);
-  if (aliasPath) {
-    const header = await readSessionHeader(aliasPath);
-    if (header?.aliased && header.openCodeId === openCodeId && (!directory || sameDirectory(header.cwd, directory))) {
-      return buildOpenCodeSession(header, aliasPath);
-    }
-    if (!header) aliasIndex.delete(openCodeId);
-  }
-
   const ompId = fromOpenCodeSessionId(openCodeId);
   const requestedAlias = isCanonicalOpenCodeSessionId(openCodeId)
     ? undefined
@@ -763,7 +560,6 @@ export async function getOmpSessionByOpenCodeId(
       }[];
     } catch { continue; }
 
-    let fallback: OpenCodeSession | undefined;
     for (const ent of dirents) {
       if (ent.isFile() && ent.name.endsWith(".jsonl")) {
         const filePath = join(dirPath, ent.name);
@@ -776,9 +572,7 @@ export async function getOmpSessionByOpenCodeId(
           (requestedAlias !== undefined && normalizeSessionAlias(header.title ?? "") === requestedAlias)
         ) {
           if (directory && !sameDirectory(header.cwd, directory)) continue;
-          if (header.aliased) return buildOpenCodeSession(header, filePath);
-          // Another file of this bucket may have taken the id over (an `oc_alias`).
-          fallback ??= await buildOpenCodeSession(header, filePath);
+          return buildOpenCodeSession(header, filePath);
         }
       } else if (ent.isDirectory()) {
         const subDirPath = join(dirPath, ent.name);
@@ -815,7 +609,6 @@ export async function getOmpSessionByOpenCodeId(
         }
       }
     }
-    if (fallback) return fallback;
   }
 
   return null;

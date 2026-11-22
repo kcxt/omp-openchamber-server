@@ -1,13 +1,14 @@
 /**
  * OpenChamber config surfaces (MCP servers, plugins, slash commands) backed by
- * omp's own state: `mcp.json` files, the `omp plugin` CLI and the RPC
- * `get_available_commands` command. Nothing here keeps a copy of that state.
+ * omp's own state: `mcp.json` files, the `omp plugin` CLI and `omp session
+ * inspect`. Nothing here keeps a copy of that state.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getExplicitOmpBinary } from "../../providers/omp/binary";
-import { Utility } from "../../omp/utility";
+import { OmpCli } from "../../omp/cli";
+import { defaultBackend } from "../../providers/registry";
 import { listAvailableCommands } from "./discovery";
 
 type Json = Record<string, unknown>;
@@ -268,7 +269,8 @@ const commandInflight = new Map<string, Promise<SlashCommand[]>>();
 /**
  * Commands omp itself would accept in a session at `directory`: its builtins,
  * skills, file commands, MCP prompts and every plugin/extension command
- * (e.g. `/pi-vcc`). Cached because answering it costs one omp spawn.
+ * (e.g. `/pi-vcc`). Read from a read-only `omp session inspect` of the
+ * directory's newest session, so it is cached: answering it costs one omp spawn.
  */
 export async function listOmpSlashCommands(directory: string): Promise<SlashCommand[]> {
   const cached = commandCache.get(directory);
@@ -277,15 +279,19 @@ export async function listOmpSlashCommands(directory: string): Promise<SlashComm
   if (pending) return pending;
   const load = (async () => {
     try {
-      const data = await Utility.for(directory).availableCommands() as { commands?: Array<{ name?: unknown; description?: unknown }> };
-      const commands = (data?.commands ?? [])
-        .filter((command): command is { name: string; description?: unknown } => typeof command.name === "string" && command.name.length > 0)
+      const sessions = await defaultBackend().store.list(directory);
+      const newest = sessions.filter((session) => session.path && !session.parentID).sort((a, b) => b.time.updated - a.time.updated)[0];
+      if (!newest) throw new Error("no session in this directory to inspect");
+      // Fresh: a plugin or MCP change alters the commands without touching the transcript the memo is keyed on.
+      const inspection = await OmpCli.inspect(newest.path, directory, { fresh: true });
+      const commands = inspection.availableCommands
+        .filter((command) => typeof command.name === "string" && command.name.length > 0)
         .map((command) => ({ name: command.name, ...(typeof command.description === "string" && command.description ? { description: command.description } : {}) }));
       if (commands.length === 0) throw new Error("omp reported no commands");
       commandCache.set(directory, { at: Date.now(), commands });
       return commands;
     } catch {
-      // omp unreachable: fall back to filesystem discovery rather than an empty palette.
+      // Nothing to inspect, or omp unreachable: fall back to filesystem discovery rather than an empty palette.
       return (await listAvailableCommands(directory)).map(({ name, description }) => ({ name, description }));
     } finally {
       commandInflight.delete(directory);

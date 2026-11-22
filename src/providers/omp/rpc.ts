@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RpcChild } from "../../omp/rpc-child";
 import type { BackendCredentials, OpenCodeModel, OpenCodeProvider, OpenCodeProvidersResponse } from "../types";
 
 export function getSidecarExtensionPaths(): string[] {
@@ -111,34 +110,6 @@ export interface OmpRpcModel {
   supportsToolCall?: boolean;
   supportsAttachment?: boolean;
   [key: string]: unknown;
-}
-
-/**
- * Normalizes the omp `get_available_models` response into an OmpRpcModel
- * list. Accepts a bare array or one of the `{models|data|result}` wrappers.
- */
-export function normalizeModelsResponse(value: unknown): OmpRpcModel[] {
-  if (Array.isArray(value)) return value as OmpRpcModel[];
-  if (value != null && typeof value === "object") {
-    const obj = value as Record<string, unknown>;
-    if (Array.isArray(obj.models)) return obj.models as OmpRpcModel[];
-    if (Array.isArray(obj.data)) return obj.data as OmpRpcModel[];
-    if (Array.isArray(obj.result)) return obj.result as OmpRpcModel[];
-  }
-  return [];
-}
-
-export async function withOmpRpc<T>(
-  cwd: string,
-  fn: (conn: RpcChild) => Promise<T>,
-  options: OmpRpcSpawnOptions = {},
-): Promise<T> {
-  const conn = await RpcChild.spawn(cwd, 3, options);
-  try {
-    return await fn(conn);
-  } finally {
-    conn.kill();
-  }
 }
 
 const defaultThinkingVariants: Record<string, unknown> = {
@@ -316,29 +287,5 @@ export function mapRpcModelsToOpenCodeProviders(
   return {
     providers,
     default: { default: defaultProvider?.id ?? "" },
-  };
-}
-
-export async function getCurrentModel(
-  conn: Pick<OmpRpcTransport, "request">,
-): Promise<{ providerID?: string; modelID?: string; variant?: string } | undefined> {
-  const state = (await conn.request("get_state")) as Record<string, unknown> | undefined;
-  if (!state || typeof state !== "object") return undefined;
-  if (!("model" in state)) return undefined;
-  const model = state.model;
-  if (!model || typeof model !== "object") return undefined;
-  const providerID =
-    "provider" in model && typeof model.provider === "string" ? model.provider : undefined;
-  const modelID = "id" in model && typeof model.id === "string" ? model.id : undefined;
-  const variant =
-    typeof state.thinkingLevel === "string"
-      ? state.thinkingLevel
-      : "variant" in model && typeof model.variant === "string"
-        ? model.variant
-        : undefined;
-  return {
-    providerID,
-    modelID,
-    variant,
   };
 }

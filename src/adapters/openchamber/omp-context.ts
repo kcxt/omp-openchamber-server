@@ -3,9 +3,9 @@
  *
  * Tier 1 comes from the transcript (`metadata.omp.context` on every assistant
  * message): window fill, the history curve, cache weight, compactions. The
- * per-category `breakdown` needs omp's `get_context_breakdown` RPC, which costs
- * one omp spawn, so it is opt-in and degrades to `null` against an omp that
- * predates the command.
+ * per-category `breakdown` comes from `omp session inspect`, which costs one
+ * read-only omp spawn unless the session's first read already prefetched it,
+ * so it is opt-in and degrades to `null` when omp cannot answer.
  */
 import {
   contextHistory,
@@ -13,7 +13,7 @@ import {
   type OmpContextPoint,
   type OmpSessionContext,
 } from "../../providers/omp/context";
-import { Utility } from "../../omp/utility";
+import { OmpCli } from "../../omp/cli";
 import type { AgentBackend, OpenCodeMessageRecord, OpenCodeSession } from "../../providers/types";
 
 export const OMP_CONTEXT_VERSION = 1;
@@ -80,11 +80,11 @@ export function buildOmpContext(
   };
 }
 
-/** omp's categorical breakdown for the session, or `null` when this omp has no `get_context_breakdown`. */
+/** omp's categorical breakdown for the session (read-only `omp session inspect`, usually prefetched), or `null` when omp has none. */
 async function readBreakdown(session: OpenCodeSession): Promise<OmpContextBreakdown | null> {
   try {
-    const raw = await Utility.for(session.directory).contextBreakdown(session.path);
-    return raw && typeof raw === "object" ? raw as OmpContextBreakdown : null;
+    const inspection = await OmpCli.inspect(session.path, session.directory);
+    return inspection.contextBreakdown as OmpContextBreakdown | null;
   } catch {
     return null;
   }

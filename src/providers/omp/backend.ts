@@ -11,28 +11,17 @@ import type {
   SessionStore,
 } from "../types";
 import { resolveBackendCredentials } from "./credentials";
+import { OmpCli } from "../../omp/cli";
 import { RpcChild } from "../../omp/rpc-child";
-import { Utility } from "../../omp/utility";
-import {
-  getCurrentModel,
-  mapRpcModelsToOpenCodeProviders,
-  normalizeModelsResponse,
-  withOmpRpc,
-  type OmpRpcTransport,
-} from "./rpc";
-import { rememberModelWindows } from "./context";
-import { forkOmpSession, loadSessionMessages, recordUserMessageId, truncateOmpSessionAtMessage } from "./messages";
+import { listOmpModels } from "./models";
+import { loadSessionMessages } from "./messages";
 import {
   createOmpSession,
   deleteOmpSession,
   getOmpSessionByOpenCodeId,
   listOmpChildSessions,
   listOmpSessions,
-  moveOmpSession,
-  setOmpSessionTitle,
   updateOmpSession,
-  adoptOmpTranscript,
-  readSessionIdSync,
 } from "./store";
 
 /** The omp store's stand-in model for a session with no recorded model. */
@@ -45,7 +34,6 @@ const ompCapabilities: BackendCapabilities = {
   approvals: true,
   subagents: true,
   todo: true,
-  titleGeneration: true,
   skills: true,
   compact: true,
   shell: true,
@@ -70,10 +58,7 @@ const ompStore: SessionStore = {
     return updateOmpSession(
       openCodeId,
       {
-        title: updates.title,
         metadata: updates.metadata,
-        agent: updates.agent,
-        model: updates.model,
         revert: updates.revert,
         time: updates.time?.archived !== undefined || updates.time?.viewed !== undefined
           ? {
@@ -85,29 +70,11 @@ const ompStore: SessionStore = {
       directory,
     );
   },
-  async commitRevert(openCodeId, messageID, directory) {
-    return truncateOmpSessionAtMessage(openCodeId, directory ?? "", messageID);
-  },
-  async adoptTranscript(openCodeId, transcriptPath) {
-    await adoptOmpTranscript(openCodeId, transcriptPath);
-  },
-  async fork(openCodeId, directory, before) {
-    return forkOmpSession(openCodeId, directory, before);
-  },
-  async move(openCodeId, directory, sourceDirectory) {
-    return moveOmpSession(openCodeId, directory, sourceDirectory);
-  },
-  async setTitle(openCodeId, title, source, cwd) {
-    await setOmpSessionTitle(openCodeId, title, source, cwd);
-  },
   async children(parentOpenCodeId, directory) {
     return listOmpChildSessions(parentOpenCodeId, directory);
   },
   async transcript(openCodeId, cwd) {
     return loadSessionMessages(openCodeId, cwd);
-  },
-  recordUserMessage(openCodeId, text, messageId, parts) {
-    recordUserMessageId(openCodeId, text, messageId, undefined, parts);
   },
 };
 
@@ -118,36 +85,11 @@ export const ompBackend: AgentBackend = {
   capabilities: ompCapabilities,
   defaultModel: OMP_DEFAULT_MODEL,
   store: ompStore,
-  async listModels(cwd, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse> {
-    const credential = await resolveBackendCredentials(auth, { cwd });
-    const readModels = async (request: OmpRpcTransport["request"]): Promise<OpenCodeProvidersResponse> => {
-      const models = normalizeModelsResponse(await request("get_available_models"));
-      const currentModel = await getCurrentModel({ request });
-      const providers = mapRpcModelsToOpenCodeProviders(models, currentModel?.providerID, currentModel?.modelID);
-      rememberModelWindows(providers);
-      return providers;
-    };
-    if (!credential) {
-      const utility = Utility.for(cwd);
-      return readModels((method, params, timeoutMs) => utility.request(method, params, timeoutMs));
-    }
-    // Caller-owned credentials are per child: a shared utility cannot carry them.
-    return withOmpRpc(cwd, (conn) => readModels((method, params, timeoutMs) => conn.request(method, params, timeoutMs)), { credential });
-  },
-  async sessionOwnedElsewhere(cwd, transcriptPath) {
-    const id = readSessionIdSync(transcriptPath);
-    if (!id) return false;
-    // A utility omp never opened the session: `held` can only be another process.
-    try {
-      const lease = await Utility.for(cwd).leaseHeld([id]);
-      if (lease.held.includes(id)) return true;
-      return lease.unknown.includes(id) ? undefined : false;
-    } catch {
-      return undefined;
-    }
+  async listModels(cwd: string, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse> {
+    return listOmpModels(cwd, await resolveBackendCredentials(auth, { cwd }));
   },
   shutdownAll() {
-    Utility.shutdown();
+    OmpCli.shutdown();
     RpcChild.killAll();
   },
 };

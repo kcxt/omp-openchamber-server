@@ -2,22 +2,24 @@
  * omp's own idle recap, published where OpenChamber's session-assist UI reads it.
  *
  * omp generates a recap when a session has been quiet for `recap.idleSeconds`
- * (`recap.enabled`, default on) and journals it to `session_recaps` in
- * `~/.omp/agent/history.db`. OpenChamber's own recap path runs its Small Model
+ * (`recap.enabled`, default on). A session this sidecar drives reports it as a
+ * `recap` frame (P4), which the runtime publishes; a session another omp owns
+ * has its recap read from the `session_recaps` journal in `~/.omp/agent/history.db`.
+ * OpenChamber's own recap path runs its Small Model
  * and deliberately skips a session whose model is a local endpoint, so an
  * omp-backed session never gets one from OpenChamber. The slot is the same
  * either way: `metadata.openchamber.assist`.
  *
  * The client requires a non-empty `forMessageID` to render the recap, so the
- * assistant message id is rebuilt from the last user prompt the sidecar
- * recorded — the same id the transcript mapper and the live turn handler mint.
+ * assistant message id is the transcript's newest assistant message.
  */
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { getDefaultHistoryDbPath, listPersistedMessageIds } from "./title-db";
-import { timeHexFromTimestamp, timeHexOfMessageId } from "../../shared/message-id";
+import { loadSessionMessages } from "./messages";
+import { ompAgentDir } from "./paths";
+import { Registry } from "../../sessions/registry";
 import type { OpenCodeSession } from "../types";
 
 const RECAP_TTL_MS = 30_000;
@@ -45,7 +47,7 @@ function recapIndex(): Database | undefined {
   if (dbUnavailable) return undefined;
   if (!db) {
     try {
-      db = new Database(getDefaultHistoryDbPath(), { readonly: true });
+      db = new Database(join(ompAgentDir(), "history.db"), { readonly: true });
     } catch {
       dbUnavailable = true;
       return undefined;
@@ -110,20 +112,10 @@ function ompSessionId(session: OpenCodeSession): string | undefined {
   return basename(session.path).match(OMP_UUID_AT_END)?.[1];
 }
 
-/**
- * The assistant message a recap summarizes: `msg_<session>_asst_<last prompt>`,
- * which is how both the transcript mapper and the live turn handler name the
- * assistant turn following a user message.
- */
-function recapSubjectMessageID(session: OpenCodeSession): string | undefined {
-  const recorded = listPersistedMessageIds(session.id);
-  let newest: { clientMessageId: string; createdAt: number } | undefined;
-  for (const item of recorded) {
-    if (!newest || item.createdAt > newest.createdAt) newest = item;
-  }
-  if (!newest) return undefined;
-  const asstHex = timeHexOfMessageId(newest.clientMessageId) ?? timeHexFromTimestamp(newest.createdAt);
-  return `msg_${asstHex}~${session.id}_asst_${newest.clientMessageId}`;
+/** The assistant message a recap summarizes: the newest assistant message of the transcript. */
+async function recapSubjectMessageID(session: OpenCodeSession): Promise<string | undefined> {
+  const records = await loadSessionMessages(session.id, session.directory).catch(() => null);
+  return records?.findLast((record) => record.info.role === "assistant")?.info.id;
 }
 
 const hasAssist = (session: OpenCodeSession): boolean => {
@@ -162,13 +154,15 @@ const withinLimit = (text: string): string =>
   text.length <= RECAP_CHAR_LIMIT ? text : `${text.slice(0, RECAP_CHAR_LIMIT - 1).trimEnd()}…`;
 
 /**
- * Add omp's recap to the session records that carry none. OpenChamber's own
- * assist wins when it has written one; a session with no recorded prompt has
+ * Add omp's recap to the session records that carry none, from `history.db`:
+ * this is only for sessions another omp owns. A session this sidecar drives
+ * gets its recap from the runtime's `onRecap` (the P4 `recap` frame). OpenChamber's
+ * own assist wins when it has written one; a session with no recorded prompt has
  * no assistant turn to attach a recap to, so it is left alone.
  */
-export function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): T[] {
+export async function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): Promise<T[]> {
   if (sessions.length === 0 || !openchamberRecapEnabled()) return sessions;
-  const candidates = sessions.filter((session) => !hasAssist(session));
+  const candidates = sessions.filter((session) => !hasAssist(session) && !Registry.get(session.id, session.directory));
   if (candidates.length === 0) return sessions;
 
   const ids = new Map<string, string>();
@@ -181,11 +175,11 @@ export function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): 
   const recaps = latestRecaps([...new Set(ids.values())]);
   if (recaps.size === 0) return sessions;
 
-  return sessions.map((session) => {
+  return Promise.all(sessions.map(async (session) => {
     const ompId = ids.get(session.id);
     const recap = ompId ? recaps.get(ompId) : undefined;
     if (!recap || hasAssist(session)) return session;
-    const forMessageID = recapSubjectMessageID(session);
+    const forMessageID = await recapSubjectMessageID(session);
     if (!forMessageID) return session;
     const metadata = (session.metadata ?? {}) as Record<string, unknown>;
     const openchamber = (metadata.openchamber ?? {}) as Record<string, unknown>;
@@ -205,7 +199,7 @@ export function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): 
         },
       },
     };
-  });
+  }));
 }
 
 /**
@@ -214,14 +208,14 @@ export function attachOmpRecapAssist<T extends OpenCodeSession>(sessions: T[]): 
  * assistant message is known to attach it to. `forMessageID` is the assistant
  * message the runtime last completed; without one it is rebuilt as above.
  */
-export function withOmpRecapAssist(
+export async function withOmpRecapAssist(
   session: OpenCodeSession,
   recap: string,
   createdAt: number,
   forMessageID: string | undefined,
-): Record<string, unknown> | null {
+): Promise<Record<string, unknown> | null> {
   if (!openchamberRecapEnabled()) return null;
-  const subject = forMessageID ?? recapSubjectMessageID(session);
+  const subject = forMessageID ?? (await recapSubjectMessageID(session));
   if (!subject) return null;
   const metadata = (session.metadata ?? {}) as Record<string, unknown>;
   const openchamber = (metadata.openchamber ?? {}) as Record<string, unknown>;

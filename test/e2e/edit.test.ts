@@ -31,11 +31,12 @@ async function transcript(): Promise<string[]> {
 /** The user/assistant text omp has on its active branch, from the file it persists. */
 function branchOnDisk(marker: string): string[] {
   const file = stack.sessionFiles().find((f) => JSON.stringify(f.records).includes(marker))!;
-  const records = file.records.filter((r) => typeof r.id === "string" && r.type === "message");
+  // The branch runs through omp's own bookkeeping entries too (the `host-revert` marker a revert journals).
+  const records = file.records.filter((r) => typeof r.id === "string" && (r.type === "message" || r.type === "custom"));
   const byId = new Map(records.map((r) => [r.id, r]));
   const path: any[] = [];
   for (let n = records.at(-1); n; n = byId.get(n.parentId)) path.unshift(n);
-  return path.map((r) => r.message.role === "user" ? `user: ${r.message.content[0].text}` : `assistant: ${r.message.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("")}`);
+  return path.filter((r) => r.type === "message").map((r) => r.message.role === "user" ? `user: ${r.message.content[0].text}` : `assistant: ${r.message.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("")}`);
 }
 const stop = () => page.getByRole("button", { name: "Stop generating" }).first();
 
