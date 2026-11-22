@@ -1,6 +1,6 @@
 import { connectHost } from '@openchamber/sdk';
 import type { HostClient, SessionSnapshot } from '@openchamber/sdk';
-import { applyHostReady, mountEmpty, mountSpinner } from '@openchamber/sdk/ui';
+import { applyHostReady, mountEmpty } from '@openchamber/sdk/ui';
 
 import type { ContextReport } from '../service/breakdown';
 import type { GoalReport } from '../service/goal';
@@ -20,7 +20,10 @@ type Section = {
   icon: IconName;
   /** Goal and tasks change mid-turn and the host has no event for them: they are polled while shown. */
   polled: boolean;
-  loading: (m: Messages) => string;
+  /** Shape of the empty layout drawn before the first answer: heights in rem. */
+  skeleton: number[];
+  /** Least time between two reads; the poll retries until it has passed. */
+  minMs: number;
   /** Reads this view's route through the panel service and turns the answer into a view. */
   fetch: (session: SessionSnapshot) => Promise<View>;
 };
@@ -45,9 +48,10 @@ async function post<T>(path: string, forSession: SessionSnapshot): Promise<T> {
 const SECTIONS: Section[] = [
   {
     id: 'goal',
+    skeleton: [8],
     icon: 'goal',
     polled: true,
-    loading: (words) => words.goal.loading,
+    minMs: 1500,
     async fetch(forSession) {
       const report = await post<GoalReport>('/goal', forSession);
       if (report.status !== 'ok') return { empty: [m.sections.goal, m.goal.reasons[report.reason] ?? m.goal.reasons.failed] };
@@ -56,9 +60,10 @@ const SECTIONS: Section[] = [
   },
   {
     id: 'tasks',
+    skeleton: [1.6, 1.6, 1.6],
     icon: 'tasks',
     polled: true,
-    loading: (words) => words.tasks.loading,
+    minMs: 1500,
     async fetch(forSession) {
       const report = await post<TasksReport>('/tasks', forSession);
       if (report.status !== 'ok') return { empty: [m.sections.tasks, m.tasks.reasons[report.reason] ?? m.tasks.reasons.failed] };
@@ -67,14 +72,15 @@ const SECTIONS: Section[] = [
   },
   {
     id: 'context',
+    skeleton: [6, 1.2, 1.2, 1.2, 1.2],
     icon: 'context',
     polled: false,
-    loading: (words) => words.empty.loading,
+    minMs: 12_000,
     async fetch(forSession) {
       const report = await post<ContextReport>('/context', forSession);
       if (report.status === 'no-turn') return { empty: m.empty.noTurn };
       if (report.status !== 'ok') return { empty: [m.empty.notFound, m.empty.reasons[report.reason] ?? m.empty.reasons.failed] };
-      return { signature: '', draw: (body) => void renderReport(body, report) };
+      return { signature: JSON.stringify(report), draw: (body) => void renderReport(body, report) };
     },
   },
 ];
@@ -84,9 +90,6 @@ type Mounted = {
   tab: HTMLButtonElement;
   label: HTMLElement;
   count: HTMLElement;
-  /** Only the latest request may paint: an answer for a session or tab left behind is dropped. */
-  request: number;
-  signature: string | null;
 };
 
 const content = el('div', 'cx-content');
@@ -97,7 +100,7 @@ const mounted: Mounted[] = SECTIONS.map((section) => {
   const label = el('span', 'cx-tab-label');
   const count = el('span', 'cx-tab-count');
   tab.append(icon(section.icon, 'cx-tab-icon'), label, count);
-  const state: Mounted = { section, tab, label, count, request: 0, signature: null };
+  const state: Mounted = { section, tab, label, count };
   tab.addEventListener('click', () => select(state));
   return state;
 });
@@ -121,9 +124,7 @@ function boot() {
   bar.append(...mounted.map((state) => state.tab));
   root.append(bar, content);
   labelTabs();
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') refreshPolled();
-  });
+  document.addEventListener('visibilitychange', tick);
 
   host = connectHost();
   host.onReady((context) => {
@@ -136,6 +137,7 @@ function boot() {
       document.documentElement.lang = context.locale || 'en';
       labelTabs();
       shownKey = null;
+      shown = null;
     }
     // A turn ends when `busy` goes back to false: that is when the context numbers move. The polled
     // views are read again here too, not only on their timer.
@@ -144,8 +146,9 @@ function boot() {
     shownKey = key;
     const changed = context.session?.id !== session?.id;
     session = context.session;
-    if (changed) for (const state of mounted) clearCount(state);
-    show(changed);
+    for (const state of mounted) request(state);
+    render(changed);
+    ensurePoll();
   });
 }
 
@@ -160,63 +163,93 @@ function select(next: Mounted) {
   if (next === active) return;
   active = next;
   labelTabs();
-  show(true);
+  request(next);
+  render(true);
 }
 
-function clearCount(state: Mounted) {
-  state.count.textContent = '';
-  state.signature = null;
+// In memory only, per session and view: what was last read, shown at once while a read refreshes it.
+type Entry = { view?: View; count: string; at: number; inflight: boolean; wanted: boolean };
+const cache = new Map<string, Entry>();
+const entryOf = (state: Mounted, id: string): Entry => {
+  const key = `${id}|${state.section.id}`;
+  let entry = cache.get(key);
+  if (!entry) cache.set(key, (entry = { count: '', at: 0, inflight: false, wanted: false }));
+  return entry;
+};
+let shown: string | null = null;
+
+/** Asks for a read of `state` for the open session; the poll starts it once the rate limit allows. */
+function request(state: Mounted) {
+  if (!session) return;
+  entryOf(state, session.id).wanted = true;
+  refresh(state);
 }
 
-/** Paints the active tab for the open session. `fresh`: start from a spinner. */
-function show(fresh: boolean) {
-  clearInterval(pollTimer);
-  pollTimer = undefined;
+function refresh(state: Mounted) {
+  if (!session || document.visibilityState !== 'visible') return;
+  const forSession = session;
+  const entry = entryOf(state, forSession.id);
+  if (entry.inflight || !(state.section.polled || entry.wanted)) return;
+  if (Date.now() - entry.at < state.section.minMs) return;
+  entry.inflight = true;
+  entry.wanted = false;
+  void state.section
+    .fetch(forSession)
+    .then((view) => {
+      entry.view = view;
+    })
+    .catch(() => {
+      // Keep what is shown; with nothing yet, say the service does not answer.
+      entry.view ??= { empty: [m.sections[state.section.id], m.empty.unreachable] };
+    })
+    .finally(() => {
+      entry.inflight = false;
+      entry.at = Date.now();
+      if (state === active && session?.id === forSession.id) render(false);
+    });
+}
+
+/** Runs every 2 s while visible: the cheap views read again, an asked-for one once its limit has passed. */
+function tick() {
+  for (const state of mounted) refresh(state);
+}
+
+function ensurePoll() {
+  pollTimer ??= setInterval(tick, POLL_MS);
+}
+
+/** Paints the active tab from the cache, or the empty layout before the first answer. `reset`: repaint even if unchanged. */
+function render(reset: boolean) {
   if (!session) {
-    active.request++;
-    paintEmpty(active, m.empty.noSession);
-    return;
-  }
-  void load(active, session, fresh);
-  if (active.section.polled) pollTimer = setInterval(refreshPolled, POLL_MS);
-}
-
-function refreshPolled() {
-  if (!session || !active.section.polled || document.visibilityState !== 'visible') return;
-  void load(active, session, false);
-}
-
-async function load(state: Mounted, forSession: SessionSnapshot, fresh: boolean) {
-  const request = ++state.request;
-  // A new session or tab starts on a spinner; the same one keeps its numbers until the new ones arrive.
-  if (fresh || !content.hasChildNodes()) {
-    state.signature = null;
+    shown = null;
+    active.count.textContent = '';
     content.replaceChildren();
-    mountSpinner(content, { size: 'sm', label: state.section.loading(m) });
-  }
-  let view: View;
-  try {
-    view = await state.section.fetch(forSession);
-  } catch {
-    view = { empty: [m.sections[state.section.id], m.empty.unreachable] };
-  }
-  if (request !== state.request || state !== active) return;
-  if ('empty' in view) {
-    paintEmpty(state, view.empty);
+    mountEmpty(content, { title: m.empty.noSession[0], body: m.empty.noSession[1] });
     return;
   }
-  // An unchanged answer is not repainted, so the page neither flickers nor loses its scroll.
-  if (view.signature !== '' && view.signature === state.signature && content.hasChildNodes()) return;
-  state.signature = view.signature || null;
+  const entry = entryOf(active, session.id);
+  const view = entry.view;
+  if (!view) {
+    shown = `${session.id}|${active.section.id}|blank`;
+    content.replaceChildren(...active.section.skeleton.map((rem) => {
+      const bar = el('div', 'cx-skel');
+      bar.style.height = `${rem}rem`;
+      return bar;
+    }));
+    active.count.textContent = '';
+    return;
+  }
+  const signature = `${session.id}|${active.section.id}|${'empty' in view ? JSON.stringify(view.empty) : view.signature}`;
+  if (!reset && signature === shown) return;
+  shown = signature;
   content.replaceChildren();
-  state.count.textContent = view.draw(content) ?? '';
-}
-
-function paintEmpty(state: Mounted, [title, body]: [string, string?]) {
-  state.signature = null;
-  state.count.textContent = '';
-  content.replaceChildren();
-  mountEmpty(content, body ? { title, body } : { title });
+  if ('empty' in view) {
+    entry.count = '';
+    mountEmpty(content, view.empty[1] ? { title: view.empty[0], body: view.empty[1] } : { title: view.empty[0] });
+  } else {
+    entry.count = view.draw(content) ?? '';
+  }
+  active.count.textContent = entry.count;
 }
 
 boot();

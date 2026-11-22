@@ -24,9 +24,12 @@ tabs; future omp-only views are an entry in `SECTIONS` (`status/main.ts`), a ser
 | **Tasks** | omp's todo list, drawn like the rows of the Tasks section of OpenChamber's work-status panel: open tasks first, cancelled hidden. | `GET /api/session-todos/:sessionId?directory=` |
 | **Context** | How full the context window is, like Claude Code's `/context`: omp's categories, compaction threshold, cache warmth, history curve. Refreshes when the session's busy state changes. | `GET /api/omp/context/:sessionId?breakdown=1&directory=` |
 
-Goal and Tasks change mid-turn and the extension SDK has no event for them, so the panel polls the open one every 2 s
-while it is visible (and re-reads on a session or busy change); an unchanged answer is not repainted. The Tasks tab
-shows `done/total` next to its name.
+Every view is cached in memory per session (never on disk) and shown at once; a read refreshes it in the background
+(stale-while-revalidate), at most one in flight per view, and nothing blocks on a fetch. Before the first answer the tab
+draws its empty layout, with no spinner. Goal and Tasks change mid-turn and the extension SDK has no event for them, so
+the panel re-reads them every 2 s while it is visible. Context (omp's inspection takes seconds) is read when its tab
+opens or the session's busy state changes, and no more often than every 12 s per session. An unchanged answer is not
+repainted. The Tasks tab shows `done/total` next to its name.
 
 ## What changed from upstream
 

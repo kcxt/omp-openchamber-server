@@ -367,6 +367,7 @@ export const STYLES = `
   .cx-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cx-tab-count { font-size: 0.7rem; font-variant-numeric: tabular-nums; font-weight: 400; }
   .cx-content { display: flex; flex-direction: column; gap: 0.75rem; }
+  .cx-skel { border-radius: 8px; background: color-mix(in srgb, var(--oc-muted) 8%, transparent); }
 
   @media (prefers-reduced-motion: reduce) { .cx-chevron::before, .cx-block { transition: none; } }
 `;
