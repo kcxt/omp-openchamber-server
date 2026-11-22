@@ -4,7 +4,22 @@ HTTP/SSE sidecar that lets [OpenChamber](https://github.com/OpenChamber/OpenCham
 
 ## Setup
 
-The sidecar needs the **patched omp from the `local` branch** of your oh-my-pi checkout (upstream plus patches P1–P6, `get_context_breakdown` and idle maintenance for RPC sessions; see [`docs/architecture.md`](./docs/architecture.md#omp-patches) and [`docs/omp-protocol.md`](./docs/omp-protocol.md) §11). A stock upstream release lacks them: client message ids, the lease-claiming session open, idle recap, `resume`, `omp session inspect` and the context breakdown do not work. Build that branch and point the sidecar at the binary with `--binary` (or `OMP_BIN`); the systemd launcher `bin/omp-server` uses `$OMP_BIN`, default `~/bin/omp`.
+The sidecar needs the **patched omp fork**, branch [`casey/feat/openchamber-bridge`](https://github.com/kcxt/oh-my-pi/tree/casey/feat/openchamber-bridge) of `kcxt/oh-my-pi` (upstream plus patches P1–P6, `get_context_breakdown` and idle maintenance for RPC sessions; see [`docs/architecture.md`](./docs/architecture.md#omp-patches) and [`docs/omp-protocol.md`](./docs/omp-protocol.md) §11). A stock upstream release lacks them: client message ids, the lease-claiming session open, idle recap, `resume`, `omp session inspect` and the context breakdown do not work.
+
+### Install the omp fork
+
+Prerequisites: [Bun](https://bun.sh), a Rust toolchain (builds the native addon; `rustup` picks the pinned version from `rust-toolchain.toml`), and `git`.
+
+```bash
+git clone --branch casey/feat/openchamber-bridge https://github.com/kcxt/oh-my-pi.git
+cd oh-my-pi
+bun setup        # installs workspaces, builds @oh-my-pi/pi-natives, links `omp` into Bun's global bin
+omp --version
+```
+
+`bun setup` links `packages/coding-agent/scripts/omp` (a launcher that runs the checkout's TypeScript source) as `omp` in `~/.bun/bin`; make sure that directory is on `PATH`, or symlink the launcher yourself (e.g. `ln -s "$PWD/packages/coding-agent/scripts/omp" ~/bin/omp`). Update with `git pull && bun install`, plus `bun run build:native` when Rust crates or `packages/natives` changed. Nix users: `nix develop` first, then `bun setup`.
+
+Point the sidecar at the binary with `--binary` (or `OMP_BIN`); the systemd launcher `bin/omp-server` uses `$OMP_BIN`, default `~/bin/omp`.
 
 ## Run
 
