@@ -79,67 +79,28 @@ describe("one busy period per omp run", () => {
   });
 });
 
-describe("pending inbox", () => {
-  test("a steer omp has not read yet is listed by GET /inbox until it is delivered", async () => {
-    stack.script([
-      { when: "long run", steps: [{ text: "working " }, { sleep: 2_500 }, { text: "done" }] },
-      { when: "steer me", steps: [{ text: "steered" }] },
-    ]);
-    const id = await createSession();
-    await prompt(id, { id: "msg_runtimeC0001", parts: [{ type: "text", text: "long run" }] });
-    const rec = await record();
-    await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
-    await prompt(id, { id: "msg_runtimeC0002", parts: [{ type: "text", text: "steer me" }], delivery: "steer" });
-    await Bun.sleep(200);
-
-    const pending = (await stack.http(`/session/${id}/inbox?${dir()}`)).body.data as any[];
-    expect(pending.map((item) => [item.id, item.delivery, item.payload.text])).toEqual([["msg_runtimeC0002", "steer", "steer me"]]);
-
-    await rec.until("the steer to be read", () => rec.of(id, "session.inbox.delivered").some((e) => e.data.inboxID === "msg_runtimeC0002"), 10_000);
-    await rec.stop();
-    expect(((await stack.http(`/session/${id}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
-  });
-});
-
-describe("omp dies with messages queued", () => {
-  test("their pending bubbles are cancelled: nothing will read them", async () => {
-    stack.script([{ when: "dies soon", steps: [{ text: "about to die " }, { sleep: 1_500 }, { crash: true }] }]);
-    const id = await createSession();
-    const rec = await record();
-    await prompt(id, { id: "msg_runtimeE0001", parts: [{ type: "text", text: "dies soon" }] });
-    await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
-    await prompt(id, { id: "msg_runtimeE0002", parts: [{ type: "text", text: "steer into the void" }], delivery: "steer" });
-    await prompt(id, { id: "msg_runtimeE0003", parts: [{ type: "text", text: "follow into the void" }], delivery: "queue" });
-    await rec.until("the child to die and its bubbles to go", () => rec.of(id, "session.inbox.cancelled").length >= 2, 10_000);
-    await rec.stop();
-    expect(rec.of(id, "session.inbox.cancelled").map((e) => e.data.inboxID).sort()).toEqual(["msg_runtimeE0002", "msg_runtimeE0003"]);
-  });
-});
-
 describe("Esc", () => {
-  test("with queued input: the queue is sent again right after the run stops, under the ids the client shows", async () => {
+  test("with queued input: the withdrawn text comes back unsent and the session goes idle", async () => {
     stack.script([{ when: "hold on", steps: [{ text: "holding " }, { sleep: 20_000 }, { text: "never" }] }]);
     const id = await createSession();
     const rec = await record();
     await prompt(id, { id: "msg_runtimeB0001", parts: [{ type: "text", text: "hold on" }] });
     await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
-    await prompt(id, { id: "msg_runtimeB0002", parts: [{ type: "text", text: "steer one" }], delivery: "steer" });
-    await prompt(id, { id: "msg_runtimeB0003", parts: [{ type: "text", text: "queued one" }], delivery: "queue" });
+    await prompt(id, { id: "msg_runtimeB0002", parts: [{ type: "text", text: "queued one" }], delivery: "queue" });
     await Bun.sleep(200);
 
     const res = await stack.http(`/session/${id}/interrupt?${dir()}`, { method: "POST" });
     expect(res.body.interrupted).toBe(true);
-    expect(res.body.withdrawn).toEqual({ steering: [], followUp: [] });
-    await rec.until("both messages delivered", () => rec.of(id, "session.inbox.delivered").length >= 2, 10_000);
-    await rec.until("the resumed run to finish", () => rec.of(id, "session.execution.succeeded").length > 0, 10_000);
+    expect(res.body.withdrawn).toEqual({ steering: [], followUp: ["queued one"] });
+    await rec.until("idle", () => rec.ended(id).length > 0, 6_000);
     await rec.stop();
 
-    expect(rec.of(id, "session.inbox.cancelled")).toEqual([]);
-    expect(rec.of(id, "session.inbox.delivery.changed").map((e) => [e.data.inboxID, e.data.delivery])).toEqual([["msg_runtimeB0002", "queue"]]);
-    expect(rec.of(id, "session.inbox.delivered").map((e) => e.data.inboxID)).toEqual(["msg_runtimeB0001", "msg_runtimeB0002", "msg_runtimeB0003"]);
+    expect(rec.of(id, "session.inbox.cancelled").map((e) => e.data.inboxID)).toEqual(["msg_runtimeB0002"]);
+    expect((await statusMap())[id]).toBeUndefined();
     expect(stack.frames().some((f) => f.type === "abort_and_restore_queue")).toBe(true);
+    // The withdrawn message never reached omp's transcript.
     const messages = (await stack.http(`/session/${id}/message?${dir()}&order=asc`)).body.data as any[];
-    expect(messages.filter((m) => m.type === "user").map((m) => m.text)).toEqual(["hold on", "steer one", "queued one"]);
+    expect(messages.filter((m) => m.type === "user").map((m) => m.text)).toEqual(["hold on"]);
   });
 
   test("while a background subagent runs: the parent goes idle, the child session stays busy", async () => {
@@ -242,62 +203,5 @@ describe("streaming latency", () => {
     // Batching would show up as runs of near-zero gaps; spacing follows the stub's tick.
     expect(gaps.filter((gap) => gap >= TICK_MS / 2).length).toBeGreaterThanOrEqual(Math.floor(gaps.length * 0.8));
     expect(deltas.at(-1)!.at - deltas[0]!.at).toBeGreaterThanOrEqual((deltas.length - 1) * TICK_MS * 0.6);
-  });
-});
-
-// Last: it cancels a subagent, and the Esc tests above assert no `cancel_subagent` frame was ever sent.
-describe("pending inbox, subagent", () => {
-  test("a steer to a subagent is pending (and listed after a reload) until the subagent reads it", async () => {
-    stack.script([{
-      when: "delegate",
-      steps: [
-        { tool: "task", args: { name: "Reader", task: "work a while" }, subagent: { steps: [{ text: "working" }, { sleep: 2_500 }] } } as any,
-        { text: "delegated" },
-      ],
-    }]);
-    const id = await createSession();
-    const rec = await record();
-    await prompt(id, { parts: [{ type: "text", text: "delegate it" }] });
-    await rec.until("the subagent to run", async () => (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.length > 0);
-    const [job] = (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data;
-    const child = job.childSessionID as string;
-
-    await rec.until("the child session to exist", async () => (await stack.http(`/session/${child}?${dir()}`)).status === 200);
-    await prompt(child, { id: "msg_runtimeD0001", parts: [{ type: "text", text: "look at b.c" }], delivery: "steer" });
-    await Bun.sleep(200);
-    expect(rec.of(child, "session.inbox.enqueued").map((e) => [e.data.inboxID, e.data.item.delivery])).toEqual([["msg_runtimeD0001", "steer"]]);
-    expect(rec.of(child, "session.inbox.delivered")).toEqual([]);
-    const pending = (await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[];
-    expect(pending.map((item) => [item.id, item.payload.text])).toEqual([["msg_runtimeD0001", "look at b.c"]]);
-
-    await rec.until("the subagent to read the steer", () => rec.of(child, "session.inbox.delivered").length > 0, 10_000);
-    await rec.stop();
-    expect(rec.of(child, "session.inbox.delivered").map((e) => e.data.inboxID)).toEqual(["msg_runtimeD0001"]);
-    expect(rec.of(child, "session.inbox.cancelled")).toEqual([]);
-    expect(((await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
-  });
-
-  test("a steer the subagent never reads is cancelled when it ends", async () => {
-    stack.script([{
-      when: "delegate",
-      steps: [
-        { tool: "task", args: { name: "Stopper", task: "hang" }, subagent: { steps: [{ text: "working" }, { hang: true }] } } as any,
-        { text: "delegated" },
-      ],
-    }]);
-    const id = await createSession();
-    const rec = await record();
-    await prompt(id, { parts: [{ type: "text", text: "delegate it" }] });
-    await rec.until("the subagent to run", async () => (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.some((job: any) => job.childSessionID));
-    const job = (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.find((entry: any) => entry.childSessionID);
-    const child = job.childSessionID as string;
-    await rec.until("the child session to exist", async () => (await stack.http(`/session/${child}?${dir()}`)).status === 200);
-    await prompt(child, { id: "msg_runtimeD0002", parts: [{ type: "text", text: "never read" }], delivery: "steer" });
-    await Bun.sleep(300);
-    expect((await stack.http(`/session/${child}/abort?${dir()}`, { method: "POST" })).body).toBe(true);
-    await rec.until("the child to go idle", () => rec.ended(child).length > 0);
-    await rec.stop();
-    expect(rec.of(child, "session.inbox.cancelled").map((e) => e.data.inboxID)).toEqual(["msg_runtimeD0002"]);
-    expect(((await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
   });
 });

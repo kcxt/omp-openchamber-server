@@ -288,7 +288,6 @@ const steering: QueueItem[] = [];
 const followUps: QueueItem[] = [];
 const tickets = new Set<Ticket>();
 const abortWaiters: Array<() => void> = [];
-const restoredEntry = (q: QueueItem) => ({ text: q.text, ...(q.hostMessageId ? { hostMessageId: q.hostMessageId } : {}) });
 const queueSize = () => steering.length + followUps.length;
 const isSettled = () => !busy && queueSize() === 0 && asyncJobs === 0 && !goalScheduled;
 const queueUpdate = () => out({ type: "queue_update", steering: steering.map((q) => q.text), followUp: followUps.map((q) => q.text), liveSteered: 0 });
@@ -640,8 +639,7 @@ async function runAgent(ticket: Ticket | undefined, text: string, first: FirstOp
 // stream carries `subagent_lifecycle`, `subagent_progress` and (at level "events") `subagent_event`.
 let subIndex = 0;
 let asyncSeq = 0;
-const subagents = new Map<string, { snapshot: any; cancel: () => void; resume: (hostMessageId?: string) => void; steer: (message: string, hostMessageId?: string) => void; queued: () => string[] }>();
-const subagentModels = new Map<string, string>();
+const subagents = new Map<string, { snapshot: any; cancel: () => void; resume: (hostMessageId?: string) => void }>();
 /** Finished subagents stay registered: `resume` revives them from their transcript, as omp's lifecycle manager does. */
 const finishedSubagents = new Map<string, { call: any; sessionFile: string; index: number }>();
 async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
@@ -668,19 +666,6 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
   const interrupted = () => cancelled || resumeReq !== undefined;
   const nap = async (ms: number) => { const end = Date.now() + ms; while (Date.now() < end && !interrupted()) await sleep(Math.min(25, end - Date.now())); };
   let toolCount = 0;
-  // Steers (steer_subagent) wait for the next turn boundary, as in omp; the subagent then reads them as its user.
-  const steers: Array<{ message: string; hostMessageId?: string }> = [];
-  const readSteers = () => {
-    for (const { message, hostMessageId } of steers.splice(0)) {
-      ev({ type: "turn_start" });
-      const steered = { role: "user", content: [{ type: "text", text: message }], attribution: "user", timestamp: Date.now(), ...(hostMessageId ? { hostMessageId } : {}) };
-      ev({ type: "message_start", message: steered }); subAppend(steered); ev({ type: "message_end", message: steered }); msgs.push(steered);
-      const reply = { role: "assistant", content: [{ type: "text", text: "acknowledged" }], api: "stub", provider: model.provider, model: model.id, usage: usage(10), stopReason: "stop", timestamp: Date.now() };
-      ev({ type: "message_start", message: { ...reply, content: [] } });
-      ev({ type: "message_end", message: reply }); subAppend(reply); msgs.push(reply);
-      ev({ type: "turn_end", message: reply, toolResults: [] });
-    }
-  };
   const progress: any = { index, id, agent: "task", agentSource: "bundled", status: "running", task, assignment, recentTools: [], recentOutput: [], toolCount: 0, requests: 0, tokens: 0, cost: 0, durationMs: 0 };
   const snapshot = () => ({ id, index, agent: "task", agentSource: "bundled", description: assignment, status: progress.status, task, assignment, sessionFile, lastUpdate: Date.now(), progress: { ...progress }, parentToolCallId: call.id });
   const lifecycle = (status: string) => { if (subLevel !== "off") out({ type: "subagent_lifecycle", payload: { id, agent: "task", parentToolCallId: call.id, detached: true, agentSource: "bundled", status, sessionFile, index } }); };
@@ -692,8 +677,6 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
   subagents.set(id, {
     snapshot: snapshot(),
     cancel: () => { cancelled = true; },
-    steer: (message, hostMessageId) => { steers.push({ message, hostMessageId }); },
-    queued: () => steers.map((held) => held.message),
     resume: (hostMessageId) => {
       resumeReq = { hostMessageId };
       if (hostMessageId) subJournal("custom", { customType: "host-resume", data: { hostMessageId, text: "." } });
@@ -752,7 +735,6 @@ async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
     ev({ type: "turn_end", message: reply, toolResults: [] });
     lastText = "ok";
   }
-  if (!cancelled) readSteers();
   ev({ type: "agent_end", messages: msgs, yielded: true });
   const status = cancelled ? "aborted" : "completed";
   progress.status = status; progress.requests = subEntries.filter((e) => e.message?.role === "assistant").length; progress.tokens = progress.requests * 110;
@@ -1027,22 +1009,8 @@ async function handle(frame: any): Promise<void> {
         if (sub) sub.cancel();
         return respond(id, type, { cancelled: !!sub });
       }
-      case "set_subagent_model": {
-        if (!subagents.has(String(frame.subagentId))) return fail(id, type, `Subagent not found: ${String(frame.subagentId)}`);
-        if (!MODELS.some((x) => x.provider === frame.provider && x.id === frame.modelId)) return fail(id, type, `Model not found: ${frame.provider}/${frame.modelId}`);
-        subagentModels.set(String(frame.subagentId), `${frame.provider}/${frame.modelId}${frame.level ? `:${frame.level}` : ""}`);
-        return respond(id, type);
-      }
-      case "get_queued_prompts": {
-        if (frame.subagentId === undefined) return respond(id, type, { steering: steering.map(restoredEntry), followUp: followUps.map(restoredEntry) });
-        const target = subagents.get(String(frame.subagentId));
-        if (!target) return fail(id, type, `Subagent not running: ${String(frame.subagentId)}`);
-        return respond(id, type, { steering: target.queued().map((text) => ({ text })), followUp: [] });
-      }
       case "steer_subagent": {
-        const target = subagents.get(String(frame.subagentId));
-        if (!target) return fail(id, type, `Subagent refused the message: unknown subagent ${String(frame.subagentId)}`);
-        target.steer(String(frame.message), frame.hostMessageId);
+        if (!subagents.has(String(frame.subagentId))) return fail(id, type, `Subagent refused the message: unknown subagent ${String(frame.subagentId)}`);
         return respond(id, type);
       }
       case "get_session_stats": return respond(id, type, { tokens: { input: 100, output: 10, total: 110 }, cost: 0 });
@@ -1155,7 +1123,7 @@ async function handle(frame: any): Promise<void> {
         return;
       }
       case "abort_and_restore_queue": {
-        const restored = { steering: steering.splice(0).map(restoredEntry), followUp: followUps.splice(0).map(restoredEntry) };
+        const restored = { steering: steering.splice(0).map((q) => ({ text: q.text })), followUp: followUps.splice(0).map((q) => ({ text: q.text })) };
         queueUpdate();
         if (goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
         if (!busy) return respond(id, type, restored);

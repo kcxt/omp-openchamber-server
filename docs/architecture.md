@@ -77,13 +77,11 @@ Busy is the **parent's own work**: `active` from an accepted prompt or `agent_st
 
 ### Abort
 
-Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagents stop, queued steer/follow-up text is sent again once the run has stopped (same ids; a steer becomes a follow-up), and only what cannot be sent again is returned in the `/interrupt` response (`withdrawn`) with its inbox bubbles cancelled. The runtime then waits for the run to stop (`agent_end`, or `get_state.isStreaming === false`), bounded by `ABORT_DEADLINE_MS` (5 s); past the deadline the child's process group is killed, state becomes `closed` and idle is published with `aborted: true`. The next prompt starts a fresh child on the same transcript. Background subagents keep running by design.
+Esc sends `abort_and_restore_queue`: the parent run and its synchronous subagents stop, queued steer/follow-up text is withdrawn and returned in the `/interrupt` response (`withdrawn`), and its inbox bubbles are cancelled. The runtime then waits for the run to stop (`agent_end`, or `get_state.isStreaming === false`), bounded by `ABORT_DEADLINE_MS` (5 s); past the deadline the child's process group is killed, state becomes `closed` and idle is published with `aborted: true`. The next prompt starts a fresh child on the same transcript. Background subagents keep running by design.
 
 ### Child lifetime
 
-A child is released after `OC_CHILD_IDLE_MS` once it is `idle`, `get_state.isSettled === true`, and omp owes no idle maintenance (`get_state.idleMaintenance` absent, P4), so omp's idle recap and idle compaction always run first. Unreadable state keeps the child. A crash ends the active stretch with an error turn and goes idle, and cancels the inbox bubbles of messages that were queued in the dead child.
-
-The queue itself is omp's: `get_queued_prompts` lists it (with the client id omp stores on each queued message), `abort_and_restore_queue` returns it, and a sidecar that adopts a running child reads the ids back from it. The runtime keeps only the ids it announced (`#undelivered`), to cancel them when the child dies; a subagent entry keeps the same list for its steers.
+A child is released after `OC_CHILD_IDLE_MS` once it is `idle`, `get_state.isSettled === true`, and omp owes no idle maintenance (`get_state.idleMaintenance` absent, P4), so omp's idle recap and idle compaction always run first. Unreadable state keeps the child. A crash ends the active stretch with an error turn and goes idle.
 
 ## omp layer (`src/omp/`)
 

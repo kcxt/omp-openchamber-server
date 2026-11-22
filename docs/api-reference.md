@@ -474,11 +474,6 @@ close that omp.
   client id. On a subagent session `.` resumes that subagent.
 - A prompt to a subagent session goes to its parent's runtime: `steer_subagent`
   while it runs, otherwise `409` (send `.` to resume it, or prompt the parent).
-  It is announced like any prompt (`session.inbox.enqueued`), stays pending until the
-  subagent reads it (`session.inbox.delivered`; the steer carries the client id, which omp
-  stores on the subagent's user message), is listed by the subagent session's `GET /inbox`
-  meanwhile, and is cancelled (`session.inbox.cancelled`) when the subagent ends or is
-  stopped first. A sidecar restart forgets which steers a subagent still holds.
 - A body starting with `/aside <question>` is a side question (below).
 - `credentials` / `credentialRef`: see "Caller-owned credentials".
 
@@ -508,13 +503,9 @@ Esc. `interrupt` answers `{ "interrupted": boolean, "withdrawn"?: { "steering": 
 the legacy `abort` answers a bare boolean.
 
 The sidecar sends omp's `abort_and_restore_queue`: the parent run and its
-synchronous subagents stop. Queued steer/follow-up messages are not dropped: once
-the run has stopped they are **sent again** to omp, oldest first, under the ids
-the client already shows. The first starts the next run, the rest follow it, and a
-queued steer becomes a follow-up (`session.inbox.delivery.changed`, `delivery:
-"queue"`). `withdrawn` lists only what could not be sent again (omp refused it or
-the child is gone); those inbox bubbles are cancelled
-(`session.inbox.cancelled`). It waits until the run has
+synchronous subagents stop, and queued steer/follow-up text is **withdrawn**: it
+is returned in `withdrawn`, its inbox bubbles are cancelled
+(`session.inbox.cancelled`), and it is not re-sent. It waits until the run has
 stopped, bounded by 5 s; past that the omp child is killed, idle is published
 with `aborted: true`, and the next prompt starts a fresh child on the same
 transcript. Background subagents keep running; stop one by sending the abort to
@@ -718,7 +709,7 @@ instead of failing on a missing route.
 |---|---|---|
 | `/fs/directory-stats` | `POST` | `{ "results": [{ "path", "isDirectory", "reason"?, "realPath"? }] }` for a `{ "paths": [...] }` body. `reason` is `not-found`, `not-directory`, or `unavailable`; the client maps the first two to "missing". |
 | `/session-todos/:id` | `GET` | `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`, read from omp's todo state in the transcript. |
-| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items, plus the prompts the session's omp holds but has not read yet (a steer waiting for a step boundary, a follow-up). omp lists them (`get_queued_prompts`), so a reload sees what is really queued; the bubble text is what the user typed when the sidecar recorded it, else omp's text, and attachments come back as images only. |
+| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items in the prompt-payload shape the client seeds as optimistic user messages. |
 | `/session/:id/inbox/:itemId` | `DELETE` | `204` — cancels a queued prompt. |
 | `/session/:id/inbox/:itemId` | `PATCH` | `409` — delivery mode is chosen by the prompt request, not by a queued item. |
 | `/session/:id/view` | `POST` | `204` — records `time.viewed` from the `idle` timestamp and emits `session.viewed`. |

@@ -28,7 +28,6 @@ import {
   emitSessionStatus,
   emitSessionUpdated,
 } from "../shared/sse";
-import { makeMessageId } from "./prompt-input";
 import { TurnTranslator, type OmpFrame } from "./turn-translator";
 import { AsideStream } from "./aside";
 import type { BtwTopic } from "../omp/btw-history";
@@ -59,23 +58,11 @@ export interface PromptInput {
   delivery?: "steer" | "queue";
 }
 
-/** One queued prompt `abort_and_restore_queue` took back. */
-interface WithdrawnItem {
-  /** The id the client announced it under (omp stores it on the queued message). */
-  hostMessageId?: string;
-  message: string;
-  images?: ImageContent[];
-  /** How the client queued it. */
-  delivery: "steer" | "queue";
-}
-
-/** Queued input `abort_and_restore_queue` withdrew and the sidecar could not send again, with the inbox ids to cancel. */
+/** Queued input `abort_and_restore_queue` withdrew, with the inbox ids it was announced under. */
 export interface Withdrawn {
   steering: string[];
   followUp: string[];
   inboxIDs: string[];
-  /** Internal: what {@link SessionRuntime.abort} sends again once the run has stopped. */
-  items?: WithdrawnItem[];
 }
 
 export type SubagentStatus = "running" | "completed" | "failed" | "aborted";
@@ -120,8 +107,6 @@ interface SubagentEntry extends SubagentInfo {
   /** Settles once `childSessionId` is known. */
   resolved?: Promise<void>;
   failure?: string;
-  /** Inbox ids of steers sent to the subagent that it has not read yet, oldest first: all that is left to cancel when it ends. */
-  pending: string[];
 }
 
 /** How long Esc waits for the parent run to stop before the child is killed (§3.4). */
@@ -171,17 +156,8 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function restored(value: unknown): Array<{ text: string; images?: ImageContent[]; hostMessageId?: string }> {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    const entry = record(item);
-    if (typeof entry?.text !== "string") return [];
-    return [{
-      text: entry.text,
-      ...(Array.isArray(entry.images) ? { images: entry.images as ImageContent[] } : {}),
-      ...(typeof entry.hostMessageId === "string" && entry.hostMessageId ? { hostMessageId: entry.hostMessageId } : {}),
-    }];
-  });
+function texts(value: unknown): string[] {
+  return Array.isArray(value) ? value.flatMap((item) => typeof record(item)?.text === "string" ? [record(item)!.text as string] : []) : [];
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -384,7 +360,7 @@ export class SessionRuntime {
     if (this.#state !== "active") {
       // Nothing of the parent's runs; a queue an earlier abort stranded is still withdrawn.
       const data = await this.#child.request("abort_and_restore_queue", {}).catch(() => undefined);
-      return this.#resend(this.#withdrawn(data));
+      return this.#withdrawn(data);
     }
     this.#setState("aborting");
     const deadline = Date.now() + ABORT_DEADLINE_MS;
@@ -404,68 +380,14 @@ export class SessionRuntime {
     } catch (err) {
       promptLogger.error({ err, sessionID: this.sessionId }, "[abort] the parent run did not stop; killing the omp child");
       this.close("abort");
-      this.#reportUnsent(withdrawn.items ?? []);
-      return { steering: withdrawn.steering, followUp: withdrawn.followUp, inboxIDs: withdrawn.inboxIDs.concat(withdrawn.items?.flatMap((item) => item.hostMessageId ? [item.hostMessageId] : []) ?? []) };
+      return withdrawn;
     }
     this.#awaitingRun = false;
     this.#due = false;
     this.#dueGeneration++;
     this.#undelivered = [];
     this.#setState(this.#runLive ? "active" : "idle", { aborted: true });
-    return this.#resend(withdrawn);
-  }
-
-  /**
-   * Esc stops the run, not the user's queued messages: what omp took back is sent again,
-   * oldest first, under the ids the client already shows. The first starts the next run and
-   * the rest follow it, so a steer that never reached a step boundary becomes a follow-up
-   * (`session.inbox.delivery.changed`). Returns what could not be sent (the child is gone, or
-   * omp refused it); those inbox items are the caller's to cancel.
-   */
-  async #resend(withdrawn: Withdrawn): Promise<Withdrawn> {
-    const items = withdrawn.items ?? [];
-    const { items: _taken, ...rest } = withdrawn;
-    if (items.length === 0) return rest;
-    for (let sent = 0; sent < items.length; sent++) {
-      const item = items[sent]!;
-      const hostMessageId = item.hostMessageId ?? makeMessageId(this.sessionId);
-      try {
-        await this.prompt({ message: item.message, images: item.images, hostMessageId, delivery: "queue" });
-      } catch (err) {
-        this.#reportProblem(err, "could not send queued messages again after Esc");
-        const left = items.slice(sent);
-        this.#reportUnsent(left);
-        return {
-          steering: left.filter((entry) => entry.delivery === "steer").map((entry) => entry.message),
-          followUp: left.filter((entry) => entry.delivery === "queue").map((entry) => entry.message),
-          inboxIDs: left.flatMap((entry) => entry.hostMessageId ? [entry.hostMessageId] : []).concat(rest.inboxIDs),
-        };
-      }
-      if (item.delivery === "steer" && item.hostMessageId) {
-        emitOpenCodeV2Event("session.inbox.delivery.changed", { sessionID: this.sessionId, inboxID: item.hostMessageId, delivery: "queue" }, this.cwd);
-      }
-    }
-    // Everything was sent again: only ids the client showed with nothing behind them are left to cancel.
-    return { steering: [], followUp: [], inboxIDs: rest.inboxIDs };
-  }
-
-  /** Queued messages that cannot be sent again leave their bubbles; the text stays in the chat as an error so it can be copied. */
-  #reportUnsent(items: WithdrawnItem[]): void {
-    if (items.length === 0) return;
-    const texts = items.map((item) => `• ${item.message.length > 400 ? `${item.message.slice(0, 400)}…` : item.message}`).join("\n");
-    emitSessionError(this.sessionId, { message: `${items.length} queued message(s) were not sent and are gone:\n${texts}` }, this.cwd);
-  }
-
-  /**
-   * The prompts omp holds and has not read yet, listed by omp itself (`get_queued_prompts`) so a reload sees
-   * what is really queued. Only entries queued under a client id are listed: those are the ones OpenChamber shows.
-   */
-  async pendingInbox(): Promise<Array<{ id: string; delivery: "steer" | "queue"; text: string; images?: ImageContent[] }>> {
-    if (this.#state === "closed") return [];
-    const queued = record(await this.#child.request("get_queued_prompts", {}).catch(() => undefined));
-    return (["steer", "queue"] as const).flatMap((delivery) =>
-      restored(queued?.[delivery === "steer" ? "steering" : "followUp"]).flatMap((entry) =>
-        entry.hostMessageId ? [{ id: entry.hostMessageId, delivery, text: entry.text, ...(entry.images?.length ? { images: entry.images } : {}) }] : []));
+    return withdrawn;
   }
 
   /** Compacts the session through its own child. Refused while a run is live. */
@@ -622,47 +544,16 @@ export class SessionRuntime {
   // ------------------------------------------------------------------ subagents
 
   subagents(): SubagentInfo[] {
-    return [...this.#subagents.values()].map(({ translator: _t, buffered: _b, failure: _f, resolved: _r, pending: _p, ...info }) => info);
+    return [...this.#subagents.values()].map(({ translator: _t, buffered: _b, failure: _f, resolved: _r, ...info }) => info);
   }
 
   subagentByChild(childSessionId: string): SubagentInfo | undefined {
     return this.subagents().find((entry) => entry.childSessionId === childSessionId);
   }
 
-  /**
-   * Steers a subagent under the client's inbox id: omp stores it on the subagent's user message, so the
-   * subagent's stream acks it exactly (`session.inbox.delivered`). The id stays pending until then, and is
-   * cancelled when the subagent ends without reading it or omp refuses the steer.
-   */
-  async steerSubagent(subagentId: string, message: string, hostMessageId?: string): Promise<unknown> {
+  steerSubagent(subagentId: string, message: string): Promise<unknown> {
     this.#assertOpen();
-    const entry = this.#subagents.get(subagentId);
-    if (hostMessageId) entry?.pending.push(hostMessageId);
-    try {
-      return await this.#child.request("steer_subagent", { subagentId, message, ...(hostMessageId ? { hostMessageId } : {}) });
-    } catch (err) {
-      if (entry && hostMessageId) entry.pending = entry.pending.filter((id) => id !== hostMessageId);
-      throw err;
-    }
-  }
-
-  /** The model a subagent's session runs, as omp last reported it. */
-  subagentModel(childSessionId: string): ModelRef | undefined {
-    const entry = [...this.#subagents.values()].find((candidate) => candidate.childSessionId === childSessionId);
-    return entry?.translator ? { ...entry.translator.model } : undefined;
-  }
-
-  /**
-   * Steers a subagent has not read yet. omp lists what the subagent holds (texts only); the ids come from
-   * `pending`. A steer read but not yet acked has left omp's list, so the two are matched from the newest end.
-   */
-  async subagentPendingInbox(childSessionId: string): Promise<Array<{ id: string; delivery: "steer"; text: string }>> {
-    const entry = [...this.#subagents.values()].find((candidate) => candidate.childSessionId === childSessionId);
-    if (!entry || this.#state === "closed" || entry.pending.length === 0) return [];
-    const queued = record(await this.#child.request("get_queued_prompts", { subagentId: entry.id }).catch(() => undefined));
-    const texts = restored(queued?.steering).map((held) => held.text);
-    const ids = entry.pending.slice(Math.max(0, entry.pending.length - texts.length));
-    return ids.map((id, index) => ({ id, delivery: "steer" as const, text: texts[texts.length - ids.length + index]! }));
+    return this.#child.request("steer_subagent", { subagentId, message });
   }
 
   /**
@@ -753,12 +644,6 @@ export class SessionRuntime {
     this.#unsubscribe();
     this.#child.kill();
     clearSessionApprovals(this.sessionId);
-    // The queue died with the child: what the client still shows as pending will never be read.
-    if (reason === "crash" || reason === "abort") {
-      for (const inboxID of this.#undelivered.splice(0)) {
-        emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: this.sessionId, inboxID }, this.cwd);
-      }
-    }
     for (const entry of this.#subagents.values()) {
       if (entry.status === "running") this.#endChild(entry, "aborted");
     }
@@ -857,8 +742,6 @@ export class SessionRuntime {
       if (!sub || (sub.status !== "running" && sub.status !== "pending")) continue;
       this.#onSubagentFrame({ type: "subagent_lifecycle", payload: { id: sub.id, agent: sub.agent, description: sub.description, sessionFile: sub.sessionFile, status: "started" } } as OmpFrame);
     }
-    // The queue the previous sidecar left in omp: its ids are what a later Esc or crash has to answer for.
-    this.#undelivered = (await this.pendingInbox()).map((held) => held.id);
     this.#runLive = state.isStreaming === true;
     this.#state = "idle";
     for (const listener of this.#stateListeners) listener({ state: "idle", previous: "starting" });
@@ -1026,22 +909,11 @@ export class SessionRuntime {
    */
   #withdrawn(data: unknown): Withdrawn {
     const value = record(data);
-    const steering = restored(value?.steering);
-    const followUp = restored(value?.followUp);
-    const undelivered = this.#undelivered.splice(0);
-    if (steering.length + followUp.length === 0) return { steering: [], followUp: [], inboxIDs: undelivered };
-    const items: WithdrawnItem[] = [
-      ...steering.map((entry) => ({ hostMessageId: entry.hostMessageId, message: entry.text, images: entry.images, delivery: "steer" as const })),
-      ...followUp.map((entry) => ({ hostMessageId: entry.hostMessageId, message: entry.text, images: entry.images, delivery: "queue" as const })),
-    ];
-    // What omp returned is sent again; any other id the client still shows has nothing behind it.
-    const sendable = new Set(items.flatMap((item) => item.hostMessageId ? [item.hostMessageId] : []));
-    return {
-      steering: steering.map((entry) => entry.text),
-      followUp: followUp.map((entry) => entry.text),
-      inboxIDs: undelivered.filter((id) => !sendable.has(id)),
-      items,
-    };
+    const steering = texts(value?.steering);
+    const followUp = texts(value?.followUp);
+    if (steering.length + followUp.length === 0) return { steering, followUp, inboxIDs: [] };
+    const inboxIDs = this.#undelivered.splice(0);
+    return { steering, followUp, inboxIDs };
   }
 
   /**
@@ -1084,7 +956,7 @@ export class SessionRuntime {
       const description = typeof payload.description === "string" && payload.description.trim()
         ? payload.description.trim()
         : typeof payload.assignment === "string" && payload.assignment.trim() ? payload.assignment.trim().split("\n")[0]! : `Subagent (${agent})`;
-      entry = { id, agent, description, sessionFile, status: "running", startedAt: Date.now(), buffered: [], pending: [] };
+      entry = { id, agent, description, sessionFile, status: "running", startedAt: Date.now(), buffered: [] };
       this.#subagents.set(id, entry);
       entry.resolved = this.#resolveChild(entry);
     } else if (sessionFile && !entry.sessionFile) {
@@ -1116,13 +988,7 @@ export class SessionRuntime {
     const childId = toOpenCodeSessionId(ompId ?? entry.id);
     entry.childSessionId = childId;
     const model = this.#translator.model;
-    entry.translator = new TurnTranslator({
-      sessionId: childId,
-      cwd: this.cwd,
-      model,
-      fullForm: true,
-      host: { delivered: (id) => { entry.pending = entry.pending.filter((held) => held !== id); } },
-    });
+    entry.translator = new TurnTranslator({ sessionId: childId, cwd: this.cwd, model, fullForm: true });
     emitSessionCreated({
       id: childId,
       slug: childId,
@@ -1154,10 +1020,6 @@ export class SessionRuntime {
 
   #publishChildEnd(entry: SubagentEntry): void {
     const childId = entry.childSessionId!;
-    // A steer the subagent never read is not coming: its pending bubble goes away.
-    for (const inboxID of entry.pending.splice(0)) {
-      emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: childId, inboxID }, this.cwd);
-    }
     if (entry.status === "failed") {
       entry.translator?.finishRun(entry.failure ?? "Subagent failed", "error");
       emitSessionError(childId, { message: entry.failure ?? "Subagent failed" }, this.cwd);

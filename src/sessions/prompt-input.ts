@@ -339,18 +339,21 @@ export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<Prep
       return source ? [toV2FileAttachment({ uri: source, mime, ...(typeof value.filename === "string" ? { name: value.filename } : {}) })] : [];
     }),
   ];
-  const item = {
-    type: "user",
-    delivery: body.delivery ?? "queue",
-    payload: {
-      text: prompt.visibleText,
-      files: filePayload,
-      ...(body.agents ? { agents: body.agents } : {}),
-      ...(body.skills ? { skills: body.skills } : {}),
-      ...(body.metadata ? { metadata: body.metadata } : {}),
+  emitOpenCodeV2Event("session.inbox.enqueued", {
+    sessionID: sessionId,
+    inboxID: messageID,
+    item: {
+      type: "user",
+      delivery: body.delivery ?? "queue",
+      payload: {
+        text: prompt.visibleText,
+        files: filePayload,
+        ...(body.agents ? { agents: body.agents } : {}),
+        ...(body.skills ? { skills: body.skills } : {}),
+        ...(body.metadata ? { metadata: body.metadata } : {}),
+      },
     },
-  };
-  emitOpenCodeV2Event("session.inbox.enqueued", { sessionID: sessionId, inboxID: messageID, item }, cwd);
+  }, cwd);
   emitMessageUpdated({
     info: {
       id: messageID,

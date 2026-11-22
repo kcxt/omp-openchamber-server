@@ -459,7 +459,7 @@ export class TurnTranslator {
       this.#emitTool(steer.id, "irc", steer.state);
       return;
     }
-    if (message?.role !== "user") return;
+    if (this.#fullForm || message?.role !== "user") return;
     if (message.synthetic === true || message.attribution === "assistant") return;
     const hostMessageId = typeof message.hostMessageId === "string" && message.hostMessageId
       ? message.hostMessageId
