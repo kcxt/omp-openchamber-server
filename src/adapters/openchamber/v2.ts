@@ -101,7 +101,7 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: openCodeToolName(part.tool) ?? part.tool,
+      name: openCodeToolName(part.tool, input) ?? part.tool,
       executed: true,
       state: {
         status: "completed" as const,
@@ -116,7 +116,7 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: openCodeToolName(part.tool) ?? part.tool,
+      name: openCodeToolName(part.tool, input) ?? part.tool,
       executed: true,
       state: {
         status: "error" as const,
@@ -132,7 +132,7 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
     return {
       type: "tool" as const,
       id: part.callID,
-      name: openCodeToolName(part.tool) ?? part.tool,
+      name: openCodeToolName(part.tool, input) ?? part.tool,
       executed: true,
       state: { status: "running" as const, input, metadata: state.metadata ?? {} },
       time: { created: time.start, ran: time.start },
@@ -141,7 +141,7 @@ function v2ToolContent(part: Extract<OpenCodePart, { type: "tool" }>) {
   return {
     type: "tool" as const,
     id: part.callID,
-    name: openCodeToolName(part.tool) ?? part.tool,
+    name: openCodeToolName(part.tool, input) ?? part.tool,
     executed: false,
     state: { status: "streaming" as const, input: JSON.stringify(input) },
     time: { created: time.start },

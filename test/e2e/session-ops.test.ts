@@ -91,6 +91,35 @@ describe("renaming", () => {
   });
 });
 
+describe("archiving and deleting", () => {
+  const listed = async (query = ""): Promise<string[]> =>
+    ((await stack.http(`/session?${dir()}${query}`)).body.data as any[]).map((s) => s.id);
+
+  test("OpenChamber's `{ archived }` patch hides the session until it is restored, and survives a restart of the list", async () => {
+    const id = await createSession();
+    await converse(id, "msg_opsarchive001", "a session to archive", 2);
+
+    expect((await stack.http(`/session/${id}?${dir()}`, { method: "PATCH", json: { archived: true } })).status).toBe(204);
+    expect(await listed()).not.toContain(id);
+    expect(await listed("&archived=true")).toContain(id);
+    expect((await stack.http(`/session/${id}?${dir()}`)).body.data.time.archived).toBeNumber();
+
+    expect((await stack.http(`/session/${id}?${dir()}`, { method: "PATCH", json: { archived: false } })).status).toBe(204);
+    expect(await listed()).toContain(id);
+    expect((await stack.http(`/session/${id}?${dir()}`)).body.data.time.archived).toBeUndefined();
+  });
+
+  test("a deleted session is gone from the list and its transcript, and stays gone", async () => {
+    const id = await createSession();
+    await converse(id, "msg_opsdelete0001", "a session to delete", 2);
+    expect((await stack.http(`/session/${id}?${dir()}`, { method: "DELETE" })).status).toBe(204);
+    expect(await listed()).not.toContain(id);
+    expect(await listed("&archived=true")).not.toContain(id);
+    expect((await stack.http(`/session/${id}?${dir()}`)).status).toBe(404);
+    expect(stack.sessionFiles().some((f) => JSON.stringify(f.records).includes("a session to delete"))).toBe(false);
+  });
+});
+
 describe("moving to another directory", () => {
   test("is omp's /move: same session, new directory, file in the new bucket", async () => {
     const id = await createSession();

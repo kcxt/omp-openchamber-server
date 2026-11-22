@@ -336,7 +336,8 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         const body = (await readJson(req)) as {
           title?: string;
           metadata?: Record<string, unknown>;
-          time?: { archived?: number | null };
+          /** OpenCode v2: archive or restore. The instant is the server's. */
+          archived?: boolean;
         } | undefined;
         const { session } = await resolveSessionRoute(openCodeId, dir);
         if (!session) return jsonError("session not found", 404);
@@ -344,7 +345,7 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         if (typeof body?.title === "string" && body.title !== session.title) await renameSession(session, body.title);
         const updated = await updateOmpSession(
           openCodeId,
-          { metadata: body?.metadata, time: body?.time },
+          { metadata: body?.metadata, ...(typeof body?.archived === "boolean" ? { time: { archived: body.archived ? Date.now() : null } } : {}) },
           dir,
         );
         if (!updated) return jsonError("session not found", 404);

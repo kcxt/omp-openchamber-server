@@ -2,9 +2,10 @@ import { mapOmpUsageToTokens, readTranscript, type TranscriptEntry } from "./tra
 import { SessionDocs, type SessionDocNotice } from "../store/session-docs";
 import { getOmpSessionByOpenCodeId } from "../store/sessions";
 import { editToolMetadata } from "../shared/edit-diff";
-import { normalizeToolInput, normalizeToolOutput } from "../shared/tool-normalize";
+import { normalizeToolInput, normalizeToolOutput, splitBashFailure } from "../shared/tool-normalize";
 import { timeHexFromTimestamp, timeHexOfMessageId } from "../shared/message-id";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool } from "./todo";
+import { ircMessageCard, parentIrcCard } from "./irc";
 import { resolveImageDataUrl } from "../shared/blobs";
 import type {
   OpenCodeMessageRecord,
@@ -154,6 +155,10 @@ export interface AgentMessage {
   error?: unknown;
   display?: boolean;
   attribution?: "user" | "assistant";
+  /** A `custom_message` entry's type (`irc:incoming`, …) and payload. */
+  customType?: string;
+  /** On a user message: the parent agent's steer, with the sender's own words (omp's IRC). */
+  parentIrc?: unknown;
   /** OpenChamber's client message id, stored on the user entry by omp (P1) or on a `host-resume` marker (P5). */
   hostMessageId?: string;
   /** The transcript entry this message came from. */
@@ -227,6 +232,14 @@ function developerToolPart(msg: AgentMessage, openCodeId: string): OpenCodeToolP
     messageID: "",
     sessionID: openCodeId,
   };
+}
+
+/** A message between agents (omp's IRC) as an `irc` tool card, or undefined for any other message. */
+function ircToolPart(msg: AgentMessage, openCodeId: string): OpenCodeToolPart | undefined {
+  const at = typeof msg.timestamp === "number" ? msg.timestamp : Date.now();
+  const card = msg.role === "user" ? parentIrcCard(msg.parentIrc, at) : msg.role === "custom" ? ircMessageCard(msg, at) : undefined;
+  if (!card) return undefined;
+  return { id: card.id, type: "tool", callID: card.id, tool: "irc", state: card.state, messageID: "", sessionID: openCodeId };
 }
 
 function createToolPart(
@@ -321,7 +334,9 @@ function mergeToolResultIntoAssistant(
   const isError = msg.isError === true || raw.is_error === true;
   target.state.status = isError ? "error" : "completed";
   if (isError) {
-    target.state.error = content;
+    const failure = (target.tool === "bash" || target.tool === "shell") ? splitBashFailure(content) : undefined;
+    target.state.error = failure?.error ?? content;
+    if (failure) target.state.output = failure.output;
   } else {
     target.state.output = normalizeToolOutput(target.tool, content, msg.details ?? raw.details);
     if (target.tool.toLowerCase() === "edit") {
@@ -652,11 +667,11 @@ export function mapRpcMessagesToOpenCodeRecords(
       records.push(...asideRecords(openCodeId, msg.aside));
       continue;
     }
-    if (msg.role === "developer") {
-      // omp's own directives (resume's continue, goal nudges) read as a tool card in the turn they drive.
-      const part = developerToolPart(msg, openCodeId);
-      if (lastAssistantRecord) lastAssistantRecord.parts.push({ ...part, messageID: lastAssistantRecord.info.id });
-      else pendingDeveloper.push(part);
+    const card = msg.role === "developer" ? developerToolPart(msg, openCodeId) : ircToolPart(msg, openCodeId);
+    if (card) {
+      // omp's own directives (resume's continue, goal nudges) and messages between agents read as a tool card in the turn they drive.
+      if (lastAssistantRecord) lastAssistantRecord.parts.push({ ...card, messageID: lastAssistantRecord.info.id });
+      else pendingDeveloper.push(card);
       continue;
     }
     const role = openCodeRoleFor(msg);
@@ -920,6 +935,19 @@ function agentMessagesOfBranch(branch: TranscriptEntry[], legacyNotices: Session
       const data = entry.data as Record<string, unknown> | undefined;
       if (typeof data?.text !== "string") continue;
       messages.push(noticeMessage(entryId, data.text, typeof data.level === "string" ? data.level : "info", timestampOf(entry.timestamp) ?? Date.now()));
+      continue;
+    }
+    // omp's IRC: a message another agent sent this session (`irc:incoming`, `irc:relay`, …).
+    if (entry.type === "custom_message" && typeof entry.customType === "string" && entry.customType.startsWith("irc:")) {
+      messages.push({
+        id: entryId,
+        entryId,
+        role: "custom",
+        customType: entry.customType,
+        display: entry.display !== false,
+        details: entry.details,
+        timestamp: timestampOf(entry.timestamp) ?? Date.now(),
+      });
       continue;
     }
     if (entry.type !== "message") continue;

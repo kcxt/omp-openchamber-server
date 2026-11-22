@@ -38,8 +38,9 @@ describe("a turn renders the way omp produced it", () => {
     await page.getByText("All done.").first().waitFor();
 
     // Tool card: command and output.
-    await page.getByText("Bash", { exact: true }).first().click();
-    await page.getByText("Command: ls -la").waitFor();
+    // The row is found by the command it shows, not by the tool's display name (OpenChamber's wording moves).
+    await page.getByText("ls -la", { exact: true }).first().click();
+    await page.getByText("Command: ls -la").or(page.getByText("ls -la").nth(1)).first().waitFor();
     await page.getByText("file-a.txt").waitFor();
     // Todo list in the side panel, with omp's statuses.
     await page.getByText("Run the tests", { exact: true }).waitFor();
@@ -50,7 +51,7 @@ describe("a turn renders the way omp produced it", () => {
     const [{ id }] = await sessions();
     const content = await blocks(id);
     expect(content.some((c) => c.type === "reasoning" && c.text.includes("list the files"))).toBe(true);
-    const bash = content.find((c) => c.type === "tool" && c.name === "bash");
+    const bash = content.find((c) => c.type === "tool" && c.name === "shell");
     expect(bash?.state.status).toBe("completed");
     expect(bash?.state.input.command).toBe("ls -la");
     expect(JSON.stringify(bash?.state.content)).toContain("file-a.txt");
@@ -62,6 +63,33 @@ describe("a turn renders the way omp produced it", () => {
     await page.reload();
     await page.getByText("All done.").first().waitFor();
     await page.getByText("Run the tests", { exact: true }).waitFor();
+  });
+
+  test("a failed command keeps its output as the result and only the exit code as the error", async () => {
+    stack.script([{ when: "fail please", steps: [
+      { tool: "bash", args: { command: "make" }, result: "src/a.c:1: error: nope\n\nCommand exited with code 2", isError: true },
+      { tool: "write", args: { path: "agent://Reviewer", content: "please look at a.c" }, result: "delivered" },
+      { text: "Reported." },
+    ] }]);
+    await newSession(page);
+    await send(page, "fail please");
+    await page.getByText("Reported.").first().waitFor();
+    await page.getByText("make", { exact: true }).first().click();
+    await page.getByText("error: nope").first().waitFor();
+    await page.getByText("Exit code 2").first().waitFor();
+
+    const [{ id }] = (await sessions()).slice(0, 1);
+    const content = await blocks(id);
+    const failed = content.find((c) => c.type === "tool" && c.name === "shell");
+    expect(failed?.state.status).toBe("error");
+    expect(failed?.state.error.message).toBe("Exit code 2");
+    expect(JSON.stringify(failed?.state.content)).toContain("error: nope");
+    expect(JSON.stringify(failed?.state.content)).not.toContain("Command exited");
+
+    // A message to another agent is its own card, not a file write.
+    const message = content.find((c) => c.type === "tool" && c.name === "irc");
+    expect(message?.state.input).toMatchObject({ ircTo: "Reviewer", content: "please look at a.c", description: "→ Reviewer" });
+    expect(content.some((c) => c.type === "tool" && c.name === "write")).toBe(false);
   });
 });
 

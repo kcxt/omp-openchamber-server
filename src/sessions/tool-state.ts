@@ -4,7 +4,9 @@
  */
 import type { ToolPartState } from "../shared/types";
 import { editToolMetadata } from "../shared/edit-diff";
-import { normalizeToolInput, normalizeToolOutput } from "../shared/tool-normalize";
+import { normalizeToolInput, normalizeToolOutput, splitBashFailure } from "../shared/tool-normalize";
+
+const isBashTool = (name: string | undefined): boolean => name === "bash" || name === "shell";
 
 function isRpcEventFrame(obj: Record<string, unknown>): boolean {
   if (typeof obj.type === "string" && (
@@ -282,7 +284,7 @@ export function reduceToolPartState(
     if (output != null) {
       const normalizedOutput = normalizeToolOutput(resolvedToolName, output, rawDetails);
       if (
-        (resolvedToolName === "bash" || resolvedToolName === "terminal" || resolvedToolName === "exec") &&
+        (resolvedToolName === "bash" || resolvedToolName === "shell" || resolvedToolName === "terminal" || resolvedToolName === "exec") &&
         state.output &&
         normalizedOutput &&
         !normalizedOutput.startsWith(state.output)
@@ -303,6 +305,11 @@ export function reduceToolPartState(
     const output = formatToolOutput(event.output ?? event.content ?? event.result ?? (typeof event.data === "object" && event.data != null ? event.data : undefined));
     if (output != null) {
       state.output = normalizeToolOutput(resolvedToolName, output, rawDetails);
+    }
+    const failure = error && isBashTool(resolvedToolName) ? splitBashFailure(error) : undefined;
+    if (failure) {
+      state.error = failure.error;
+      state.output = failure.output;
     }
     if (!error && resolvedToolName?.toLowerCase() === "edit") {
       // omp's tool_execution_end carries the tool result as `result: { content, details }`.

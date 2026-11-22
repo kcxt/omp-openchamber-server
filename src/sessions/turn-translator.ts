@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import type { ModelRef, OpenCodeTodo, TokenBreakdown, ToolPartState, TurnTelemetry } from "../shared/types";
 import { mapOmpUsageToTokens } from "../omp/transcript-reader";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "../omp/todo";
+import { ircMessageCard, parentIrcCard } from "../omp/irc";
 import {
   emitFormCreated,
   emitFormSettled,
@@ -243,6 +244,12 @@ export class TurnTranslator {
         }
         return;
       }
+      case "irc_message": {
+        const message = record(frame.message) ?? {};
+        const card = ircMessageCard(message, typeof message.timestamp === "number" ? message.timestamp : Date.now());
+        if (card) this.#emitTool(card.id, "irc", card.state);
+        return;
+      }
       case "auto_compaction_start":
       case "manual_compaction_start":
         this.#finalizePart();
@@ -426,7 +433,7 @@ export class TurnTranslator {
         )
       : undefined;
     if (todos) attachTodosToState(state, todos);
-    this.#emitTool(toolCallId, openCodeToolName(resolved), state);
+    this.#emitTool(toolCallId, openCodeToolName(resolved, state.input), state);
     if (!todoEnd) return;
     if (todos) this.#emitTodos(todos);
     else void this.#host.readTodos?.().then((list) => list && this.#emitTodos(list)).catch(() => {});
@@ -442,6 +449,14 @@ export class TurnTranslator {
     }
     if (message?.role === "developer") {
       this.#developer(message);
+      return;
+    }
+    // A parent agent's steer (omp's IRC): the sender's words as a card, not the model-facing envelope or a user message.
+    const steer = message?.role === "user"
+      ? parentIrcCard(message.parentIrc, typeof message.timestamp === "number" ? message.timestamp : Date.now())
+      : undefined;
+    if (steer) {
+      this.#emitTool(steer.id, "irc", steer.state);
       return;
     }
     if (this.#fullForm || message?.role !== "user") return;

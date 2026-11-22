@@ -379,6 +379,7 @@ function toV2WireEvent(event: OpenCodeEvent, id: string): Record<string, unknown
                   ? error.message
                   : typeof state.output === "string" ? state.output : "tool failed",
             },
+            ...(typeof state.output === "string" && state.output ? { content: [{ type: "text", text: state.output }] } : {}),
             metadata: {},
             executed: true,
           });

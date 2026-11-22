@@ -101,6 +101,19 @@ export function normalizeToolInput(
     return normalized;
   }
 
+  if ((tool === "write" || tool === "irc") && typeof normalized.path === "string") {
+    // A `write` to `agent://<id>` is a message to another agent (omp's IRC), not a file. It becomes an
+    // `irc` card: the body is the call's `content`, which OpenChamber shows as the input text.
+    const peer = ircPeer(normalized.path);
+    if (peer) {
+      return {
+        ircTo: peer.to,
+        description: `→ ${peer.to}${peer.progress ? " (progress)" : ""}`,
+        ...(typeof normalized.content === "string" ? { content: normalized.content } : {}),
+      };
+    }
+  }
+
   if (tool === "edit") {
     // Hashline calls carry everything in one `input` string headed `[path#TAG]`;
     // OpenChamber's tool row needs a path to label the call instead of dumping JSON.
@@ -247,4 +260,23 @@ export function normalizeToolOutput(
   }
 
   return output;
+}
+
+/** The recipient of an `agent://<id>[?progress]` path, or null for any other path. */
+export function ircPeer(path: string): { to: string; progress: boolean } | null {
+  const match = /^agent:\/\/([^?#/]+)(?:\?([^#]*))?$/.exec(path);
+  if (!match) return null;
+  return { to: decodeURIComponent(match[1]!), progress: /(?:^|&)progress(?:=|&|$)/.test(match[2] ?? "") };
+}
+
+/**
+ * omp's bash tool reports a non-zero exit as an error whose text is the command's output followed by
+ * `Command exited with code N`. OpenChamber draws an error as one red block, so the output is split
+ * from the exit code: the output stays a monospace result, only the code is the error.
+ * Returns undefined when the text carries no exit notice (timeouts, aborts, tool failures).
+ */
+export function splitBashFailure(text: string): { output: string; error: string } | undefined {
+  const match = /(?:^|\n)\n?Command exited with code (-?\d+)\s*$/.exec(text);
+  if (!match) return undefined;
+  return { output: text.slice(0, match.index).trimEnd(), error: `Exit code ${match[1]}` };
 }

@@ -9,11 +9,18 @@ export function isTodoTool(toolName: string | undefined): boolean {
 /** OpenChamber's todo panel is keyed on OpenCode's tool name. */
 export const OPENCHAMBER_TODO_TOOL = "todowrite";
 
-/** omp names the tool `todo`; OpenCode - and so OpenChamber - calls it `todowrite`. */
-export function openCodeToolName(toolName: string | undefined): string | undefined {
+/**
+ * omp's tool names as OpenCode - and so OpenChamber - spells them: `todo` is `todowrite`, `bash` is
+ * `shell` (OpenChamber's command output, error and duration rendering is keyed on it), and a `write` to
+ * `agent://<id>` (already normalised to carry `ircTo`) is an `irc` card, not a file write.
+ */
+export function openCodeToolName(toolName: string | undefined, input?: Record<string, unknown>): string | undefined {
   if (!toolName) return toolName;
   const t = toolName.toLowerCase().trim();
-  return t === "todo" || t === "todos" ? OPENCHAMBER_TODO_TOOL : toolName;
+  if (t === "todo" || t === "todos") return OPENCHAMBER_TODO_TOOL;
+  if (t === "bash") return "shell";
+  if (t === "write" && typeof input?.ircTo === "string") return "irc";
+  return toolName;
 }
 
 /**

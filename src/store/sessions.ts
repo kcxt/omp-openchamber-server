@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { readdir, stat, mkdir, unlink } from "node:fs/promises";
+import { readdir, stat, mkdir, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -359,6 +359,9 @@ export async function deleteOmpSession(
   try {
     const docKey = (await readSessionHeader(session.path))?.id;
     await unlink(session.path);
+    // The session's artifact directory (`<session>/`: subagent transcripts, tool logs) goes with it; left behind,
+    // its subagent transcripts would be listed as sessions of a parent that no longer exists.
+    await rm(session.path.slice(0, -".jsonl".length), { recursive: true, force: true });
     if (docKey) await SessionDocs.remove(docKey);
     return true;
   } catch {

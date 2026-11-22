@@ -320,20 +320,22 @@ Retrieves metadata for a specific session.
 - **Response `404 Not Found`**: If session does not exist.
 
 ### `PATCH /session/:id`
-Updates session metadata (e.g. title).
+Updates a session. All fields are optional; `title` goes to omp (`set_session_name`).
 
 - **Request Body**:
 ```json
 {
-  "title": "New Session Title"
+  "title": "New Session Title",
+  "metadata": { "openchamber": {} },
+  "archived": true
 }
 ```
-- **Response `200 OK`**: Returns the updated `Session` object.
+`archived: true` hides the session from the default list (`?archived=true` lists it) and stamps `time.archived`;
+`archived: false` restores it. The state lives in the session's doc, not the transcript.
+- **Response `204 No Content`**.
 
 ### `DELETE /session/:id`
-Deletes the session and its transcript JSONL file.
-
-- **Response `200 OK`**: `true`
+Deletes the session: its runtime, its transcript JSONL file, its artifact directory (subagent transcripts, tool logs) and its doc. `204` (`404` when it does not exist).
 
 ### `GET /session/status`
 Returns the sessions that are busy now, keyed by session id; idle sessions are
@@ -419,6 +421,19 @@ Fetches all messages for a session via direct JSONL read (fast path).
   }
 ]
 ```
+
+#### Tool names and cards
+omp's tools reach OpenChamber under the names it keys its rendering on; live and history agree.
+
+| omp | OpenChamber | Notes |
+|---|---|---|
+| `bash` | `shell` | A non-zero exit is an error whose message is only `Exit code N`; the command output stays the result (`content`), so it renders as output. Timeouts and aborts keep omp's text as the error. |
+| `todo` | `todowrite` | The list comes from the call's result. |
+| `write` to `agent://<id>[?progress]` | `irc` | A message to another agent. Input: `ircTo`, `content` (the body), `description` (`→ <id>`). |
+| received `irc:*` message, parent steer (`parentIrc`) | `irc` | Completed card, output = the sender's own words (never the `<irc>` envelope); `description` is `← <sender>`. Live from `irc_message` frames and the steer's `message_start`; in history from `irc:*` `custom_message` entries and `parentIrc` user messages. |
+| omp's developer messages | `developer` | |
+
+A subagent's session is titled with its omp id (`OhMyPiExtension`), live and listed.
 
 ### `POST /session/:id/prompt_async` · `POST /session/:id/prompt` · `POST /session/:id/message`
 One prompt; the three routes differ only in the acknowledgement. The sidecar
