@@ -11,14 +11,14 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { getOmpRuntimeInfo, probeOmpVersion } from "../../providers/omp/binary";
+import { getOmpRuntimeInfo, probeOmpVersion } from "../providers/omp/binary";
 import staticSchema from "./omp-settings-schema.json";
 
 type Schema = { ompVersion?: string };
 
 const agentDir = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
 const cachePath = () => join(agentDir(), "openchamber-settings-schema.json");
-const generatorPath = () => join(import.meta.dir, "..", "..", "..", "scripts", "gen-omp-settings-schema.ts");
+const generatorPath = () => join(import.meta.dir, "..", "..", "scripts", "gen-omp-settings-schema.ts");
 
 /** Candidate locations of an omp source checkout; OMP_SOURCE_DIR wins. */
 function sourceCandidates(binary: string | null): string[] {

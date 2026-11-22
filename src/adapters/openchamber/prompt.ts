@@ -52,9 +52,9 @@ import { normalizeToolInput, normalizeToolOutput } from "../../shared/tool-norma
 import { isBlobRef, readBlobBufferSync } from "../../shared/blobs";
 import { randomIdSuffix, timeHexFromTimestamp, timeHexOfMessageId, timeSortableHex } from "../../shared/message-id";
 import { readFile } from "node:fs/promises";
-import { appendOcRecord } from "../../providers/omp/oc-records";
 import { goalChangeFor, ocGoalOf, ocPatchForOmpGoal, withGoalPatch, type GoalChange, type OcGoal } from "./goal";
-import { invalidateMessageCache } from "../../providers/omp/messages";
+import { readTranscriptSummary } from "../../omp/transcript-reader";
+import { SessionDocs } from "../../store/session-docs";
 import { isAbsolute, resolve } from "node:path";
 
 interface OpenCodeTextPart {
@@ -1285,9 +1285,13 @@ function attachTurn(state: SessionState, parentMessageID: string | undefined, on
       // omp keeps no record of a command's notify message; without one the
       // reply vanishes on the next refetch and the turn reads as unanswered.
       (text, level, timestamp) => {
-        void appendOcRecord(state.sessionPath, { type: "oc_notice", text, level, timestamp })
-          .then(() => invalidateMessageCache(openCodeId, cwd))
-          .catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, "[prompt] could not persist command notice"));
+        void (async () => {
+          const header = (await readTranscriptSummary(state.sessionPath))?.header;
+          if (!header) throw new Error(`no session header in ${state.sessionPath}`);
+          await SessionDocs.update(header.id, (doc) => {
+            doc.notices = [...(doc.notices ?? []), { text, level, timestamp }];
+          });
+        })().catch((err) => promptLogger.warn({ err, sessionID: openCodeId }, "[prompt] could not persist command notice"));
       },
     ),
   );
@@ -1492,22 +1496,27 @@ async function applyModelRef(state: SessionState, model: ModelRef, strict: boole
 }
 
 /**
- * Applies a model the user just picked to this session's live child, if it has
- * one. With no live child there is nothing to push: the next prompt reads the
- * stored model back out of the session record and applies it then.
+ * Applies a model the user just picked to the session's omp child, starting one
+ * when none is live. omp journals the pick in the transcript, which is where the
+ * session's model is read from; the sidecar keeps no copy.
  */
 export async function applySessionModel(
   openCodeId: string,
   cwd: string,
+  sessionPath: string,
   model: ModelRef,
 ): Promise<{ applied: boolean; error?: string }> {
-  const state = sessionStates.get(sessionKey(openCodeId, cwd));
-  if (!state || state.conn.isAlive?.() === false) return { applied: false };
+  const key = sessionKey(openCodeId, cwd);
+  const release = await acquireSessionLock(key);
   try {
+    const state = await getOrCreateSessionState(openCodeId, cwd, sessionPath);
     await applyModelRef(state, model, true);
+    if (!state.busy) scheduleIdleRelease(state);
     return { applied: true };
   } catch (err) {
     return { applied: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    release();
   }
 }
 
@@ -1618,7 +1627,6 @@ export async function promptSessionAsync(
 
     cancelIdleRelease(state);
     state.busy = true;
-    backendForSession(openCodeId).store.beforeTurn?.(openCodeId, cwd);
     emitSessionStatus(openCodeId, { type: "busy" }, cwd);
 
     const parentMessageID = body.id ?? body.messageID ?? makeMessageId(openCodeId);
@@ -1782,12 +1790,14 @@ export function isSessionDriven(openCodeId: string, cwd: string): boolean {
 /**
  * Whether sending to this session would make omp fork it: another process
  * (typically a terminal omp) owns its transcript. This sidecar's own live child
- * counts as the owner, so only sessions without one are probed.
+ * counts as the owner, so only sessions without one are probed. `undefined`
+ * when ownership could not be determined; callers must not read it as free.
  */
-export async function sessionOwnedElsewhere(openCodeId: string, cwd: string, transcriptPath: string): Promise<boolean> {
+export async function sessionOwnedElsewhere(openCodeId: string, cwd: string, transcriptPath: string): Promise<boolean | undefined> {
   const state = sessionStates.get(sessionKey(openCodeId, cwd));
   if (state && state.conn.isAlive?.() !== false) return false;
-  return (await backendForSession(openCodeId).sessionOwnedElsewhere?.(cwd, transcriptPath)) ?? false;
+  const backend = backendForSession(openCodeId);
+  return backend.sessionOwnedElsewhere ? backend.sessionOwnedElsewhere(cwd, transcriptPath) : false;
 }
 
 /** How long omp gets to acknowledge an abort, and then to actually stop streaming, before its child is killed. */

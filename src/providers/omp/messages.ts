@@ -1,10 +1,9 @@
-import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { MissingWorkingDirectoryError, withOmpRpc } from "./rpc";
-import { appendOcRecord, ocStamp, readOcRecordLines } from "./oc-records";
-import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId } from "./store";
-import { sessionLogger } from "../../shared/logger";
+import { parseTranscript, mapOmpUsageToTokens, readTranscript, type TranscriptEntry } from "../../omp/transcript-reader";
+import { SessionDocs, type SessionDocNotice } from "../../store/session-docs";
+import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId, readSessionHeader } from "./store";
 import {
   bindPersistedOmpMessageId,
   deletePersistedMessageIdsFrom,
@@ -27,10 +26,6 @@ import type {
   TokenBreakdown,
 } from "../types";
 import { contextPointOfMessage, type OmpContextPoint } from "./context";
-export interface UsageMappingResult {
-  tokens: TokenBreakdown;
-  cost: number;
-}
 
 interface OmpTurnTelemetry {
   turnUsage: TokenBreakdown;
@@ -139,123 +134,6 @@ function addTurnTelemetry(
   });
 }
 
-function firstPositive(...values: unknown[]): number {
-  for (const v of values) {
-    if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
-  }
-  return 0;
-}
-
-export function mapOmpUsageToTokens(rawUsage: unknown, rawCost?: unknown): UsageMappingResult {
-  const fallbackTokens: TokenBreakdown = {
-    input: 0,
-    output: 0,
-    reasoning: 0,
-    cache: { read: 0, write: 0 },
-  };
-
-  if (!rawUsage || typeof rawUsage !== "object") {
-    let cost = 0;
-    if (typeof rawCost === "number" && Number.isFinite(rawCost)) {
-      cost = Math.max(0, rawCost);
-    }
-    return { tokens: fallbackTokens, cost };
-  }
-
-  const u = rawUsage as Record<string, unknown>;
-
-  const promptDetails = (u.prompt_tokens_details && typeof u.prompt_tokens_details === "object")
-    ? (u.prompt_tokens_details as Record<string, unknown>)
-    : (u.promptTokensDetails && typeof u.promptTokensDetails === "object" ? (u.promptTokensDetails as Record<string, unknown>) : undefined);
-
-  const completionDetails = (u.completion_tokens_details && typeof u.completion_tokens_details === "object")
-    ? (u.completion_tokens_details as Record<string, unknown>)
-    : (u.completionTokensDetails && typeof u.completionTokensDetails === "object" ? (u.completionTokensDetails as Record<string, unknown>) : undefined);
-
-  const output = firstPositive(
-    u.output,
-    u.outputTokens,
-    u.output_tokens,
-    u.completion_tokens,
-    u.completionTokens,
-  );
-
-  const reasoning = firstPositive(
-    u.reasoning,
-    u.reasoningTokens,
-    u.reasoning_tokens,
-    completionDetails?.reasoning_tokens,
-    completionDetails?.reasoningTokens,
-  );
-
-  const cacheRead = firstPositive(
-    u.cacheRead,
-    u.cache_read,
-    u.cached_tokens,
-    u.cachedTokens,
-    promptDetails?.cached_tokens,
-    promptDetails?.cachedTokens,
-    u.cache_read_input_tokens,
-    promptDetails?.cache_read_input_tokens,
-    u.prompt_cache_hit_tokens,
-    promptDetails?.prompt_cache_hit_tokens,
-  );
-
-  const cacheWrite = firstPositive(
-    u.cacheWrite,
-    u.cache_write,
-    u.cache_write_tokens,
-    u.cacheWriteTokens,
-    promptDetails?.cache_write_tokens,
-    promptDetails?.cacheWriteTokens,
-    u.created_cache_tokens,
-    u.createdCacheTokens,
-    promptDetails?.created_cache_tokens,
-    promptDetails?.createdCacheTokens,
-    u.cache_creation_input_tokens,
-    promptDetails?.cache_creation_input_tokens,
-    u.prompt_cache_miss_tokens,
-    promptDetails?.prompt_cache_miss_tokens,
-  );
-
-  const input = typeof u.input === "number" && Number.isFinite(u.input)
-    ? Math.max(0, u.input)
-    : (typeof u.inputTokens === "number" && Number.isFinite(u.inputTokens)
-      ? Math.max(0, u.inputTokens)
-      : (typeof u.input_tokens === "number" && Number.isFinite(u.input_tokens)
-        ? Math.max(0, u.input_tokens)
-        : (typeof u.prompt_tokens === "number" && Number.isFinite(u.prompt_tokens)
-          ? Math.max(0, u.prompt_tokens - cacheRead - cacheWrite)
-          : (typeof u.promptTokens === "number" && Number.isFinite(u.promptTokens)
-            ? Math.max(0, u.promptTokens - cacheRead - cacheWrite)
-            : 0))));
-
-  let cost = 0;
-  if (typeof rawCost === "number" && Number.isFinite(rawCost)) {
-    cost = Math.max(0, rawCost);
-  } else if (typeof u.cost === "number" && Number.isFinite(u.cost)) {
-    cost = Math.max(0, u.cost);
-  } else if (u.cost && typeof u.cost === "object") {
-    const c = u.cost as Record<string, unknown>;
-    if (typeof c.total === "number" && Number.isFinite(c.total)) {
-      cost = Math.max(0, c.total);
-    }
-  }
-
-  return {
-    tokens: {
-      input,
-      output,
-      reasoning,
-      cache: {
-        read: cacheRead,
-        write: cacheWrite,
-      },
-    },
-    cost,
-  };
-}
-
 export type AgentMessageRole = "user" | "developer" | "assistant" | "custom" | "toolResult" | "compactionSummary";
 
 export interface AgentMessageContentBlock {
@@ -301,33 +179,6 @@ export interface AgentMessage {
   ttft?: number;
   /** Provider prompt size and non-message estimate recorded with the request (see context.ts). */
   contextSnapshot?: unknown;
-}
-
-const TTL_MS = 5_000;
-
-interface CacheEntry {
-  messages: OpenCodeMessageRecord[];
-  at: number;
-  /** Transcript the messages were read from, and its `mtime:size` then: any append or rewrite by omp invalidates the entry. */
-  path?: string;
-  stamp?: string;
-}
-
-async function fileStamp(path: string): Promise<string | undefined> {
-  const info = await ocStamp(path);
-  return info ? `${info.mtimeMs}:${info.size}` : undefined;
-}
-
-const messageCache = new Map<string, CacheEntry>();
-const loadedFrom = new Map<string, { path: string; stamp: string | undefined }>();
-const inflightLoads = new Map<string, Promise<OpenCodeMessageRecord[]>>();
-
-function cacheKey(openCodeId: string, cwd: string): string {
-  return `${openCodeId}\0${cwd}`;
-}
-
-export function invalidateMessageCache(openCodeId: string, cwd: string): void {
-  messageCache.delete(cacheKey(openCodeId, cwd));
 }
 
 function timestampFromJsonlEntry(entry: Record<string, unknown>, message?: Record<string, unknown>): number | undefined {
@@ -395,7 +246,7 @@ function retainBeforeBoundary(lines: string[], boundary: number): string[] {
       return null;
     }
   });
-  const onActiveBranch = activeBranchFilter(parsed.filter((r): r is Record<string, unknown> => r !== null));
+  const activeIds = new Set(parseTranscript(lines.join("\n")).activeBranch.map((entry) => entry.id));
   const flat: string[] = [];
   const abandoned: string[] = [];
   const active: string[] = [];
@@ -404,7 +255,7 @@ function retainBeforeBoundary(lines: string[], boundary: number): string[] {
     if (line.length === 0) continue;
     const record = parsed[index];
     if (!record || typeof record.id !== "string" || record.type === "session") flat.push(line);
-    else (onActiveBranch(record) ? active : abandoned).push(line);
+    else (activeIds.has(record.id) ? active : abandoned).push(line);
   }
   return [...flat, ...abandoned, ...active];
 }
@@ -446,13 +297,13 @@ export async function truncateOmpSessionAtMessage(
   try {
     await writeFile(tempPath, `${retained.join("\n")}\n`, "utf8");
     await rename(tempPath, session.path);
-    await appendOcRecord(session.path, { type: "revert_change", timestamp: new Date().toISOString(), revert: null });
+    const header = await readSessionHeader(session.path);
+    if (header) await SessionDocs.update(header.id, (doc) => { delete doc.revert; });
   } catch {
     await unlink(tempPath).catch(() => {});
     return false;
   }
 
-  invalidateMessageCache(openCodeId, session.directory);
   const recorded = recordedUserMessagesBySession.get(openCodeId);
   if (recorded) {
     recordedUserMessagesBySession.set(openCodeId, recorded.filter((item) => item.timestamp < targetTime));
@@ -530,7 +381,6 @@ export async function forkOmpSession(
       await unlink(tempPath).catch(() => {});
       throw error;
     }
-    invalidateMessageCache(child.id, child.directory);
     return await getOmpSessionByOpenCodeId(child.id, child.directory);
   } catch {
     await deleteOmpSession(child.id, child.directory);
@@ -1204,114 +1054,31 @@ export function mapRpcMessagesToOpenCodeRecords(
   return records;
 }
 
-function extractMessagesFromRpcResponse(raw: unknown): unknown {
-  if (raw != null && typeof raw === "object" && "messages" in raw) {
-    const candidate = (raw as Record<string, unknown>).messages;
-    if (Array.isArray(candidate)) return candidate;
+function timestampOf(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return parsed;
   }
-  return raw;
+  return undefined;
 }
 
 /**
- * omp's transcript is a tree (`id`/`parentId`) whose active leaf is the last
- * entry appended; `/tree`, `/branch` and edits leave abandoned branches in the
- * file. Only the path from the leaf to the root is the conversation. Records
- * without an `id` (the header, title slot, and the sidecar's own markers) are
- * not tree nodes and pass through; a file with no tree ids at all is linear.
+ * The conversation as AgentMessages: the messages and compactions of the
+ * transcript's active branch (see `transcript-reader.ts`), with the sidecar's
+ * command notices placed among them by timestamp.
+ *
+ * Record shapes (omp session file format):
+ *   {"type":"message","id","parentId","timestamp":"<iso>","message":{"role","content":[...],
+ *    "api","provider","model","usage","stopReason","timestamp":<ms>,
+ *    "toolCallId","toolName","isError"}}
+ * The inner `message` object matches the AgentMessage shape the `get_messages`
+ * RPC returns, so it flows through the same mapper.
  */
-function activeBranchFilter(records: Record<string, unknown>[]): (entry: Record<string, unknown>) => boolean {
-  // A tree node carries `id` and `parentId` (null at the root). Older files, and
-  // anything the sidecar appends, lack `parentId` and are never filtered.
-  const isNode = (entry: Record<string, unknown>) =>
-    typeof entry.id === "string" && entry.type !== "session" && "parentId" in entry;
-  const byId = new Map<string, Record<string, unknown>>();
-  let leaf: Record<string, unknown> | undefined;
-  for (const entry of records) {
-    if (!isNode(entry)) continue;
-    byId.set(entry.id as string, entry);
-    leaf = entry;
-  }
-  if (!leaf) return () => true;
-  const active = new Set<string>();
-  for (let node: Record<string, unknown> | undefined = leaf; node && !active.has(node.id as string);) {
-    active.add(node.id as string);
-    node = typeof node.parentId === "string" ? byId.get(node.parentId) : undefined;
-  }
-  return (entry) => !isNode(entry) || active.has(entry.id as string);
-}
-
-// Fast path: read the omp session JSONL directly from disk.
-//
-// The previous implementation (loadFromRpc) spawned a transient
-// `omp --mode rpc` child per fetch, which resumed the session and was
-// SIGTERM'd afterwards. OMP's teardown bookkeeping appends a
-// `{"type":"custom","customType":"session_exit"}` record to the session
-// JSONL on that SIGTERM, so repeated UI polling rewrote user session
-// files with synthetic records every ~20s. Reading the file directly
-// yields the same message records without touching the session.
-//
-// Record shapes (omp v17.3.5 session file format):
-//   {"type":"message","id","parentId","timestamp":"<iso>","message":{"role","content":[...],
-//    "api","provider","model","usage","stopReason","timestamp":<ms>,
-//    "toolCallId","toolName","isError"}}
-// The inner `message` object matches the AgentMessage shape returned by
-// the `get_messages` RPC, so it flows through the same mapper. Truncated
-// trailing lines (concurrent mid-write) are skipped, never fatal.
-export async function loadMessagesFromFile(
-  sessionPath: string,
-  openCodeId: string,
-  dbPath?: string,
-): Promise<OpenCodeMessageRecord[] | null> {
-  let text: string;
-  try {
-    text = await readFile(sessionPath, "utf8");
-  } catch {
-    return null;
-  }
-
+function agentMessagesOfBranch(branch: TranscriptEntry[], notices: SessionDocNotice[] = []): AgentMessage[] {
   const messages: AgentMessage[] = [];
-  let hasSessionHeader = false;
-
-  const records: Record<string, unknown>[] = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      records.push(JSON.parse(trimmed) as Record<string, unknown>);
-    } catch {
-      continue;
-    }
-  }
-  const onActiveBranch = activeBranchFilter(records);
-  // Command notices live in the sidecar file; they are placed by timestamp below.
-  const notices: AgentMessage[] = [];
-  for (const line of await readOcRecordLines(sessionPath)) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line) as Record<string, unknown>;
-      if (entry.type !== "oc_notice" || typeof entry.text !== "string" || typeof entry.timestamp !== "number") continue;
-      notices.push({
-        id: `notice_${entry.timestamp}`,
-        role: "assistant",
-        content: [{ type: "text", text: entry.level === "info" ? entry.text : `⚠️ ${entry.text}` }],
-        stopReason: "stop",
-        timestamp: entry.timestamp,
-      } as unknown as AgentMessage);
-    } catch {
-      continue;
-    }
-  }
-
-  for (const entry of records) {
-    if (entry.type === "session") hasSessionHeader = true;
-    if (!onActiveBranch(entry)) continue;
-
+  for (const entry of branch) {
     if (entry.type === "compaction") {
-      let timestamp = typeof entry.timestamp === "number" ? entry.timestamp : undefined;
-      if (timestamp === undefined && typeof entry.timestamp === "string") {
-        const parsed = Date.parse(entry.timestamp);
-        if (!Number.isNaN(parsed)) timestamp = parsed;
-      }
       messages.push({
         id: typeof entry.id === "string" ? entry.id : undefined,
         role: "compactionSummary",
@@ -1320,108 +1087,44 @@ export async function loadMessagesFromFile(
         tokensBefore: typeof entry.tokensBefore === "number" ? entry.tokensBefore : undefined,
         tokensAfter: typeof entry.tokensAfter === "number" ? entry.tokensAfter : undefined,
         method: typeof entry.method === "string" ? entry.method : undefined,
-        timestamp: timestamp ?? Date.now(),
+        timestamp: timestampOf(entry.timestamp) ?? Date.now(),
       } as unknown as AgentMessage);
       continue;
     }
-
-    if (entry.type === "oc_notice") {
-      if (typeof entry.text !== "string" || typeof entry.timestamp !== "number") continue;
-      const text = entry.level === "info" ? entry.text : `⚠️ ${entry.text}`;
-      messages.push({
-        id: `notice_${entry.timestamp}`,
-        role: "assistant",
-        content: [{ type: "text", text }],
-        stopReason: "stop",
-        timestamp: entry.timestamp,
-      } as unknown as AgentMessage);
-      continue;
-    }
-
     if (entry.type !== "message") continue;
-
     const raw = entry.message;
     if (raw == null || typeof raw !== "object") continue;
-
     const message = raw as Record<string, unknown>;
-    let id = typeof message.id === "string" ? message.id : undefined;
-    if (id === undefined && typeof entry.id === "string") id = entry.id;
-
-    let timestamp = typeof message.timestamp === "number" ? message.timestamp : undefined;
-    if (timestamp === undefined && typeof entry.timestamp === "string") {
-      const parsed = Date.parse(entry.timestamp);
-      if (!Number.isNaN(parsed)) timestamp = parsed;
-    }
-
+    const id = typeof message.id === "string" ? message.id : typeof entry.id === "string" ? entry.id : undefined;
+    const timestamp = typeof message.timestamp === "number" ? message.timestamp : timestampOf(entry.timestamp);
     messages.push({ ...message, id, timestamp } as unknown as AgentMessage);
   }
 
-  // A readable session file with no message records is a valid empty
-  // transcript. Returning [] keeps it distinct from a file read failure
-  // (null), so callers do not spawn OMP just to read an empty session.
   for (const notice of notices) {
-    const at = (notice as unknown as { timestamp: number }).timestamp;
-    const index = messages.findIndex((m) => typeof (m as { timestamp?: unknown }).timestamp === "number" && (m as { timestamp: number }).timestamp > at);
-    if (index === -1) messages.push(notice);
-    else messages.splice(index, 0, notice);
+    const message = {
+      id: `notice_${notice.timestamp}`,
+      role: "assistant",
+      content: [{ type: "text", text: notice.level === "info" ? notice.text : `⚠️ ${notice.text}` }],
+      stopReason: "stop",
+      timestamp: notice.timestamp,
+    } as unknown as AgentMessage;
+    const index = messages.findIndex((m) => typeof m.timestamp === "number" && m.timestamp > notice.timestamp);
+    if (index === -1) messages.push(message);
+    else messages.splice(index, 0, message);
   }
-  if (messages.length === 0) return hasSessionHeader ? [] : null;
-  return mapRpcMessagesToOpenCodeRecords(messages, openCodeId, dbPath);
+  return messages;
 }
 
-async function loadFromRpc(openCodeId: string, cwd: string, dbPath?: string): Promise<OpenCodeMessageRecord[]> {
-  const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
-  if (!session) {
-    sessionLogger.error({ sessionID: openCodeId, cwd }, `no session found for ${openCodeId} in ${cwd}`);
-    return [];
-  }
-
-  return withOmpRpc(cwd, async (conn) => {
-    await conn.switchSession(session.path);
-    const raw = await conn.request("get_messages");
-    const messages = extractMessagesFromRpcResponse(raw);
-    if (!Array.isArray(messages)) {
-      throw new Error(`RPC get_messages returned unexpected ${typeof messages}`);
-    }
-    return mapRpcMessagesToOpenCodeRecords(messages as AgentMessage[], openCodeId, dbPath);
-  });
-}
-
+/** Messages of the session's transcript, read through the memoised `TranscriptReader`. */
 export async function loadSessionMessages(
   openCodeId: string,
   cwd: string,
   dbPath?: string,
 ): Promise<OpenCodeMessageRecord[]> {
-  const key = cacheKey(openCodeId, cwd);
-  const now = Date.now();
-  const cached = messageCache.get(key);
-  if (cached && now - cached.at < TTL_MS && (!cached.path || (await fileStamp(cached.path)) === cached.stamp)) {
-    return cached.messages;
-  }
-
-  const inflight = inflightLoads.get(key);
-  if (inflight) return inflight;
-
-  const promise = (async () => {
-    const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
-    if (!session) {
-      throw new Error(`no session found for ${openCodeId} in ${cwd}`);
-    }
-    loadedFrom.set(key, { path: session.path, stamp: await fileStamp(session.path) });
-    const fromFile = await loadMessagesFromFile(session.path, openCodeId, dbPath);
-    if (fromFile !== null) return fromFile;
-    return loadFromRpc(openCodeId, cwd, dbPath);
-  })().catch((err) => {
-    if (err instanceof MissingWorkingDirectoryError) throw err;
-    throw new Error(`Failed to load messages for ${openCodeId}: ${err instanceof Error ? err.message : String(err)}`);
-  });
-  inflightLoads.set(key, promise);
-
-  try {
-    const messages = await promise;
-    messageCache.set(key, { messages, at: Date.now(), ...loadedFrom.get(key) });
-    return messages;
-  } finally {
-    inflightLoads.delete(key);
-  }
+  const session = await getOmpSessionByOpenCodeId(openCodeId, cwd);
+  if (!session) throw new Error(`Failed to load messages for ${openCodeId}: no session found in ${cwd}`);
+  const transcript = await readTranscript(session.path);
+  if (!transcript?.header) throw new Error(`Failed to load messages for ${openCodeId}: transcript unreadable`);
+  const doc = await SessionDocs.get(transcript.header.id);
+  return mapRpcMessagesToOpenCodeRecords(agentMessagesOfBranch(transcript.activeBranch, doc.notices), openCodeId, dbPath);
 }

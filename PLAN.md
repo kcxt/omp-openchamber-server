@@ -119,8 +119,8 @@ Merges today's `providers/omp/events.ts` normalizer and `prompt.ts#createEventHa
 ### 3.4 Abort (Esc)
 
 1. `state → aborting`; publish nothing new (still busy to OpenChamber).
-2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned to OpenChamber as un-sent queue items.
-3. Wait for `session_settled` or `prompt_result` with `sessionSettled`, bounded by `ABORT_DEADLINE_MS` (5 s).
+2. Send omp `abort_and_restore_queue` (D3); the withdrawn queue text is returned to OpenChamber as un-sent queue items. R9: this aborts synchronous subagents with the parent turn but leaves async (background) subagents running, which keeps the stretch open. Esc means stop everything, so the runtime also sends `cancel_subagent` for every async subagent `get_subagents` reports as `pending`/`running`.
+3. Wait until settled: `session_settled`, `prompt_result` with `sessionSettled`, or `get_state.isSettled === true` polled after the abort response (R1: a stretch stranded by queued input never emits `session_settled`, even after `abort_and_restore_queue`; the `abort` response itself arrives after `agent_end`). Bounded by `ABORT_DEADLINE_MS` (5 s).
 4. On deadline: kill the child process group, `state → closed`, publish idle with `aborted: true`. The next prompt starts a fresh child on the same transcript.
 
 There is no separate `killedOnAbort` flag and no dangling prompt promise: the prompt promise resolves on acceptance, not on turn end.
@@ -156,9 +156,9 @@ The OpenChamber goal record (`metadata.openchamber.goal`) stays OpenChamber's, s
 
 ### 3.9 Revert, redo, fork, move
 
-- Revert to message M: `navigate_tree` to M's parent entry. omp keeps the abandoned branch in the file and hides it; `TranscriptReader` already shows only the active branch. Redo: `navigate_tree` back to the abandoned leaf (recorded in the store as the revert marker). No file truncation.
+- Revert to message M: `navigate_tree` to M's parent entry, then `append_custom_entry { customType: "host-revert" }` (P2). R3: `navigate_tree` alone moves the leaf in memory only; a child that dies before its next append loses the revert, and other processes still see the old leaf. The appended entry is parented on the new leaf, which makes the branch durable in omp's own tree. omp keeps the abandoned branch in the file and hides it; `TranscriptReader` shows only the active branch. Redo: the same two steps back to the abandoned leaf (kept in `SessionDoc.revert`). No file truncation.
 - Fork: omp `fork` RPC. The new transcript is omp's; the store copies OpenChamber metadata to the new session id.
-- Move to another directory: R5 decides between an omp command and keeping a sidecar-side header rewrite as the single documented exception.
+- Move to another directory: omp's builtin `/move <dir>` sent as a `prompt` on the session's runtime (R5: no model call, keeps the session id, rewrites the header and moves the file). A refusal arrives only as `command_output` with `success: true`, so the runtime parses it into an error. No sidecar header rewrite.
 
 ### 3.10 What the sidecar persists: one metadata document per session
 
@@ -196,7 +196,8 @@ Migration: a one-time, idempotent importer on startup builds `SessionDoc`s from 
 ### 3.11 omp layer
 
 - `RpcChild`: today's `OmpRpcConnection` minus session knowledge: spawn (detached process group), NDJSON framing, request/response with per-request timeout, event fan-out, death detection. Kept, trimmed.
-- `Utility`: one long-lived child per cwd with no session open, reused for `get_available_models`, `get_available_commands`, `get_session_lease`, `get_context_breakdown` for undriven sessions, `bash` for `/session/:id/shell` without a runtime. Replaces every `withOmpRpc` one-shot spawn. Idle-released like runtimes.
+- `OmpCli`: stateless one-shot subprocesses for everything that is not a driven session, all read-only (no lease, no writes): `omp session lease --json -- <ids…>` (0.17 s, batched), `omp models --json` (1.8 s; cached, invalidated when omp's `models.yml`/`config.yml` change), `omp session inspect --json <path>` (P6, ~2 s). Replaces Phase 1's long-lived `Utility` child (deleted in Phase 3), whose `switch_session` onto undriven sessions could write to, and so fork, a session a terminal omp owns. `/session/:id/shell` runs through the session's runtime when it has one, otherwise a plain `bash` spawn.
+- Inspect prefetch: when OpenChamber opens an undriven session (first transcript read), the sidecar starts `inspect` in the background and memoises the result by transcript `(path, size, mtimeMs)`, so the context panel usually opens without the delay. It deliberately does *not* start a runtime opportunistically: a runtime claims the session's lease, which would block (and with omp's move rule, fork) a terminal omp resuming the same session.
 - `TranscriptReader`: pure function JSONL text → `{ header, records, leafId, model, usage }`, memoised by `(path, size, mtimeNs)`. The single transcript parser: `store.ts#parseSessionHeader` and `messages.ts#loadMessagesFromFile` merge into it. No `get_messages` fallback.
 
 ### 3.12 HTTP layer
@@ -229,6 +230,7 @@ The sidecar runs a patched omp (D2). Patches stay small, each one commit with it
 | P3 | `switch_session { claimLease: true }`: take the ownership lease on open; fail with `session_busy` if another process holds it. | The probe-then-prompt race, transcript moves to siblings, `oc_alias`/`adoptTranscript`, and the "refuse if owned elsewhere" pre-check (the switch itself refuses). |
 | P4 | `get_state.idleMaintenance: { recapDueAt?: number; compactionDueAt?: number }` (absent when nothing is owed), from `IdleMaintenance#pending` and its timers; plus a `recap` event frame `{ recap, createdAt }` from the existing `onRecap` hook. | Guessing omp's idle settings for child release (§3.2); `recap.ts` polling `history.db` for the recap. |
 | P5 | `resume { subagentId?, hostMessageId? }` → `AgentSession.resume()` on the session or subagent, journaling a `host-resume` custom entry when `hostMessageId` is given (§3.14). | `.` reaching the model as a literal message; synthetic restart text. |
+| P6 | `omp session inspect --json <sessionPath>`: normal startup, read-only session manager (no lease, every write path disabled), prints model, thinking level, context breakdown, commands, todos, goal, title, lease state. | The shared Utility child and its `switch_session` onto sessions it does not own (§3.11). |
 
 **Not patched, deliberately:** OpenChamber metadata stays in the sidecar (§3.10). Putting it in omp's transcript would need the lease holder to write it (impossible while a terminal omp owns the session, and a child spawn per PATCH otherwise; OpenChamber writes turn timings every few seconds while a session is active), and transcript entries are branch-scoped, so a revert would hide session-level state.
 
@@ -257,10 +259,10 @@ Sidecar wiring:
 **How the sidecar wires them.** The parent's `SessionRuntime` owns its subagents. There is never a runtime or omp child for a subagent session.
 
 - Identity: the child's OpenCode session id comes from the artifact file's header (`sessionFile` in the lifecycle payload). No name-matching heuristic (`resolveOmpSubagentOpenCodeId` goes).
-- Live view: the runtime runs one `TurnTranslator` per running subagent over its `subagent_event` stream and emits under the child's session id, so a child session in OpenChamber streams like a root session. Today the sidecar drops `subagent_event` and only maps lifecycle and progress to a busy flag.
+- Live view: the runtime runs one `TurnTranslator` per running subagent over its `subagent_event` stream and emits under the child's session id, so a child session in OpenChamber streams like a root session. Today the sidecar drops `subagent_event` and only maps lifecycle and progress to a busy flag. R9: `subagent_event` is the child's full unfiltered stream (it bypasses `set_event_filter`, so `message_update` arrives in full form, not delta) and has no replay; on subscribe or reconnect, backfill with `get_subagent_messages`. The translator must therefore accept full-form updates and derive deltas itself.
 - Status: `statusOf(child)` = busy iff the parent runtime's latest snapshot (`get_subagents`, refreshed on lifecycle frames) says `pending`/`running`. No `subagentStatusMap`, no reconcile pass. A child of an undriven parent is followed like any other transcript: idle unless the parent's lease is held and the child's tail is mid-turn.
 - Transcript: `TranscriptReader` on the artifact file, as for any session.
-- Prompting a child session routes to `steer_subagent` while it runs. Stopping it routes to `cancel_subagent`. Once it has finished, a prompt is refused with an explanation (unless R9 finds an RPC resume path).
+- Prompting a child session routes to `steer_subagent` while it runs (pending tasks are not steerable yet; the prompt waits for `running`). Stopping it routes to `cancel_subagent`. `.` on a child routes to P5 `resume { subagentId }`, which also revives a finished subagent that is still registered; any other prompt to a finished child is refused with an explanation.
 
 Today a prompt to a child session can reach `promptSessionAsync`, which would spawn a second omp child on the artifact file while the parent process may still be writing it. The rewrite makes that unrepresentable: `Registry` creates runtimes only for root sessions.
 
@@ -335,6 +337,7 @@ Each phase ends with the full e2e suite green (`bun test`, currently 60/60). Sli
 - 3B revert/redo/fork onto `navigate_tree`/`fork`; message-id mapping §3.7; delete file surgery.
 - 3C follower rewrite on `statusOf`; delete `follow.ts` busy inference.
 - 3D goals onto runtime + store; delete goal loop.
+- 3F replace `Utility` with the one-shot `OmpCli` (§3.11): lease, models, inspect + prefetch; shell via runtime or plain bash; delete `src/omp/utility.ts` and `withOmpRpc`.
 - 3E model/effort/title routes apply through a runtime (started on demand); delete `currentModel` and the `.oc` `model_change`/`agent_change` records.
 
 **Phase 4: removal and docs**
@@ -359,3 +362,8 @@ Each phase ends with the full e2e suite green (`bun test`, currently 60/60). Sli
 - **omp internals.** The lease probe goes through omp's own RPC (`get_session_lease`), never its lock paths, so an omp upgrade cannot silently break it.
 - **Migration of user data.** The importer is idempotent, runs before children spawn, and renames rather than deletes. Dry-run mode logs what it would move.
 - **Concurrent edits.** Several agents have been editing this checkout. The rewrite runs on a branch/worktree; Phase 1 slices own disjoint files.
+
+## 10. Later (after Phase 4)
+
+- **Bash tool rendering.** omp's TUI renders bash calls with one-liners split into steps and syntax colouring. Bring that into OpenChamber's tool card: find omp's renderer (tui tool views for `bash`), decide whether to send pre-rendered segments in the tool part's `metadata` (sidecar-side, reusing omp's tokenizer) or ship a renderer in an OpenChamber extension panel.
+- **Low-latency reasoning streaming.** The sidecar already serves events over WebSocket (`/api/global/event/ws`, capability `realtime.websocket.global-events.v1`) as well as SSE, and OpenChamber's websocket setting selects it. Before switching anything, measure: time from omp `thinking_delta` on the child's stdout to the delta reaching the browser, on SSE vs WS. Likely costs are elsewhere: the translator batching or re-emitting whole parts instead of deltas, `message.part.updated` full-text updates per delta, or OpenChamber's own reducer. The TurnTranslator (§3.3) must emit `message.part.delta` per omp delta with no batching; the e2e suite has no latency check today, so Phase 2 adds one (stub emits timed deltas, the test asserts arrival spacing in the UI stream).

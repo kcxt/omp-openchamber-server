@@ -1,8 +1,8 @@
 # Testing and coverage
 
-One layer: `bun test` (alias for `bun test --timeout 90000 test/e2e`). The old unit/contract suites, the mock omp and the Jarvis adapter were removed; every test now drives the real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp`, with a throwaway `$HOME`, `PI_CODING_AGENT_DIR` and `TMPDIR`. No network, no credentials.
+Two layers. `bun run test` (`bun test --timeout 90000 test/e2e`) drives the real OpenChamber 2.x UI in headless Chromium -> `openchamber serve` -> sidecar -> `test/stub-omp/omp`, with a throwaway `$HOME`, `PI_CODING_AGENT_DIR` and `TMPDIR`. `bun test test/contract` runs omp commands directly against the stub and, with `CONTRACT_OMP=real`, against the pinned real omp build, so stub drift is caught (below). No network, no credentials in either layer; the old unit suites, the mock omp and the Jarvis adapter are gone.
 
-The stub is the main fidelity limit: it was written from omp's docs and never diffed against a real omp. Script format (`when`, text/thinking/tool/sleep/hang/fail/crash steps) is documented at the top of the stub and in `test/e2e/stack.ts`.
+The stub is kept honest by the contract suite: every behaviour it models (stretch frames, queues, abort, lease, tree, fork, compaction, subagents, journaling) is asserted identically against the real omp. What it still does not model is listed at the bottom of `docs/research/R7.md`. Script format (`when`, text/thinking/tool/sleep/hang/fail/crash steps, `tool:"bash"` with `args.async`, `tool:"task"` with `subagent:{steps}`) is documented at the top of the stub and in `test/e2e/stack.ts`.
 
 | File | What it asserts |
 |---|---|
@@ -16,6 +16,26 @@ The stub is the main fidelity limit: it was written from omp's docs and never di
 | `follow` | A session a terminal omp owns is followed read-only: its appended messages arrive as events bracketed by busy/idle; nothing is written or forked. |
 | `panels` | Git (branch, change), Changes, Files, Terminal (runs a command in the project), Project knowledge notes (survive reload), Context/Walkthrough/Browser open; Stats, Issues and PRs, Scheduled tasks, Archive, Integrations catalog, Settings open; the sidecar served every request those made. |
 | `failures` | Model API error (shown, idle, next turn works, survives reload); omp child dying mid-turn (error shown, idle, fresh child); sidecar SIGTERM and SIGKILL (history kept, open tab keeps working, reload consistent); sidecar killed mid-turn (ends idle). |
+
+## Contract suite (`test/contract/`)
+
+```
+bun test test/contract                         # stub (default)
+CONTRACT_OMP=real bun test test/contract       # real omp, run from /hdd/brute/projects/oh-my-pi-local
+```
+
+`CONTRACT_OMP_DIR` overrides the omp checkout, `CONTRACT_TMP` the scratch root (default `/hdd/brute/tmp`). Every child, real or stub, runs under an allow-listed environment (`PATH`, throwaway `HOME`/`PI_CODING_AGENT_DIR`/`XDG_*`/`TMPDIR`, `PI_SKIP_VERSION_CHECK`, `PI_TEST_SESSION_OWNERS_DIR`, `OMP_STUB_*`; never `process.env`), with a `models.yml` that declares only provider `fake` (a scripted local OpenAI-compatible server, `apiKey: dummy`). At spawn the harness asserts `get_available_models` lists only `fake/*` and aborts otherwise; the run prints `[contract:<kind>] get_available_models -> fake/fast, fake/smart`.
+
+| File | What it asserts (both binaries) |
+|---|---|
+| `stretch` | R1: frame order of a plain turn, tool turn, follow-up (prompt and `follow_up`), steer, `abort`, abort with queued input (stranded stretch), `abort_and_restore_queue`, `abort_and_prompt`, background-job wake (`sessionSettled:false`, one `session_settled`), local prompts. |
+| `entries` | R2: `get_entries` with/without `since`, `unknown_since`, delivery-order of user entries (steer overtakes follow-up), append-only compaction, small-session refusal, transcript file/lease created by the first assistant message, `model_change`/`thinking_level_change` journaling, id-less lines. |
+| `tree` | R3 `navigate_tree` revert/redo (memory-only leaf, file untouched, durable after the next append); R4 `fork`/`branch`/`new_session` output (path, header, lineage, ids); R5 `/move`. |
+| `lease` | R6 `get_session_lease` from a sessionless child: correctness, latency, crash release, the open-but-unwritten gap, fork lease. |
+| `consumed` | R7 every frame/response field the sidecar reads, by type. |
+| `subagents` | Subagent lifecycle/progress/event frames, wake ordering, `get_subagents`, `steer_subagent`, `cancel_subagent`. |
+
+Last run: stub 43/43, real 43/43.
 
 ## API coverage at a glance
 
@@ -33,10 +53,10 @@ The stub is the main fidelity limit: it was written from omp's docs and never di
 | Providers / models | e2e (catalog, pick); credentials / `credentialRef` not covered |
 | Git, files, terminal websocket, project notes | e2e through the panels |
 | Provider errors, child crash, sidecar restart | e2e |
-| Subagents / children and their lifecycle events | not covered (stub emits no subagent frames) |
+| Subagents / children and their lifecycle events | contract suite (frames, wake, cancel) on stub and real; not covered end to end through the UI |
 | Permissions and questions (approvals bridge, `question` extension) | not covered |
-| Compaction, shell (`/session/:id/shell`), slash commands | not covered |
-| Message queue / inbox, steering mid-turn | not covered |
+| Compaction, shell (`/session/:id/shell`), slash commands | compaction frames and refusal in the contract suite; shell, slash commands not covered end to end |
+| Message queue / inbox, steering mid-turn | contract suite (queue, steer, follow-up, abort and restore) on stub and real; not covered through the UI |
 | Goals, plans, session knowledge | not covered |
 | Settings routes, omp settings panel | Settings dialog opens; routes not asserted |
 | Image attachments / blobs | not covered |
@@ -45,9 +65,9 @@ The stub is the main fidelity limit: it was written from omp's docs and never di
 
 ## Where more attention is likely to pay off
 
-1. **Stub fidelity.** Real omp may differ on lease/fork timing, `get_state.sessionFile`, `get_session_lease` (on Linux it probes an abstract socket; the stub uses pid files), `session_exit` records written when a child is SIGTERMed (idle release and revert kill children more often), and how it reacts to the sidecar's own marker lines (`revert_change`, `viewed`, `oc_alias`, ...) appended to files it owns. A real-omp smoke over fork/revert/ownership would settle this.
+1. **Stub fidelity.** Now diffed against the real omp by `test/contract` (`docs/research/R7.md` lists what differed and was fixed). Remaining differences: goal continuations, auto-compaction, retries, approval round trips and image prompts are modelled from source or not at all; `session_exit` records written when a child is SIGTERMed are not asserted.
 2. **Ownership probe cost.** Every first prompt of a session without a live child spawns a probe omp (`get_session_lease`). A terminal omp that has the session open but has not written yet holds no lease and cannot be detected.
-3. **Steering, queued prompts, concurrent prompts, subagents, approvals** during a turn: no coverage at all now that the unit suites are gone.
+3. **Concurrent prompts, approvals** during a turn: steering/queued prompts are in the contract suite, not in the UI suite; approvals have no coverage.
 4. **Compaction, shell, slash commands, images, goals.**
 5. **The `alias` path** (omp moves the session after the sidecar's check): implemented, no longer exercised since ownership is refused up front.
 6. **OpenChamber-owned failures** seen in panels and deliberately ignored: `/api/source-control/binding` (422, no GitHub binding) and `/api/git/worktrees/archives` (500) come from OpenChamber's own web server, not the sidecar.

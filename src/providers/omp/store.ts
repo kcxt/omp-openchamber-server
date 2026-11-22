@@ -1,13 +1,10 @@
 import { readdir, stat, mkdir, unlink, rename } from "node:fs/promises";
 import { readFileSync } from "node:fs";
-import { appendOcRecord, ocStamp, readOcRecordLines, removeOcRecords, ocRecordsPath } from "./oc-records";
 import { basename, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
-  isLowSignalTitleInput,
   overlayTitleSlotContent,
-  parseTitleSlotLine,
   serializeTitleSlot,
 } from "./title";
 import {
@@ -18,7 +15,8 @@ import {
   searchMatchingSessionIds,
 } from "./title-db";
 import { emitOpenCodeV2Event, emitSessionUpdated } from "../../shared/sse";
-import { mapOmpUsageToTokens } from "./messages";
+import { readTranscriptSummary } from "../../omp/transcript-reader";
+import { SessionDocs, type SessionDoc } from "../../store/session-docs";
 import type { OpenCodeSession, TokenBreakdown } from "../types";
 
 import {
@@ -206,16 +204,19 @@ export async function resolveOmpSubagentOpenCodeId(
  * An OpenChamber session that moved to a sibling transcript. omp never writes
  * a session another live process holds: it moves to a new file (new id,
  * `parentSession` pointing back) on its first write. The sidecar marks that
- * file with an `oc_alias` line carrying the OpenChamber id, so the same
+ * transcript's SessionDoc with the OpenChamber id (`alias`), so the same
  * OpenChamber session continues in it while the original stays the other
  * process's. Among files claiming one id the alias wins, newest first.
+ * (Fallback until omp patch P3 makes such moves impossible.)
  */
 const aliasedSessions = new WeakSet<OpenCodeSession>();
 const aliasIndex = new Map<string, string>();
 
 /** Bind OpenChamber session `openCodeId` to the transcript omp moved it to. */
 export async function adoptOmpTranscript(openCodeId: string, transcriptPath: string): Promise<void> {
-  await appendOcRecord(transcriptPath, { type: "oc_alias", openCodeId, timestamp: new Date().toISOString() });
+  const uuid = readSessionIdSync(transcriptPath);
+  if (!uuid) throw new Error(`cannot adopt ${transcriptPath}: no session header`);
+  await SessionDocs.update(uuid, (doc) => { doc.alias = openCodeId; });
   aliasIndex.set(openCodeId, transcriptPath);
 }
 
@@ -232,235 +233,45 @@ function dropSupersededSessions(sessions: OpenCodeSession[]): OpenCodeSession[] 
 }
 
 /**
- * Parsed headers by file, valid while the file's size and mtime are unchanged.
- * A listing parses every session file (hundreds, each re-read and split), and
- * OpenChamber polls the global list, so without this a list costs seconds on
- * every call. Any append or rewrite changes size or mtime and drops the entry.
+ * A session's list-facing header: the memoised TranscriptReader summary of the
+ * transcript (omp's own records) overlaid with the session's SessionDoc
+ * (OpenChamber-owned data). The reader memoises on the file's size and mtime, so
+ * a listing of hundreds of sessions re-parses only files omp touched.
  */
-const headerCache = new Map<string, { mtimeMs: number; size: number; header: Promise<SessionHeader | null> }>();
-
 export async function readSessionHeader(filePath: string): Promise<SessionHeader | null> {
-  let mtimeMs: number;
-  let size: number;
-  const info = await ocStamp(filePath);
-  if (!info) {
-    headerCache.delete(filePath);
-    return null;
-  }
-  mtimeMs = info.mtimeMs;
-  size = info.size;
-  const hit = headerCache.get(filePath);
-  if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
-    const cached = await hit.header;
-    return cached ? { ...cached } : null;
-  }
-  // Stored as a promise so concurrent first reads (the startup warm-up and an
-  // early request) share one parse instead of each paying for it.
-  const header = parseSessionHeader(filePath);
-  headerCache.set(filePath, { mtimeMs, size, header });
-  const parsed = await header;
-  return parsed ? { ...parsed } : null;
-}
+  const summary = await readTranscriptSummary(filePath);
+  const raw = summary?.header;
+  if (!summary || !raw) return null;
+  const doc = await SessionDocs.get(raw.id);
 
-async function parseSessionHeader(
-  filePath: string,
-): Promise<SessionHeader | null> {
-  try {
-    const text = await Bun.file(filePath).text();
-    const transcriptLines = text.split("\n");
-    const maxHeaderLines = Math.min(transcriptLines.length, 200);
-    const ocLines = await readOcRecordLines(filePath);
-    const lines = [...transcriptLines, ...ocLines];
-    // omp's assistant messages record provider and model but no effort, so the
-    // effort the user picked (kept in the sidecar) carries over to a turn that ran
-    // on that same model instead of being reset to "default" by it.
-    let pickedModel: { providerID: string; modelID: string; variant: string } | undefined;
-    for (const line of ocLines) {
-      if (!line.includes('"model_change"')) continue;
-      try {
-        const entry = JSON.parse(line);
-        const raw = typeof entry.model === "string" ? entry.model : "";
-        const slash = raw.indexOf("/");
-        if (entry.type === "model_change" && slash > 0) {
-          pickedModel = { providerID: raw.slice(0, slash), modelID: raw.slice(slash + 1), variant: typeof entry.role === "string" ? entry.role : "default" };
-        }
-      } catch { /* skip malformed JSON */ }
-    }
-    let header: SessionHeader | null = null;
-    let latestTitle: string | undefined;
-    let firstUserPrompt: string | undefined;
-    let latestMetadata: Record<string, unknown> | undefined;
-    let latestArchived: number | undefined;
-    let latestViewed: number | undefined;
-    let latestAgent: string | undefined;
-    let latestRevert: SessionHeader["revert"] | null | undefined;
-    let hasRevertUpdate = false;
-    let latestAlias: string | undefined;
+  const providerID = summary.lastModel.providerID ?? raw.model?.providerID;
+  const modelID = summary.lastModel.modelID ?? raw.model?.modelID;
+  const model = providerID && modelID
+    ? { providerID, modelID, variant: summary.lastModel.thinking ?? raw.model?.variant ?? "default" }
+    : undefined;
+  const metadata = { ...raw.metadata, ...doc.metadata };
 
-    for (let i = 0; i < maxHeaderLines; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type === "session" && typeof entry.id === "string" && typeof entry.cwd === "string") {
-          header = {
-            id: entry.id,
-            cwd: entry.cwd,
-            title: typeof entry.title === "string" && entry.title.trim().length > 0 ? entry.title.trim() : undefined,
-            timestamp: typeof entry.timestamp === "string" ? entry.timestamp : "",
-            version:
-              typeof entry.version === "string"
-                ? entry.version
-                : typeof entry.version === "number"
-                  ? String(entry.version)
-                  : undefined,
-            metadata: entry.metadata && typeof entry.metadata === "object" ? entry.metadata : undefined,
-            revert: entry.revert && typeof entry.revert === "object" && typeof entry.revert.messageID === "string" ? entry.revert : undefined,
-            parentSession:
-              typeof entry.parentSession === "string"
-                ? entry.parentSession
-                : typeof entry.parentID === "string"
-                  ? entry.parentID
-                  : typeof entry.parentId === "string"
-                    ? entry.parentId
-                    : undefined,
-            agent: typeof entry.agent === "string" ? entry.agent : (typeof entry.mode === "string" ? entry.mode : undefined),
-            model: typeof entry.modelId === "string" ? {
-              providerID: typeof entry.providerID === "string" ? entry.providerID : (typeof entry.provider === "string" ? entry.provider : "omp"),
-              modelID: entry.modelId,
-              variant: typeof entry.variant === "string" ? entry.variant : "default",
-            } : undefined,
-            openCodeId: typeof entry.openCodeId === "string" ? entry.openCodeId : undefined,
-            childOf: typeof entry.openCodeParent === "string" ? entry.openCodeParent : undefined,
-          };
-          if (header.metadata) {
-            latestMetadata = { ...(latestMetadata || {}), ...header.metadata };
-          }
-          break;
-        }
-      } catch { /* skip malformed JSON */ }
-    }
-
-    if (!header) return null;
-
-    let latestTokens: TokenBreakdown | undefined;
-    let latestCost: number | undefined;
-    let latestModel: { providerID: string; modelID: string; variant?: string } | undefined;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (
-          (entry.type === "title" || entry.type === "title_change") &&
-          typeof entry.title === "string" &&
-          entry.title.trim().length > 0
-        ) {
-          latestTitle = entry.title.trim();
-        } else if (entry.type === "metadata" && entry.metadata && typeof entry.metadata === "object") {
-          latestMetadata = { ...(latestMetadata || {}), ...entry.metadata };
-        } else if (entry.type === "oc_alias" && typeof entry.openCodeId === "string") {
-          latestAlias = entry.openCodeId;
-        } else if (entry.type === "archive") {
-          latestArchived = typeof entry.archived === "number" ? entry.archived : (entry.archived ? Date.now() : 0);
-        } else if (entry.type === "viewed") {
-          latestViewed = typeof entry.viewed === "number" ? entry.viewed : Date.now();
-        } else if (entry.type === "agent_change" && typeof entry.agent === "string") {
-          latestAgent = entry.agent;
-        } else if (entry.type === "revert_change") {
-          hasRevertUpdate = true;
-          latestRevert = entry.revert && typeof entry.revert === "object" && typeof entry.revert.messageID === "string"
-            ? entry.revert
-            : null;
-        } else if (entry.type === "model_change") {
-          const rawModel = typeof entry.model === "string" ? entry.model : (typeof entry.modelID === "string" ? entry.modelID : "");
-          const slash = rawModel.indexOf("/");
-          if (slash !== -1) {
-            latestModel = {
-              providerID: rawModel.slice(0, slash),
-              modelID: rawModel.slice(slash + 1),
-              variant: typeof entry.role === "string" ? entry.role : "default",
-            };
-          } else if (rawModel) {
-            latestModel = {
-              providerID: typeof entry.providerID === "string" ? entry.providerID : (typeof entry.provider === "string" ? entry.provider : "omp"),
-              modelID: rawModel,
-              variant: typeof entry.role === "string" ? entry.role : "default",
-            };
-          }
-        } else if (entry.type === "message" && entry.message?.role === "assistant") {
-          const raw = entry.message;
-          if (typeof raw?.provider === "string" && typeof raw?.model === "string") {
-            latestModel = {
-              providerID: raw.provider,
-              modelID: raw.model,
-              variant: typeof raw.variant === "string"
-                ? raw.variant
-                : pickedModel && pickedModel.providerID === raw.provider && pickedModel.modelID === raw.model
-                  ? pickedModel.variant
-                  : "default",
-            };
-          }
-          if (raw?.usage || raw?.cost) {
-            const mapped = mapOmpUsageToTokens(raw.usage, raw.cost);
-            if (mapped.tokens.input > 0 || mapped.tokens.output > 0 || mapped.tokens.cache.read > 0 || mapped.tokens.cache.write > 0) {
-              latestTokens = mapped.tokens;
-            }
-            if (mapped.cost > 0) {
-              latestCost = (latestCost ?? 0) + mapped.cost;
-            }
-          }
-        } else if (!firstUserPrompt && entry.type === "session_init" && typeof entry.task === "string") {
-          const clean = entry.task.replace(/\s+/g, " ").trim();
-          if (clean && !isLowSignalTitleInput(clean)) {
-            firstUserPrompt = clean.length > 60 ? `${clean.slice(0, 57)}...` : clean;
-          }
-        } else if (!firstUserPrompt && entry.type === "message" && entry.message?.role === "user") {
-          const content = entry.message.content;
-          let promptText = "";
-          if (typeof content === "string") {
-            promptText = content;
-          } else if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block && typeof block === "object" && typeof block.text === "string") {
-                promptText = block.text;
-                break;
-              }
-            }
-          }
-          if (promptText && !isLowSignalTitleInput(promptText)) {
-            firstUserPrompt = promptText.trim();
-          }
-        }
-      } catch { /* skip malformed JSON */ }
-    }
-
-    if (latestTitle !== undefined) {
-      header.title = latestTitle;
-    } else if (!header.title) {
-      const indexed = lookupIndexedTitle(header.id);
-      if (indexed) header.title = indexed;
-    }
-    if (latestAlias !== undefined) {
-      header.openCodeId = latestAlias;
-      header.aliased = true;
-    }
-    if (firstUserPrompt !== undefined) header.firstUserPrompt = firstUserPrompt;
-    if (latestMetadata !== undefined) header.metadata = latestMetadata;
-    if (latestArchived !== undefined) header.archived = latestArchived;
-    if (latestViewed !== undefined) header.viewed = latestViewed;
-    if (latestAgent !== undefined) header.agent = latestAgent;
-    if (hasRevertUpdate) {
-      if (latestRevert) header.revert = latestRevert;
-      else delete header.revert;
-    }
-    if (latestModel !== undefined) header.model = latestModel;
-    if (latestTokens !== undefined) header.tokens = latestTokens;
-    if (latestCost !== undefined) header.cost = latestCost;
-    return header;
-  } catch { /* file unreadable */ }
-  return null;
+  const header: SessionHeader = {
+    id: raw.id,
+    cwd: raw.cwd,
+    timestamp: raw.timestamp,
+    version: raw.version,
+    parentSession: raw.parentSession,
+    title: summary.title ?? lookupIndexedTitle(raw.id),
+    firstUserPrompt: summary.firstUserPrompt,
+    agent: doc.agent ?? raw.agent,
+    model,
+    openCodeId: doc.alias ?? raw.openCodeId,
+    aliased: doc.alias !== undefined ? true : undefined,
+    childOf: raw.openCodeParent,
+    tokens: summary.usage.tokens,
+    cost: summary.usage.cost,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    archived: doc.archivedAt,
+    viewed: doc.viewedAt,
+    revert: doc.revert,
+  };
+  return header;
 }
 
 async function buildOpenCodeSession(
@@ -576,7 +387,6 @@ export async function createOmpSession(
     modelId: options?.model?.modelID ?? "omp",
     variant: options?.model?.variant ?? "default",
     agent: options?.agent ?? "omp",
-    metadata: options?.metadata,
     thinkingLevel: "off",
     version: 3,
     openCodeId: externalID,
@@ -585,6 +395,8 @@ export async function createOmpSession(
   };
 
   await Bun.write(filePath, titleSlot + JSON.stringify(headerRecord) + "\n");
+  // OpenChamber's blob lives in the session doc, not in omp's header.
+  if (options?.metadata) await SessionDocs.update(uuid, (doc) => { doc.metadata = { ...options.metadata }; });
   if (options?.title) {
     recordIndexedTitle(uuid, options.title);
   }
@@ -616,8 +428,9 @@ export async function deleteOmpSession(
     deleteIndexedTitle(fromOpenCodeSessionId(openCodeId));
     deletePersistedMessageIds(openCodeId);
     deletePersistedMessageIds(fromOpenCodeSessionId(openCodeId));
+    const docKey = (await readSessionHeader(session.path))?.id;
     await unlink(session.path);
-    await removeOcRecords(session.path);
+    if (docKey) await SessionDocs.remove(docKey);
     return true;
   } catch {
     return false;
@@ -662,7 +475,6 @@ export async function moveOmpSession(
       const temporaryPath = `${destinationPath}.tmp-${randomUUID()}`;
       await Bun.write(temporaryPath, rewritten);
       await rename(temporaryPath, destinationPath);
-      await rename(ocRecordsPath(session.path), ocRecordsPath(destinationPath)).catch(() => {});
       await unlink(session.path);
     }
 
@@ -720,50 +532,47 @@ export async function updateOmpSession(
   let session = (await getOmpSessionByOpenCodeId(openCodeId, directory)) || (await getOmpSessionByOpenCodeId(openCodeId));
   if (!session) return null;
 
-  if (updates.agent !== undefined && updates.agent !== session.agent) {
+  const docKey = (await readSessionHeader(session.path))?.id;
+  /** Persists into the session's doc; a doc that cannot be written keeps the existing value. */
+  const persist = async (change: (doc: SessionDoc) => void): Promise<boolean> => {
+    if (!docKey) return false;
     try {
-      const timestamp = new Date().toISOString();
-      await appendOcRecord(session.path, { type: "agent_change", agent: updates.agent, timestamp });
-      session.agent = updates.agent;
-      session.time.updated = Date.now();
+      await SessionDocs.update(docKey, change);
+      return true;
     } catch {
-      // Keep the existing session metadata if the transcript is not writable.
+      return false;
+    }
+  };
+
+  if (updates.agent !== undefined && updates.agent !== session.agent) {
+    const agent = updates.agent;
+    if (await persist((doc) => { doc.agent = agent; })) {
+      session.agent = agent;
+      session.time.updated = Date.now();
     }
   }
 
-  if (updates.model !== undefined && (
-    updates.model.providerID !== session.model.providerID ||
-    updates.model.modelID !== session.model.modelID ||
-    updates.model.variant !== session.model.variant
-  )) {
-    try {
-      const timestamp = new Date().toISOString();
-      const value = `${updates.model.providerID}/${updates.model.modelID}`;
-      await appendOcRecord(session.path, { type: "model_change", model: value, role: updates.model.variant, timestamp });
-      session.model = {
-        id: value,
-        providerID: updates.model.providerID,
-        modelID: updates.model.modelID,
-        variant: updates.model.variant,
-      };
-      session.time.updated = Date.now();
-    } catch {
-      // Keep the existing session metadata if the transcript is not writable.
-    }
+  // A model pick is not persisted here: omp journals `model_change` and
+  // `thinking_level_change` when the pick is applied to a running session, and
+  // the session's model is read back from the transcript (TranscriptReader.lastModel).
+  if (updates.model !== undefined) {
+    session.model = {
+      id: `${updates.model.providerID}/${updates.model.modelID}`,
+      providerID: updates.model.providerID,
+      modelID: updates.model.modelID,
+      variant: updates.model.variant,
+    };
+    session.time.updated = Date.now();
   }
 
   if (updates.revert !== undefined) {
-    try {
-      const timestamp = new Date().toISOString();
-      await appendOcRecord(session.path, {
-        type: "revert_change",
-        revert: updates.revert ?? undefined,
-        timestamp,
-      });
-      session.revert = updates.revert ?? undefined;
+    const revert = updates.revert;
+    if (await persist((doc) => {
+      if (revert) doc.revert = revert;
+      else delete doc.revert;
+    })) {
+      session.revert = revert ?? undefined;
       session.time.updated = Date.now();
-    } catch {
-      // Keep the existing revert marker if the transcript is not writable.
     }
   }
 
@@ -772,52 +581,34 @@ export async function updateOmpSession(
   }
 
   if (updates.metadata !== undefined && typeof updates.metadata === "object") {
-    try {
-      const timestamp = new Date().toISOString();
-      await appendOcRecord(session.path, {
-        type: "metadata",
-        metadata: updates.metadata,
-        timestamp,
-      });
-      session.metadata = { ...(session.metadata || {}), ...updates.metadata };
+    const metadata = updates.metadata;
+    if (await persist((doc) => { doc.metadata = { ...doc.metadata, ...metadata }; })) {
+      session.metadata = { ...(session.metadata || {}), ...metadata };
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
-    } catch {
-      // ignore
     }
   }
 
   if (updates.time?.archived !== undefined) {
-    try {
-      const timestamp = new Date().toISOString();
-      const archivedVal = updates.time.archived ?? 0;
-      await appendOcRecord(session.path, {
-        type: "archive",
-        archived: archivedVal,
-        timestamp,
-      });
-      session.time = { ...session.time, archived: archivedVal };
+    const archived = updates.time.archived ?? 0;
+    if (await persist((doc) => {
+      if (archived) doc.archivedAt = archived;
+      else delete doc.archivedAt;
+    })) {
+      const { archived: _previous, ...time } = session.time;
+      session.time = archived ? { ...time, archived } : time;
       session.time.updated = Date.now();
       emitSessionUpdated(session as unknown as Record<string, unknown>, session.directory);
-    } catch {
-      // ignore
     }
   }
 
   // Viewing is a read marker, not a change: it deliberately leaves
   // time.updated alone so the session list keeps its order.
   if (updates.time?.viewed !== undefined) {
-    try {
-      const viewed = updates.time.viewed;
-      await appendOcRecord(session.path, {
-        type: "viewed",
-        viewed,
-        timestamp: new Date().toISOString(),
-      });
+    const viewed = updates.time.viewed;
+    if (await persist((doc) => { doc.viewedAt = viewed; })) {
       session.time = { ...session.time, viewed };
       emitOpenCodeV2Event("session.viewed", { sessionID: openCodeId, idle: viewed }, session.directory);
-    } catch {
-      // ignore
     }
   }
 

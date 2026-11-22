@@ -10,7 +10,10 @@
 //   - a process owns a session through a lease; a writer that finds the lease held
 //     by another live process moves to a sibling file (new id, `parentSession`
 //     pointing back) instead of writing the owner's file (docs/session.md);
-//   - `navigate_tree`, `fork`, `branch` and `get_entries` work on that tree.
+//   - `navigate_tree`, `fork`, `branch`, `get_entries` and `/move` work on that tree;
+//   - runs follow omp's activity-stretch model (docs/omp-protocol.md §4): steers and follow-ups join the
+//     live run, `abort` strands queued input, `session_settled` closes the stretch. test/contract/ asserts
+//     every behaviour here against the real omp.
 //
 // No network, no credentials: replies come from a script.
 //
@@ -22,13 +25,17 @@
 //                    messages in omp's current context) {"thinking"} {"sleep":ms} {"hang":true}
 //                    {"goalComplete":true} (the agent calls the goal tool; omp keeps running goal turns "(#n)" while a goal is active)
 //                    {"fail":"message"} {"crash":true} (process dies mid-turn) {"tool":"bash","args":{},"result":"text",
-//                    "isError":bool,"details":{}}
+//                    "isError":bool,"details":{}}; a bash call with args.async=true returns at once and wakes the
+//                    session after "asyncMs" (default 300) like a background job; {"tool":"task","args":{"name","task",
+//                    "solutionSpace"},"subagent":{"steps":[...]}} spawns a detached subagent (lifecycle/progress/event
+//                    frames per set_subagent_subscription; steps as here, {"hang":true} until cancel_subagent)
 //   OMP_STUB_RECORD  file that receives every inbound frame (JSONL)
 //   OMP_STUB_TICK_MS pause between streamed chunks (default 4)
 //   OMP_STUB_START_DELAY_MS  time before the first command is handled, like a slow-booting omp (default 0)
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+//   OMP_STUB_PROVIDER  provider id of the stub's models (default "stub")
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const VERSION = "18.2.8";
@@ -47,9 +54,10 @@ const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "age
 const sessionsRoot = join(agentDir, "sessions");
 const leaseDir = process.env.PI_TEST_SESSION_OWNERS_DIR ?? join(dirname(agentDir), "run", "session-owners");
 const TICK = Number(process.env.OMP_STUB_TICK_MS ?? 4);
+const PROVIDER = process.env.OMP_STUB_PROVIDER ?? "stub";
 const MODELS = [
-  { provider: "stub", id: "fast", name: "Stub Fast", reasoning: false },
-  { provider: "stub", id: "smart", name: "Stub Smart", reasoning: true },
+  { provider: PROVIDER, id: "fast", name: "Stub Fast", reasoning: false },
+  { provider: PROVIDER, id: "smart", name: "Stub Smart", reasoning: true },
 ];
 
 // ---------------------------------------------------------------- directory layout
@@ -124,7 +132,12 @@ const goalEvent = () => out({ type: "goal_updated", goal, state: goal ? { enable
 function scheduleGoalContinuation(): void {
   if (goalScheduled || goalSuppressed || busy || aborted || goal?.status !== "active") return;
   goalScheduled = true;
-  setTimeout(() => { goalScheduled = false; if (!busy && goal?.status === "active" && !goalSuppressed) void runTurn(undefined, `${GOAL_CONTINUATION} (#${++goalTurns})`); }, 30);
+  stretchActive = true; // a reported pending goal turn opens a stretch that still ends with session_settled
+  setTimeout(() => {
+    goalScheduled = false;
+    if (!busy && goal?.status === "active" && !goalSuppressed) void runAgent(undefined, `${GOAL_CONTINUATION} (#${++goalTurns})`);
+    else settleCheck();
+  }, 30);
 }
 
 function titleSlot(title = ""): string {
@@ -152,12 +165,16 @@ function ensureOwnership(): void {
   claimed = true;
 }
 function persist(entry: Entry): void {
-  ensureOwnership();
+  // Like omp (session-manager.ts #shouldHaveSessionFile): a session that has produced no assistant
+  // message has no file and holds no lease; entries stay in memory until the first one arrives.
   if (!file || !existsSync(file)) {
+    if (!entries.some((e) => e.type === "message" && e.message?.role === "assistant")) return;
+    ensureOwnership();
     file = file ?? newFilePath(header);
     writeWhole(file); // header + every entry so far (a moved session publishes its whole transcript)
     return;
   }
+  ensureOwnership();
   appendFileSync(file, JSON.stringify(entry) + "\n");
 }
 function append(type: string, body: Record<string, any>): Entry {
@@ -177,8 +194,7 @@ function parseSessionFile(path: string): { header: Header; entries: Entry[] } {
     try { rec = JSON.parse(line); } catch { continue; }
     if (rec.type === "session" && !hdr) hdr = rec;
     else if (rec.type === "title") hdr = hdr ? { ...hdr, title: rec.title || hdr.title } : hdr;
-    else if (typeof rec.id === "string" && rec.type !== "session") list.push(rec);
-    // records without an id (foreign appends) are not part of the tree
+    else if (rec.type !== "session") list.push(rec); // id-less records stay in the list like omp's: they leave the leaf undefined
   }
   if (!hdr) throw new Error(`Not a session file: ${path}`);
   return { header: hdr, entries: list };
@@ -187,11 +203,17 @@ function load(path: string): void {
   const parsed = parseSessionFile(path);
   header = parsed.header;
   entries = parsed.entries;
-  leaf = entries.length ? entries[entries.length - 1]!.id : null;
+  leaf = entries.length ? ((entries[entries.length - 1]!.id as string | undefined) ?? (undefined as unknown as null)) : null;
   file = path;
   claimed = false; // the lease is taken by the first write, not by opening
-  const lastModel = [...entries].reverse().find((e) => e.type === "message" && e.message?.role === "assistant");
-  if (lastModel) model = MODELS.find((m) => m.provider === lastModel.message.provider && m.id === lastModel.message.model) ?? model;
+  // the session journal decides the model and effort: the latest model_change or assistant message, the latest thinking_level_change
+  for (const e of [...entries].reverse()) {
+    const spec = e.type === "model_change" ? String(e.model) : e.type === "message" && e.message?.role === "assistant" ? `${e.message.provider}/${e.message.model}` : undefined;
+    const found = spec ? MODELS.find((m) => `${m.provider}/${m.id}` === spec) : undefined;
+    if (found) { model = found; break; }
+  }
+  const lastThinking = [...entries].reverse().find((e) => e.type === "thinking_level_change");
+  thinking = lastThinking?.thinkingLevel ?? "off";
   todoPhases = [];
 }
 function fresh(parentSession?: string): void {
@@ -220,10 +242,33 @@ function fail(id: string | undefined, command: string, error: string, code?: str
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------- turns
-let busy = false;
+// Mirrors omp's RPC activity model (modes/rpc/rpc-session-settle.ts, rpc-prompt-results.ts):
+//   - one `agent_start` … `agent_end` run absorbs steers and follow-ups queued while it streams;
+//   - a prompt accepted into a live run reports `prompt_result` at the first yield with the queue drained;
+//   - `session_settled` closes the stretch once nothing is live, queued, async or scheduled;
+//   - a queued message stranded by a plain `abort` keeps the stretch open (omp does the same).
+let busy = false; // a run is live
 let aborted = false;
 let wake: (() => void) | undefined;
-const queued: Array<{ id?: string; message: string }> = [];
+let stretchActive = false; // agent activity since the last session_settled
+let runCount = 0;
+let messageSeq = 0;
+let asyncJobs = 0; // background bash jobs and detached subagents
+let subLevel = "off";
+type Ticket = { id?: string; queued: boolean; run?: number };
+type QueueItem = { text: string; ticket?: Ticket; custom?: { customType: string; content: string } };
+const steering: QueueItem[] = [];
+const followUps: QueueItem[] = [];
+const tickets = new Set<Ticket>();
+const abortWaiters: Array<() => void> = [];
+const queueSize = () => steering.length + followUps.length;
+const isSettled = () => !busy && queueSize() === 0 && asyncJobs === 0 && !goalScheduled;
+const queueUpdate = () => out({ type: "queue_update", steering: steering.map((q) => q.text), followUp: followUps.map((q) => q.text), liveSteered: 0 });
+function openTicket(id: string | undefined, queued: boolean): Ticket {
+  const t: Ticket = { id, queued };
+  tickets.add(t);
+  return t;
+}
 
 async function pause(ms: number): Promise<void> {
   if (aborted) return;
@@ -246,41 +291,11 @@ function usage(outTokens: number) {
 function chunks(text: string): string[] {
   return text.match(/[\s\S]{1,6}/g) ?? [];
 }
-
-async function runTurn(promptId: string | undefined, text: string): Promise<void> {
-  busy = true; aborted = false;
-  // Like omp's extension commands: a notify frame and no agent turn at all.
-  if (text.startsWith("/pi-vcc skip")) {
-    out({ type: "manual_compaction_start" });
-    out({ type: "manual_compaction_end", aborted: false, skipped: true, errorMessage: "Nothing to compact: the session is empty." });
-    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
-    busy = false;
-    return;
-  }
-  if (text.startsWith("/pi-vcc output")) {
-    out({ type: "command_output", text: "Context: 40 of 100000 tokens used." });
-    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
-    busy = false;
-    return;
-  }
-  if (text.startsWith("/pi-vcc")) {
-    out({ type: "extension_ui_request", id: hex8(), method: "notify", message: "Nothing to compact yet.", notifyType: "warning" });
-    out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: false, status: "completed", sessionSettled: true });
-    busy = false;
-    return;
-  }
-  const newMessages: any[] = [];
-  out({ type: "agent_start" });
-  const userMsg = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
-  out({ type: "message_start", message: userMsg });
-  append("message", { message: userMsg });
-  out({ type: "message_end", message: userMsg });
-  newMessages.push(userMsg);
-
-  // Group steps into assistant messages: content, then the tool calls it makes.
+/** Steps become assistant messages: content steps, then the tool calls they make; the next group is the reply to the results. */
+function groupSteps(steps: any[]): Array<{ content: any[]; tools: any[] }> {
   const groups: Array<{ content: any[]; tools: any[] }> = [];
   let cur = { content: [] as any[], tools: [] as any[] };
-  for (const step of pickSteps(text)) {
+  for (const step of steps) {
     if (step.tool) cur.tools.push(step);
     else {
       if (cur.tools.length) { groups.push(cur); cur = { content: [], tools: [] }; }
@@ -288,16 +303,91 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
     }
   }
   if (cur.content.length || cur.tools.length) groups.push(cur);
+  return groups;
+}
+/** Message lifecycle frames carry a `messageId` shared by start, updates and end (rpc-types.ts RpcMessageEventFrame). */
+const newMessageId = () => `msg-${++messageSeq}`;
 
+/** A wake source (finished background job or subagent): joins the live run as a follow-up, or starts one. */
+function wakeWith(custom: { customType: string; content: string }): void {
+  if (busy) { followUps.push({ text: custom.content, custom }); queueUpdate(); }
+  else void runAgent(undefined, custom.content, { custom });
+}
+
+function settleCheck(): void {
+  if (!stretchActive || busy) return;
+  if (goalScheduled) { goalScheduled = false; scheduleGoalContinuation(); return; }
+  if (!isSettled()) return;
+  stretchActive = false;
+  out({ type: "session_settled" });
+}
+
+function reportTickets(runNo: number, outcome: { status: string; failure?: string }): void {
+  const drained = queueSize() === 0;
+  for (const t of [...tickets]) {
+    if (t.queued ? !drained : t.run !== runNo) continue;
+    tickets.delete(t);
+    out({ type: "prompt_result", ...(t.id ? { id: t.id } : {}), agentInvoked: true, status: outcome.status, ...(outcome.failure ? { error: { message: outcome.failure, retryable: false } } : {}), sessionSettled: isSettled() });
+  }
+}
+
+async function runAgent(ticket: Ticket | undefined, text: string, first: { steering?: boolean; custom?: QueueItem["custom"] } = {}): Promise<void> {
+  // Like omp's extension commands: a notify frame and no agent turn at all.
+  if (!first.custom) {
+    const local = (): void => {
+      if (!ticket) return;
+      tickets.delete(ticket);
+      out({ type: "prompt_result", ...(ticket.id ? { id: ticket.id } : {}), agentInvoked: false, status: "completed", sessionSettled: isSettled() });
+    };
+    if (text.startsWith("/pi-vcc skip")) {
+      out({ type: "manual_compaction_start" });
+      out({ type: "manual_compaction_end", aborted: false, skipped: true, errorMessage: "Nothing to compact: the session is empty." });
+      return local();
+    }
+    if (text.startsWith("/pi-vcc output")) {
+      out({ type: "command_output", text: "Context: 40 of 100000 tokens used." });
+      return local();
+    }
+    if (text.startsWith("/pi-vcc")) {
+      out({ type: "extension_ui_request", id: hex8(), method: "notify", message: "Nothing to compact yet.", notifyType: "warning" });
+      return local();
+    }
+  }
+  const runNo = ++runCount;
+  busy = true; aborted = false; stretchActive = true;
+  if (ticket) ticket.run = runNo;
+  out({ type: "agent_start" });
+  const newMessages: any[] = [];
+  let turnOpen = false;
   let failure: string | undefined;
-  for (const group of groups) {
-    if (aborted || failure) break;
+
+  const deliver = (body: string, opts: { steering?: boolean; custom?: QueueItem["custom"] }) => {
     out({ type: "turn_start" });
+    turnOpen = true;
+    const mid = newMessageId();
+    if (opts.custom) {
+      const message = { role: "custom", customType: opts.custom.customType, content: opts.custom.content, display: true, attribution: "agent", timestamp: Date.now() };
+      out({ type: "message_start", message, messageId: mid });
+      append("custom_message", { customType: opts.custom.customType, content: opts.custom.content, display: true });
+      out({ type: "message_end", message, messageId: mid });
+      newMessages.push(message);
+      return;
+    }
+    const message = { role: "user", content: [{ type: "text", text: body }], ...(opts.steering ? { steering: true } : {}), attribution: "user", timestamp: Date.now() };
+    out({ type: "message_start", message, messageId: mid });
+    append("message", { message });
+    out({ type: "message_end", message, messageId: mid });
+    newMessages.push(message);
+  };
+
+  const runGroup = async (group: { content: any[]; tools: any[] }): Promise<void> => {
+    if (!turnOpen) out({ type: "turn_start" });
+    turnOpen = false;
+    const mid = newMessageId();
     const blocks: any[] = [];
     const partial = () => ({ role: "assistant", content: blocks.map((b) => ({ ...b })), api: "stub", provider: model.provider, model: model.id, usage: usage(0), stopReason: "stop", timestamp: Date.now() });
-    const msgStart = partial();
-    out({ type: "message_start", message: msgStart });
-    const event = (e: Record<string, unknown>) => out({ type: "message_update", message: partial(), assistantMessageEvent: { ...e, partial: partial() } });
+    out({ type: "message_start", message: partial(), messageId: mid });
+    const event = (e: Record<string, unknown>) => out({ type: "message_update", message: partial(), messageId: mid, assistantMessageEvent: { ...e, partial: partial() } });
 
     for (const step of group.content) {
       if (aborted) break;
@@ -345,7 +435,7 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
       timestamp: Date.now(),
     };
     append("message", { message: final });
-    out({ type: "message_end", message: final });
+    out({ type: "message_end", message: final, messageId: mid });
     newMessages.push(final);
 
     const results: any[] = [];
@@ -353,19 +443,55 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
       for (const { call, step } of calls) {
         out({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
         if (step.sleep) await pause(step.sleep);
-        const text = String(step.result ?? "ok");
+        let text = String(step.result ?? "ok");
+        if (call.name === "bash" && call.arguments?.async === true) {
+          // A background job: the call returns at once, the finished job wakes the session later.
+          const job = `bg_${++asyncSeq}`;
+          text = `Command running as background job ${job}.`;
+          asyncJobs++;
+          setTimeout(() => {
+            asyncJobs--;
+            wakeWith({ customType: "async-result", content: `<system-notice>\nBackground job ${job} (${String(call.arguments.command ?? "")}) has completed.\nResume your work using the result below.\n${String(step.result ?? "ok")}\n</system-notice>` });
+          }, Number(step.asyncMs ?? 300));
+        } else if (call.name === "task" && step.subagent) {
+          // omp's task tool spawns a detached agent and returns at once; frames follow on the parent's stream.
+          const name = String(call.arguments?.name ?? `Agent${subIndex + 1}`);
+          text = `Spawned agent \`${name}\` (job \`${name}\`).`;
+          asyncJobs++;
+          setTimeout(() => { void runSubagent(call, step.subagent); }, 20);
+        }
         out({ type: "tool_execution_update", toolCallId: call.id, toolName: call.name, args: call.arguments, partialResult: { content: [{ type: "text", text }] } });
         if (call.name === "todo" && step.details?.phases) todoPhases = step.details.phases;
         const result = { content: [{ type: "text", text }], ...(step.details ? { details: step.details } : {}) };
         out({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result, isError: !!step.isError });
         const msg = { role: "toolResult", toolCallId: call.id, toolName: call.name, content: result.content, ...(step.details ? { details: step.details } : {}), isError: !!step.isError, timestamp: Date.now() };
-        out({ type: "message_start", message: msg });
+        const rid = newMessageId();
+        out({ type: "message_start", message: msg, messageId: rid });
         append("message", { message: msg });
-        out({ type: "message_end", message: msg });
+        out({ type: "message_end", message: msg, messageId: rid });
         results.push(msg); newMessages.push(msg);
       }
     }
     out({ type: "turn_end", message: final, toolResults: results });
+  };
+
+  deliver(text, first);
+  let groups = groupSteps(pickSteps(text));
+  let gi = 0;
+  for (;;) {
+    if (!aborted && !failure) {
+      // Delivery point: steers go in at the next turn boundary, follow-ups once the model has nothing more to say.
+      const fromSteer = steering.length > 0;
+      const next = fromSteer ? steering.shift() : gi >= groups.length ? followUps.shift() : undefined;
+      if (next) {
+        queueUpdate();
+        deliver(next.text, { steering: fromSteer, custom: next.custom });
+        groups = groupSteps(pickSteps(next.text));
+        gi = 0;
+      }
+    }
+    if (gi >= groups.length || aborted || failure) break;
+    await runGroup(groups[gi++]!);
   }
 
   const toolCalls = newMessages.filter((m) => m.role === "toolResult").length;
@@ -376,13 +502,104 @@ async function runTurn(promptId: string | undefined, text: string): Promise<void
   if (goal?.status === "complete") { const done = goal; goal = null; out({ type: "goal_updated", goal: done, state: { enabled: false, mode: "exiting", reason: "completed", goal: done } }); }
   else if (goal) goalEvent();
   if (goal?.status === "active" && !aborted && !goalSuppressed) goalScheduled = true; // pending before settlement is reported
-  out({ type: "agent_end", messages: newMessages, yielded: true });
-  out({ type: "prompt_result", ...(promptId ? { id: promptId } : {}), agentInvoked: true, status: aborted ? "aborted" : failure ? "error" : "completed", ...(failure ? { error: { message: failure, retryable: false } } : {}), sessionSettled: queued.length === 0 });
+  const outcome = { status: aborted ? "aborted" : failure ? "error" : "completed", failure };
   busy = false;
-  const next = queued.shift();
-  if (next) { goalScheduled = false; void runTurn(next.id, next.message); }
-  else if (goalScheduled) { goalScheduled = false; scheduleGoalContinuation(); }
-  else out({ type: "session_settled" });
+  out({ type: "agent_end", messages: newMessages, isTerminal: true, yielded: true });
+  // abort / abort_and_prompt answer once the run has yielded
+  const waiters = abortWaiters.splice(0);
+  for (const w of waiters) w();
+  // Like omp: prompt_result a macrotask after agent_end, session_settled after it.
+  setImmediate(() => {
+    reportTickets(runNo, outcome);
+    setImmediate(settleCheck);
+  });
+}
+
+// ---------------------------------------------------------------- subagents
+// The task tool runs a subagent inside the parent process (task/executor.ts); the parent's
+// stream carries `subagent_lifecycle`, `subagent_progress` and (at level "events") `subagent_event`.
+let subIndex = 0;
+let asyncSeq = 0;
+const subagents = new Map<string, { snapshot: any; cancel: () => void }>();
+async function runSubagent(call: any, spec: { steps?: any[] }): Promise<void> {
+  const args = call.arguments ?? {};
+  const index = subIndex++;
+  const id = String(args.name ?? `Agent${index + 1}`);
+  const assignment = String(args.task ?? "");
+  const task = `Complete assignment thoroughly:\n\n${assignment}`;
+  const parentFile = file ?? newFilePath(header);
+  const sessionFile = join(parentFile.replace(/\.jsonl$/, ""), `${id}.jsonl`);
+  const subHeader = { type: "session", version: 3, id: randomUUID(), timestamp: now(), cwd };
+  const subEntries: Entry[] = [];
+  let subLeaf: string | null = null;
+  const subAppend = (message: any) => {
+    const entry: Entry = { type: "message", id: hex8(), parentId: subLeaf, timestamp: now(), message };
+    subLeaf = entry.id; subEntries.push(entry);
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    writeFileSync(sessionFile, titleSlot() + [JSON.stringify(subHeader), ...subEntries.map((e) => JSON.stringify(e))].join("\n") + "\n");
+  };
+  const started = Date.now();
+  let cancelled = false;
+  let toolCount = 0;
+  const progress: any = { index, id, agent: "task", agentSource: "bundled", status: "running", task, assignment, recentTools: [], recentOutput: [], toolCount: 0, requests: 0, tokens: 0, cost: 0, durationMs: 0 };
+  const snapshot = () => ({ id, index, agent: "task", agentSource: "bundled", description: assignment, status: progress.status, task, assignment, sessionFile, lastUpdate: Date.now(), progress: { ...progress }, parentToolCallId: call.id });
+  const lifecycle = (status: string) => { if (subLevel !== "off") out({ type: "subagent_lifecycle", payload: { id, agent: "task", parentToolCallId: call.id, detached: true, agentSource: "bundled", status, sessionFile, index } }); };
+  const report = () => {
+    progress.toolCount = toolCount; progress.durationMs = Date.now() - started;
+    if (subLevel !== "off") out({ type: "subagent_progress", payload: { index, agent: "task", agentSource: "bundled", task, parentToolCallId: call.id, detached: true, assignment, progress: { ...progress }, sessionFile } });
+  };
+  const ev = (event: Record<string, unknown>) => { if (subLevel === "events") out({ type: "subagent_event", payload: { id, event } }); };
+  subagents.set(id, { snapshot: snapshot(), cancel: () => { cancelled = true; } });
+
+  lifecycle("started");
+  ev({ type: "agent_start" });
+  report();
+  const msgs: any[] = [];
+  ev({ type: "turn_start" });
+  const user = { role: "user", content: [{ type: "text", text: task }], attribution: "agent", timestamp: Date.now() };
+  ev({ type: "message_start", message: user }); subAppend(user); ev({ type: "message_end", message: user }); msgs.push(user);
+  let lastText = "";
+  let first = true;
+  for (const group of groupSteps(spec.steps ?? [{ text: "ok" }])) {
+    if (cancelled) break;
+    if (!first) ev({ type: "turn_start" });
+    first = false;
+    const blocks: any[] = [];
+    const part = () => ({ role: "assistant", content: blocks.map((b) => ({ ...b })), api: "stub", provider: model.provider, model: model.id, usage: usage(0), stopReason: "stop", timestamp: Date.now() });
+    ev({ type: "message_start", message: part() });
+    for (const step of group.content) {
+      if (step.hang) { while (!cancelled) await sleep(25); break; }
+      if (step.sleep) { await sleep(step.sleep); continue; }
+      const text = String(step.text ?? step.thinking ?? "");
+      const kind = step.thinking !== undefined ? "thinking" : "text";
+      const idx = blocks.push(kind === "thinking" ? { type: "thinking", thinking: text } : { type: "text", text }) - 1;
+      ev({ type: "message_update", message: part(), assistantMessageEvent: { type: `${kind}_delta`, contentIndex: idx, delta: text, partial: part() } });
+      if (kind === "text") { lastText = text; progress.recentOutput = [text]; }
+      report();
+    }
+    const calls = group.tools.map((step: any) => ({ call: { type: "toolCall", id: `call_${hex8()}`, name: step.tool, arguments: step.args ?? {} }, step }));
+    for (const { call: c } of calls) blocks.push(c);
+    const fin = { ...part(), usage: usage(blocks.length * 10), stopReason: cancelled ? "aborted" : calls.length ? "toolUse" : "stop", content: blocks };
+    ev({ type: "message_end", message: fin }); subAppend(fin); msgs.push(fin);
+    const results: any[] = [];
+    for (const { call: c, step } of calls) {
+      ev({ type: "tool_execution_start", toolCallId: c.id, toolName: c.name, args: c.arguments });
+      const result = { content: [{ type: "text", text: String(step.result ?? "ok") }] };
+      toolCount++; progress.recentTools = [...progress.recentTools, { tool: c.name, args: "", endMs: Date.now() }]; report();
+      ev({ type: "tool_execution_end", toolCallId: c.id, toolName: c.name, result, isError: !!step.isError });
+      const tr = { role: "toolResult", toolCallId: c.id, toolName: c.name, content: result.content, isError: !!step.isError, timestamp: Date.now() };
+      ev({ type: "message_start", message: tr }); subAppend(tr); ev({ type: "message_end", message: tr }); results.push(tr); msgs.push(tr);
+    }
+    ev({ type: "turn_end", message: fin, toolResults: results });
+  }
+  ev({ type: "agent_end", messages: msgs, yielded: true });
+  const status = cancelled ? "aborted" : "completed";
+  progress.status = status; progress.requests = subEntries.filter((e) => e.message?.role === "assistant").length; progress.tokens = progress.requests * 110;
+  report();
+  subagents.delete(id);
+  lifecycle(status);
+  asyncJobs--;
+  wakeWith({ customType: "async-result", content: `<system-notice>\nAgent ${id} has ${status}.\n${lastText}\n</system-notice>` });
 }
 
 // ---------------------------------------------------------------- commands
@@ -390,9 +607,10 @@ function stateData() {
   return {
     model: { provider: model.provider, id: model.id, name: model.name },
     thinkingLevel: thinking,
-    isStreaming: busy, isCompacting: false, isSettled: !busy && !goalScheduled, hasPendingAsyncWork: false, goal: goal ? { enabled: goal.status === "active", mode: "active", goal } : null,
-    sessionFile: file ?? undefined, sessionId: header.id, sessionName: header.title,
-    cwd, messageCount: messages().length, queuedMessageCount: queued.length,
+    isStreaming: busy, isCompacting: false, isSettled: isSettled(), hasPendingAsyncWork: asyncJobs > 0, goal: goal ? { enabled: goal.status === "active", mode: "active", goal } : null,
+    sessionFile: file ?? newFilePath(header), sessionId: header.id, sessionName: header.title,
+    cwd, messageCount: messages().length, queuedMessageCount: queueSize(),
+    queuedMessages: { steering: steering.map((q) => q.text), followUp: followUps.map((q) => q.text), liveSteered: 0 },
     todoPhases,
   };
 }
@@ -418,26 +636,71 @@ function moveToSiblingUpTo(upTo: string | null, extra?: Partial<Header>): void {
   writeWhole(file);
 }
 
+/** The builtin `/move <dir>`: omp relocates the open session (file, header cwd) and says so as command_output; no agent turn. */
+function moveSessionTo(id: string | undefined, arg: string): void {
+  const reply = (text: string) => { out({ type: "command_output", text }); respond(id, "prompt", { agentInvoked: false }); };
+  if (busy) return reply("Cannot move while streaming.");
+  const dest = resolve(cwd, arg);
+  let isDir = false;
+  try { isDir = statSync(dest).isDirectory(); } catch { /* missing */ }
+  if (!isDir) return reply(`Directory does not exist: ${dest}`);
+  if (file && existsSync(file)) {
+    if (leaseHeldByOther(header.id)) return reply(`Move failed: Cannot move session "${file}": another live omp process writes it. Nothing was moved.`);
+    const previous = file;
+    header = { ...header, cwd: dest, previousSessionFiles: [...(header.previousSessionFiles ?? []), previous] };
+    const next = join(sessionsRoot, sessionDirName(dest), basename(previous));
+    mkdirSync(dirname(next), { recursive: true });
+    renameSync(previous, next);
+    file = next;
+    writeWhole(next);
+    claim(header.id); claimed = true;
+  } else {
+    header = { ...header, cwd: dest };
+  }
+  out({ type: "session_info_update", sessionId: header.id });
+  reply(`Moved to ${dest}.`);
+}
 async function handle(frame: any): Promise<void> {
   const { id, type } = frame as { id?: string; type: string };
   try {
     switch (type) {
       case "get_state": return respond(id, type, stateData());
-      case "get_available_models": return respond(id, type, MODELS.map(modelInfo));
+      case "get_available_models": return respond(id, type, { models: MODELS.map(modelInfo) });
       case "get_available_commands": return respond(id, type, { commands: [{ name: "pi-vcc", description: "Compact conversation with pi-vcc structured summary" }] });
       case "get_available_thinking_levels": return respond(id, type, model.reasoning ? ["off", "low", "medium", "high"] : ["off"]);
       case "set_model": {
         const m = MODELS.find((x) => x.provider === frame.provider && x.id === frame.modelId);
         if (!m) return fail(id, type, `Model not found: ${frame.provider}/${frame.modelId}`);
         model = m;
-        if (file) append("model_change", { model: `${m.provider}/${m.id}`, role: "default" });
+        append("model_change", { model: `${m.provider}/${m.id}`, role: "default", resolvedModelIsFallback: false });
         return respond(id, type, modelInfo(m));
       }
-      case "set_thinking_level": thinking = String(frame.level); return respond(id, type);
-      case "set_subagent_subscription": case "set_event_filter": case "set_host_tools": case "set_auto_compaction":
+      case "set_thinking_level": {
+        // omp journals the effective level (clamped to what the model supports) only when it changes.
+        const level = model.reasoning ? String(frame.level) : "off";
+        if (level !== thinking) {
+          thinking = level;
+          append("thinking_level_change", { thinkingLevel: level, configured: level });
+        }
+        return respond(id, type);
+      }
+      case "set_subagent_subscription":
+        if (!["off", "progress", "events"].includes(String(frame.level))) return fail(id, type, `Invalid subagent subscription level: ${String(frame.level)}`);
+        subLevel = String(frame.level);
+        return respond(id, type, { level: subLevel });
+      case "set_event_filter": case "set_host_tools": case "set_auto_compaction":
       case "set_auto_retry": case "set_steering_mode": case "set_follow_up_mode": case "set_interrupt_mode": case "set_ask_dialog":
         return respond(id, type, {});
-      case "get_subagents": return respond(id, type, { subagents: [] });
+      case "get_subagents": return respond(id, type, { subagents: [...subagents.values()].map((s) => ({ ...s.snapshot, status: "running" })) });
+      case "cancel_subagent": {
+        const sub = subagents.get(String(frame.subagentId));
+        if (sub) sub.cancel();
+        return respond(id, type, { cancelled: !!sub });
+      }
+      case "steer_subagent": {
+        if (!subagents.has(String(frame.subagentId))) return fail(id, type, `Subagent refused the message: unknown subagent ${String(frame.subagentId)}`);
+        return respond(id, type);
+      }
       case "get_session_stats": return respond(id, type, { tokens: { input: 100, output: 10, total: 110 }, cost: 0 });
       case "get_context_breakdown": return respond(id, type, {
         model: { provider: model.provider, modelId: model.id }, contextWindow: model.contextWindow ?? 100_000,
@@ -446,17 +709,36 @@ async function handle(frame: any): Promise<void> {
       });
       case "get_session_lease": {
         const ids: string[] = frame.sessionIds ?? [];
-        return respond(id, type, { held: ids.filter((s) => s === header.id || leaseHeldByOther(s)), unknown: [] });
+        return respond(id, type, { held: ids.filter((s) => owned.has(s) || leaseHeldByOther(s)), unknown: [] });
       }
       case "switch_session": {
         if (busy) { aborted = true; wake?.(); }
-        if (!existsSync(frame.sessionPath)) return fail(id, type, `Session file not found: ${frame.sessionPath}`);
+        if (!existsSync(frame.sessionPath)) {
+          // omp opens a missing path as a new, empty session that writes there (and holds its lease)
+          fresh();
+          file = frame.sessionPath;
+          writeWhole(file);
+          claim(header.id); claimed = true;
+          return respond(id, type, { cancelled: false });
+        }
         load(frame.sessionPath);
         return respond(id, type, { cancelled: false });
       }
-      case "new_session": fresh(frame.parentSession); return respond(id, type, { cancelled: false });
+      case "new_session": {
+        // omp forces the file into existence (header only) and takes the lease right away
+        fresh(frame.parentSession);
+        file = newFilePath(header);
+        writeWhole(file);
+        claim(header.id); claimed = true;
+        return respond(id, type, { cancelled: false });
+      }
       case "get_messages": return respond(id, type, { messages: messages() });
-      case "get_entries": return respond(id, type, { entries: frame.since ? entries.slice(entries.findIndex((e) => e.id === frame.since) + 1) : entries, leafId: leaf });
+      case "get_entries": {
+        if (frame.since === undefined) return respond(id, type, { entries, leafId: leaf });
+        const at = entries.findIndex((e) => e.id === frame.since);
+        if (at < 0) return fail(id, type, `Unknown entries cursor: ${String(frame.since)}`, "unknown_since");
+        return respond(id, type, { entries: entries.slice(at + 1), leafId: leaf });
+      }
       case "get_last_assistant_text": {
         const last = [...messages()].reverse().find((m) => m.role === "assistant");
         const text = last?.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") ?? "";
@@ -466,14 +748,25 @@ async function handle(frame: any): Promise<void> {
       case "set_todos": todoPhases = frame.phases ?? []; return respond(id, type, {});
       case "prompt": {
         const text = String(frame.message ?? "");
+        if (/^\/move\s+\S/.test(text)) return moveSessionTo(id, text.replace(/^\/move\s+/, "").trim());
+        if (!text.trim() && !(frame.images?.length)) return respond(id, type, { agentInvoked: false }); // handled locally, no prompt_result
         if (busy) {
-          if (!frame.streamingBehavior) return fail(id, type, "Agent is already processing a prompt. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
-          queued.push({ id, message: text });
-          return respond(id, type, {});
+          if (!frame.streamingBehavior) return fail(id, type, "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion.");
+          (frame.streamingBehavior === "steer" ? steering : followUps).push({ text, ticket: openTicket(id, true) });
+          queueUpdate();
+          return respond(id, type);
         }
-        respond(id, type, {});
-        void runTurn(id, text);
+        respond(id, type);
+        void runAgent(openTicket(id, false), text);
         return;
+      }
+      case "steer": case "follow_up": {
+        const text = String(frame.message ?? "");
+        if (!text.trim()) return respond(id, type);
+        if (!busy) { respond(id, type); void runAgent(undefined, text, { steering: type === "steer" }); return; }
+        (type === "steer" ? steering : followUps).push({ text });
+        queueUpdate();
+        return respond(id, type);
       }
       case "goal": {
         const op = String(frame.op);
@@ -495,8 +788,43 @@ async function handle(frame: any): Promise<void> {
         if (op === "drop") { const dropped = goal && { ...goal, status: "dropped" }; goal = null; if (dropped) out({ type: "goal_updated", goal: dropped, state: { enabled: false, mode: "active", goal: dropped } }); return respond(id, type, { goal: null, state: null }); }
         return fail(id, type, `Unknown goal op: ${op}`);
       }
-      case "abort": respond(id, type); if (busy) { aborted = true; wake?.(); } return;
-      case "compact": append("compaction", { summary: "Stub summary", tokensBefore: 100, firstKeptEntryId: leaf ?? "" }); return respond(id, type, { summary: "Stub summary" });
+      case "abort": {
+        if (goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
+        if (!busy) return respond(id, type);
+        aborted = true; wake?.();
+        abortWaiters.push(() => respond(id, type));
+        return;
+      }
+      case "abort_and_restore_queue": {
+        const restored = { steering: steering.splice(0).map((q) => ({ text: q.text })), followUp: followUps.splice(0).map((q) => ({ text: q.text })) };
+        queueUpdate();
+        if (goal?.status === "active") { goal = { ...goal, status: "paused" }; goalEvent(); }
+        if (!busy) return respond(id, type, restored);
+        aborted = true; wake?.();
+        abortWaiters.push(() => respond(id, type, restored));
+        return;
+      }
+      case "abort_and_prompt": {
+        const text = String(frame.message ?? "");
+        const start = () => { respond(id, type); void runAgent(openTicket(id, false), text); };
+        if (!busy) return start();
+        aborted = true; wake?.();
+        abortWaiters.push(start);
+        return;
+      }
+      case "compact": {
+        // omp refuses a session too small to summarise (and says so with the manual_compaction frames).
+        const size = messages().reduce((n, m) => n + JSON.stringify(m.content ?? "").length, 0);
+        out({ type: "manual_compaction_start" });
+        if (size < 4000) {
+          out({ type: "manual_compaction_end", aborted: false, skipped: true, errorMessage: "Nothing to compact (session too small)" });
+          return fail(id, type, "Nothing to compact (session too small)");
+        }
+        const result = { summary: "Stub summary", shortSummary: "Stub summary", firstKeptEntryId: leaf ?? "", tokensBefore: Math.round(size / 4), details: { readFiles: [], modifiedFiles: [] } };
+        append("compaction", result);
+        out({ type: "manual_compaction_end", result, aborted: false });
+        return respond(id, type, result);
+      }
       case "bash": return respond(id, type, { output: "", exitCode: 0 });
       case "export_html": {
         const outputPath = frame.outputPath ?? join(cwd, `omp-session-${header.id}.html`);

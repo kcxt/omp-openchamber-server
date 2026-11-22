@@ -14,8 +14,9 @@
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { normalizeModelsResponse, withOmpRpc } from "../../providers/omp/rpc";
-import { listOmpConfig, listOmpSetKeys, resetOmpConfigKey, setOmpConfigValue } from "../../vendor/kabmo/config-cli";
+import { Utility } from "../omp/utility";
+import { normalizeModelsResponse } from "../providers/omp/rpc";
+import { listOmpConfig, listOmpSetKeys, resetOmpConfigKey, setOmpConfigValue } from "../vendor/kabmo/config-cli";
 import { loadSettingsSchema, refreshSettingsSchema, runningOmpVersion, schemaRefreshStatus } from "./omp-settings-schema";
 
 export interface SettingsRouteResult {
@@ -60,7 +61,7 @@ let modelsCache: { at: number; models: Array<{ selector: string; name: string }>
 async function listModelSelectors(): Promise<Array<{ selector: string; name: string }>> {
   if (modelsCache && Date.now() - modelsCache.at < MODELS_TTL_MS) return modelsCache.models;
   try {
-    const raw = await withOmpRpc(process.cwd(), (conn) => conn.request("get_available_models"));
+    const raw = await Utility.for(process.cwd()).availableModels();
     const models = normalizeModelsResponse(raw)
       .filter((model) => typeof model.provider === "string" && typeof model.id === "string")
       .map((model) => ({ selector: `${model.provider}/${model.id}`, name: typeof model.name === "string" ? model.name : model.id }))

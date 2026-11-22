@@ -397,8 +397,9 @@ export function createMessageQueueRuntime(): MessageQueueRuntime {
     };
 
     try {
-      // A terminal omp holding the session would make this send fork it; keep the item queued and retry.
-      const result = (await sessionOwnedElsewhere(sessionId, entry.directory, session.path))
+      // A terminal omp holding the session would make this send fork it, and unknown ownership is
+      // no proof it is free: keep the item queued and retry.
+      const result = (await sessionOwnedElsewhere(sessionId, entry.directory, session.path)) !== false
         ? { queued: false }
         : await promptSessionAsync(sessionId, entry.directory, session.path, body);
       if (!result.queued) {

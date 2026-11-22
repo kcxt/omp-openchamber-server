@@ -141,13 +141,14 @@ async function tick(entry: Followed): Promise<void> {
       const records = await backendForSession(entry.id).store.transcript?.(entry.id, entry.cwd);
       if (records && applyTranscript(entry, records, now)) {
         entry.lastOwnerCheck = now;
-        if (await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) setBusy(entry, true);
+        if ((await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) === true) setBusy(entry, true);
       }
     }
     // Progress is a new message, never file growth: metadata appends must not keep a dead turn busy.
     if (entry.busy && now - entry.lastGrowth > OWNER_CHECK_MS && now - entry.lastOwnerCheck > OWNER_CHECK_MS) {
       entry.lastOwnerCheck = now;
-      if (!(await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path))) setBusy(entry, false);
+      // Unknown ownership keeps the turn busy; the next owner check asks again.
+      if ((await sessionOwnedElsewhere(entry.id, entry.cwd, entry.path)) === false) setBusy(entry, false);
     } else if (entry.seen && !entry.busy && now - entry.lastGrowth > EXPIRE_MS) {
       followed.delete(keyOf(entry.id, entry.cwd));
     }

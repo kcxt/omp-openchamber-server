@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getExplicitOmpBinary } from "../../providers/omp/binary";
-import { withOmpRpc } from "../../providers/omp/rpc";
+import { Utility } from "../../omp/utility";
 import { listAvailableCommands } from "./discovery";
 
 type Json = Record<string, unknown>;
@@ -277,7 +277,7 @@ export async function listOmpSlashCommands(directory: string): Promise<SlashComm
   if (pending) return pending;
   const load = (async () => {
     try {
-      const data = await withOmpRpc(directory, (conn) => conn.request("get_available_commands")) as { commands?: Array<{ name?: unknown; description?: unknown }> };
+      const data = await Utility.for(directory).availableCommands() as { commands?: Array<{ name?: unknown; description?: unknown }> };
       const commands = (data?.commands ?? [])
         .filter((command): command is { name: string; description?: unknown } => typeof command.name === "string" && command.name.length > 0)
         .map((command) => ({ name: command.name, ...(typeof command.description === "string" && command.description ? { description: command.description } : {}) }));

@@ -13,7 +13,7 @@ import {
   type OmpContextPoint,
   type OmpSessionContext,
 } from "../../providers/omp/context";
-import { withOmpRpc } from "../../providers/omp/rpc";
+import { Utility } from "../../omp/utility";
 import type { AgentBackend, OpenCodeMessageRecord, OpenCodeSession } from "../../providers/types";
 
 export const OMP_CONTEXT_VERSION = 1;
@@ -83,11 +83,8 @@ export function buildOmpContext(
 /** omp's categorical breakdown for the session, or `null` when this omp has no `get_context_breakdown`. */
 async function readBreakdown(session: OpenCodeSession): Promise<OmpContextBreakdown | null> {
   try {
-    return await withOmpRpc(session.directory, async (conn) => {
-      await conn.switchSession(session.path);
-      const raw = await conn.request("get_context_breakdown");
-      return raw && typeof raw === "object" ? raw as OmpContextBreakdown : null;
-    });
+    const raw = await Utility.for(session.directory).contextBreakdown(session.path);
+    return raw && typeof raw === "object" ? raw as OmpContextBreakdown : null;
   } catch {
     return null;
   }

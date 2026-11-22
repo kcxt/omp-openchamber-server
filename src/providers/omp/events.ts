@@ -11,7 +11,8 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import type { ModelRef, NormalizedTurnEvent, ToolPartState, TokenBreakdown, TurnTelemetry } from "../types";
-import { invalidateMessageCache, mapOmpUsageToTokens, extractUserMessageText } from "./messages";
+import { extractUserMessageText } from "./messages";
+import { mapOmpUsageToTokens } from "../../omp/transcript-reader";
 import { readSessionHeader, readSessionIdSync, toOpenCodeSessionId } from "./store";
 import { attachTodosToState, extractTodosFromOmpDetails, isTodoTool, openCodeToolName } from "./todo";
 import type { OmpRpcEvent, OmpRpcTransport } from "./rpc";
@@ -721,9 +722,6 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
         aborted,
         willRetry,
       });
-      if (!aborted) {
-        invalidateMessageCache(openCodeId, cwd);
-      }
       return;
     }
 
@@ -739,7 +737,6 @@ export function createOmpEventNormalizer(ctx: OmpEventNormalizerContext): OmpEve
       pendingTurnError = undefined;
       const aborted = Boolean(event.aborted);
       emit({ kind: "compaction_end", aborted, willRetry: false });
-      if (!aborted) invalidateMessageCache(openCodeId, cwd);
       const failure = typeof event.errorMessage === "string" ? event.errorMessage.trim() : "";
       if (failure) emit({ kind: "notice", text: failure, level: event.skipped ? "info" : "warning" });
       return;

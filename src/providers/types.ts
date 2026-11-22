@@ -453,8 +453,6 @@ export interface SessionStore {
   setTitle(openCodeId: string, title: string, source: "auto" | "user", cwd: string): Promise<void>;
   children(parentOpenCodeId: string, directory?: string | null): Promise<OpenCodeSession[]>;
   transcript(openCodeId: string, cwd: string): Promise<OpenCodeMessageRecord[] | null>;
-  /** Called before dispatching a turn (cache invalidation hooks). */
-  beforeTurn?(openCodeId: string, cwd: string): void;
   recordUserMessage?(
     openCodeId: string,
     text: string,
@@ -479,7 +477,10 @@ export interface AgentBackend {
     openCodeId: string,
     auth?: BackendCredentialInput,
   ): Promise<BackendTurnConnection>;
-  /** True when another live process (a terminal omp) owns the session's transcript. */
-  sessionOwnedElsewhere?(cwd: string, transcriptPath: string): Promise<boolean>;
+  /**
+   * True when another live process (a terminal omp) owns the session's transcript.
+   * `undefined` when ownership could not be determined (probe failed or omp reported the id unknown).
+   */
+  sessionOwnedElsewhere?(cwd: string, transcriptPath: string): Promise<boolean | undefined>;
   shutdownAll(): void;
 }

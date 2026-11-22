@@ -13,3 +13,8 @@ smoke run, or throwaway script.
   e2e harness does) before running a real binary.
 - If a live model call is genuinely required, use a free endpoint only — e.g. an `nvidia/*` model —
   and keep it to the smallest possible number of requests.
+
+## Editing files
+
+ALWAYS use the read tool and the edit tool to read and change files. NEVER use sed, perl, python or
+other inline find/replace unless genuinely necessary.

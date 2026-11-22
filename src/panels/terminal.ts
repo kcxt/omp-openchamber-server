@@ -9,8 +9,8 @@ import { randomUUID } from "node:crypto";
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, resolve } from "node:path";
-import { emitOpenCodeEvent } from "../../shared/sse";
-import { logger } from "../../shared/logger";
+import { emitOpenCodeEvent } from "../shared/sse";
+import { logger } from "../shared/logger";
 
 type Json = Record<string, unknown>;
 

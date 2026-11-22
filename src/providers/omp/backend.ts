@@ -20,10 +20,10 @@ import type {
   SessionStore,
   TurnPromptInput,
 } from "../types";
-import { quarantineLegacyOcRecords } from "./oc-records";
 import { resolveBackendCredentials } from "./credentials";
+import { RpcChild } from "../../omp/rpc-child";
+import { Utility } from "../../omp/utility";
 import {
-  OmpRpcConnection,
   getCurrentModel,
   mapRpcModelsToOpenCodeProviders,
   normalizeModelsResponse,
@@ -32,7 +32,7 @@ import {
 } from "./rpc";
 import { rememberModelWindows } from "./context";
 import { createOmpEventNormalizer, OMP_DEFAULT_MODEL } from "./events";
-import { forkOmpSession, invalidateMessageCache, loadSessionMessages, recordUserMessageId, truncateOmpSessionAtMessage } from "./messages";
+import { forkOmpSession, loadSessionMessages, recordUserMessageId, truncateOmpSessionAtMessage } from "./messages";
 import {
   createOmpSession,
   deleteOmpSession,
@@ -66,14 +66,9 @@ export type OmpTransportFactory = (
 ) => Promise<OmpRpcTransport>;
 
 const defaultOmpTransportFactory: OmpTransportFactory = async (cwd, sessionPath, credential) => {
-  // Older sidecars appended id-less records to omp's transcript, which leaves
-  // the session's active leaf undefined: the child would load an empty history.
-  await quarantineLegacyOcRecords(sessionPath).catch((err) => {
-    logger.warn({ err, sessionPath }, "[omp] could not move legacy sidecar records out of the transcript");
-  });
   const conn = credential
-    ? await OmpRpcConnection.spawn(cwd, 3, { credential })
-    : await OmpRpcConnection.spawn(cwd);
+    ? await RpcChild.spawn(cwd, 3, { credential })
+    : await RpcChild.spawn(cwd);
   try {
     try {
       await conn.switchSession(sessionPath);
@@ -259,9 +254,8 @@ const ompCapabilities: BackendCapabilities = {
 };
 
 /**
- * SessionStore facade over the omp on-disk store. Hooks (beforeTurn,
- * recordUserMessage) wire the message cache + user-message ledger so
- * prompt.ts stays backend-agnostic.
+ * SessionStore facade over the omp on-disk store. `recordUserMessage` wires the
+ * user-message ledger so prompt.ts stays backend-agnostic.
  */
 const ompStore: SessionStore = {
   async create(directory, init) {
@@ -298,18 +292,14 @@ const ompStore: SessionStore = {
   async commitRevert(openCodeId, messageID, directory) {
     return truncateOmpSessionAtMessage(openCodeId, directory ?? "", messageID);
   },
-  async adoptTranscript(openCodeId, transcriptPath, cwd) {
+  async adoptTranscript(openCodeId, transcriptPath) {
     await adoptOmpTranscript(openCodeId, transcriptPath);
-    invalidateMessageCache(openCodeId, cwd);
   },
   async fork(openCodeId, directory, before) {
     return forkOmpSession(openCodeId, directory, before);
   },
   async move(openCodeId, directory, sourceDirectory) {
-    if (sourceDirectory) invalidateMessageCache(openCodeId, sourceDirectory);
-    const moved = await moveOmpSession(openCodeId, directory, sourceDirectory);
-    if (moved) invalidateMessageCache(openCodeId, moved.directory);
-    return moved;
+    return moveOmpSession(openCodeId, directory, sourceDirectory);
   },
   async setTitle(openCodeId, title, source, cwd) {
     await setOmpSessionTitle(openCodeId, title, source, cwd);
@@ -319,9 +309,6 @@ const ompStore: SessionStore = {
   },
   async transcript(openCodeId, cwd) {
     return loadSessionMessages(openCodeId, cwd);
-  },
-  beforeTurn(openCodeId, cwd) {
-    invalidateMessageCache(openCodeId, cwd);
   },
   recordUserMessage(openCodeId, text, messageId, parts) {
     recordUserMessageId(openCodeId, text, messageId, undefined, parts);
@@ -337,17 +324,19 @@ export const ompBackend: AgentBackend = {
   store: ompStore,
   async listModels(cwd, auth?: BackendCredentialInput): Promise<OpenCodeProvidersResponse> {
     const credential = await resolveBackendCredentials(auth, { cwd });
-    const readModels = async (conn: OmpRpcConnection): Promise<OpenCodeProvidersResponse> => {
-      const rawModels = await conn.request("get_available_models");
-      const models = normalizeModelsResponse(rawModels);
-      const currentModel = await getCurrentModel(conn);
+    const readModels = async (request: OmpRpcTransport["request"]): Promise<OpenCodeProvidersResponse> => {
+      const models = normalizeModelsResponse(await request("get_available_models"));
+      const currentModel = await getCurrentModel({ request });
       const providers = mapRpcModelsToOpenCodeProviders(models, currentModel?.providerID, currentModel?.modelID);
       rememberModelWindows(providers);
       return providers;
     };
-    return credential
-      ? withOmpRpc(cwd, readModels, { credential })
-      : withOmpRpc(cwd, readModels);
+    if (!credential) {
+      const utility = Utility.for(cwd);
+      return readModels((method, params, timeoutMs) => utility.request(method, params, timeoutMs));
+    }
+    // Caller-owned credentials are per child: a shared utility cannot carry them.
+    return withOmpRpc(cwd, (conn) => readModels((method, params, timeoutMs) => conn.request(method, params, timeoutMs)), { credential });
   },
   async createTurnConnection(cwd, sessionPath, openCodeId, auth?: BackendCredentialInput) {
     const credential = await resolveBackendCredentials(auth, {
@@ -362,13 +351,17 @@ export const ompBackend: AgentBackend = {
   async sessionOwnedElsewhere(cwd, transcriptPath) {
     const id = readSessionIdSync(transcriptPath);
     if (!id) return false;
-    // A fresh omp that never opened the session: `held` can only be another process.
-    return withOmpRpc(cwd, async (conn) => {
-      const lease = (await conn.request("get_session_lease", { sessionIds: [id] })) as { held?: unknown } | undefined;
-      return Array.isArray(lease?.held) && lease.held.includes(id);
-    }).catch(() => false);
+    // A utility omp never opened the session: `held` can only be another process.
+    try {
+      const lease = await Utility.for(cwd).leaseHeld([id]);
+      if (lease.held.includes(id)) return true;
+      return lease.unknown.includes(id) ? undefined : false;
+    } catch {
+      return undefined;
+    }
   },
   shutdownAll() {
-    OmpRpcConnection.killAll();
+    Utility.shutdown();
+    RpcChild.killAll();
   },
 };
