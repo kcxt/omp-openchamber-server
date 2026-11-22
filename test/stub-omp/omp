@@ -40,9 +40,10 @@
 //   OMP_STUB_NO_MODELS  1 = no models are available (only `omp session inspect` / `omp models` use it in practice)
 //   OMP_STUB_PROVIDER  provider id of the stub's models (default "stub")
 //   --auto-title      like omp's flag of the same name: the session names itself. Once the first assistant message of a session
-//                    without a title is written, ~40 ms later the stub writes a title into the transcript's title slot and emits
-//                    NO frame, as omp does. The title is the script's top-level `"title"` string, else the first six words of
-//                    the first user message. Without the flag (omp's RPC mode default) a session is never titled.
+//                    without a title is written, after the script's top-level `"titleDelayMs"` (default 40 ms) the stub writes
+//                    a title into the transcript's title slot and emits `session_info_update {title, sessionId}`, as the
+//                    patched omp does. The title is the script's top-level `"title"` string, else the first six words of the
+//                    first user message. Without the flag (omp's RPC mode default) a session is never titled.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -317,20 +318,22 @@ function noteTitleInput(text: string): void {
 function setTitle(title: string): void {
   header = { ...header, title };
   if (file) writeFileSync(file, titleSlot(title) + readFileSync(file, "utf8").split("\n").slice(1).join("\n"));
+  // As the patched omp: every title change, generated or set, is announced.
+  out({ type: "session_info_update", title, sessionId: header.id });
 }
 function armAutoTitle(): void {
   if (titleInput === undefined || titleTimer || header.title) return;
   const input = titleInput;
+  let scripted: { title?: unknown; titleDelayMs?: unknown } = {};
+  const path = process.env.OMP_STUB_SCRIPT;
+  if (path && existsSync(path)) {
+    try { scripted = JSON.parse(readFileSync(path, "utf8")); } catch { /* derived below */ }
+  }
   titleTimer = setTimeout(() => {
     titleTimer = undefined;
     if (header.title) return;
-    let scripted: unknown;
-    const path = process.env.OMP_STUB_SCRIPT;
-    if (path && existsSync(path)) {
-      try { scripted = JSON.parse(readFileSync(path, "utf8")).title; } catch { /* derived below */ }
-    }
-    setTitle(typeof scripted === "string" && scripted.trim() ? scripted.trim() : input.trim().split(/\s+/).slice(0, 6).join(" "));
-  }, 40);
+    setTitle(typeof scripted.title === "string" && scripted.title.trim() ? scripted.title.trim() : input.trim().split(/\s+/).slice(0, 6).join(" "));
+  }, typeof scripted.titleDelayMs === "number" ? scripted.titleDelayMs : 40);
 }
 function usage(outTokens: number) {
   return { input: 100, output: outTokens, cacheRead: 0, cacheWrite: 0, totalTokens: 100 + outTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };

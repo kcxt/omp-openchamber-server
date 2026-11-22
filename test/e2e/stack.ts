@@ -128,9 +128,12 @@ export async function startStack(options: { env?: Record<string, string>; binary
     stubBin: STUB,
     env: baseEnv,
 
-    /** Replace the stub's script; takes effect on the next prompt. `title` is what the stub's `--auto-title` names a session. */
-    script(turns: Turn[], title?: string): void {
-      writeFileSync(scriptFile, JSON.stringify({ turns, ...(title ? { title } : {}) }));
+    /**
+     * Replace the stub's script; takes effect on the next prompt. `title` is what the stub's `--auto-title`
+     * names a session, `titleDelayMs` how long after the first answer it does (default 40 ms).
+     */
+    script(turns: Turn[], options: { title?: string; titleDelayMs?: number } = {}): void {
+      writeFileSync(scriptFile, JSON.stringify({ turns, ...options }));
     },
     /** Frames the sidecar sent to any stub omp, in order. */
     frames(): Array<Record<string, any>> {

@@ -12,7 +12,7 @@ import { getOmpSessionByOpenCodeId, updateOmpSession } from "../store/sessions";
 import type { BackendCredentialInput, BackendGoalSnapshot } from "../shared/types";
 import { ocPatchForOmpGoal, withGoalPatch, type OcGoal } from "../adapters/openchamber/goal";
 import { writeMetadataThroughOpenChamber } from "../adapters/openchamber/metadata-bridge";
-import { emitOpenCodeV2Event, emitSessionIdle, emitSessionStatus } from "../shared/sse";
+import { emitOpenCodeV2Event, emitSessionError, emitSessionIdle, emitSessionStatus } from "../shared/sse";
 import { promptLogger } from "../shared/logger";
 import { SessionRuntime, type CloseReason, type RuntimeState, type SubagentInfo } from "./runtime";
 
@@ -61,10 +61,15 @@ async function mirrorGoal(runtime: SessionRuntime, goal: BackendGoalSnapshot | n
     if (!metadata) return;
     const settles = patch.status !== undefined && patch.status !== "active";
     const goalRecord = (metadata.openchamber as Record<string, unknown>).goal;
-    if (settles && (await writeMetadataThroughOpenChamber(runtime.sessionId, { openchamber: { goal: goalRecord } }, runtime.cwd))) return;
+    if (settles) {
+      const failure = await writeMetadataThroughOpenChamber(runtime.sessionId, { openchamber: { goal: goalRecord } }, runtime.cwd);
+      if (!failure) return;
+      emitSessionError(runtime.sessionId, { message: `The goal is ${String(patch.status)}, but the UI could not be told: ${failure}. Reload to see it.` }, runtime.cwd);
+    }
     await updateOmpSession(runtime.sessionId, { metadata }, runtime.cwd);
   } catch (err) {
     promptLogger.warn({ err, sessionID: runtime.sessionId }, "[goal] could not mirror omp's goal into the session metadata");
+    emitSessionError(runtime.sessionId, { message: `could not record the goal's result: ${err instanceof Error ? err.message : String(err)}` }, runtime.cwd);
   }
 }
 

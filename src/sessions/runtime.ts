@@ -111,8 +111,6 @@ interface SubagentEntry extends SubagentInfo {
 export const ABORT_DEADLINE_MS = 5_000;
 /** While active with no run streaming (a pending start or goal continuation), omp's state is re-read this often. */
 const DUE_POLL_MS = 1_000;
-/** Delays of the title re-checks after a run ended with the session still untitled (omp names it from a side request that may land late). */
-const TITLE_RECHECK_MS = [1_000, 2_000, 5_000];
 const CRASH_MESSAGE = "The omp process exited unexpectedly; send another message to restart the session.";
 
 /**
@@ -202,11 +200,8 @@ export class SessionRuntime {
 
   #pollTimer?: ReturnType<typeof setTimeout>;
   #releaseTimer?: ReturnType<typeof setTimeout>;
-  /** The title last published to OpenChamber (output dedupe only: the transcript's title slot is the source). */
+  /** The title last published to OpenChamber (output dedupe only: omp's `session_info_update` is the source). */
   #publishedTitle?: string;
-  #titleReading = false;
-  #titleDirty = false;
-  #titleRecheck?: ReturnType<typeof setTimeout>;
   #unsubscribe: () => void;
   #stateListeners = new Set<(change: StateChange) => void>();
   #goalListeners = new Set<(goal: BackendGoalSnapshot | null, stalled: boolean) => void>();
@@ -601,8 +596,6 @@ export class SessionRuntime {
     this.#state = "closed";
     clearTimeout(this.#pollTimer);
     clearTimeout(this.#releaseTimer);
-    clearTimeout(this.#titleRecheck);
-    void this.#publishTitle(); // omp's last write of the session may have been its title
     this.#unsubscribe();
     this.#child.kill();
     clearSessionApprovals(this.sessionId);
@@ -632,43 +625,13 @@ export class SessionRuntime {
     emitSessionError(this.sessionId, { message: `${what}: ${reason}` }, this.cwd);
   }
 
-  /**
-   * omp emits no event when it names a session: its title lands in the transcript's
-   * title slot. Read it (memoised by the file's stamp) and tell OpenChamber when it
-   * differs from the title last published. Reads do not overlap; a request made
-   * during a read repeats it once.
-   */
-  async #publishTitle(): Promise<void> {
-    if (this.#titleReading) {
-      this.#titleDirty = true;
-      return;
-    }
-    this.#titleReading = true;
-    try {
-      do {
-        this.#titleDirty = false;
-        const title = (await readTranscriptSummary(this.#transcriptPath).catch(() => null))?.title?.trim();
-        if (!title || title === this.#publishedTitle) continue;
-        this.#publishedTitle = title;
-        emitSessionUpdated({ id: this.sessionId, title, time: { updated: Date.now() } }, this.cwd);
-        emitOpenCodeV2Event("session.renamed", { sessionID: this.sessionId, title }, this.cwd);
-      } while (this.#titleDirty);
-    } finally {
-      this.#titleReading = false;
-    }
-  }
-
-  /**
-   * A run ended: check the title now, and while the session is still untitled
-   * a few more times, because omp names a session from a side request that can
-   * outlive the run it follows.
-   */
-  #recheckTitle(attempt = 0): void {
-    void this.#publishTitle();
-    clearTimeout(this.#titleRecheck);
-    if (this.#publishedTitle || attempt >= TITLE_RECHECK_MS.length || this.#state === "closed") return;
-    this.#titleRecheck = setTimeout(() => this.#recheckTitle(attempt + 1), TITLE_RECHECK_MS[attempt]);
-    this.#titleRecheck.unref?.();
+  /** omp named the session (`session_info_update`): tell OpenChamber, once per distinct title. */
+  #publishTitle(raw: unknown): void {
+    const title = typeof raw === "string" ? raw.trim() : "";
+    if (!title || title === this.#publishedTitle) return;
+    this.#publishedTitle = title;
+    emitSessionUpdated({ id: this.sessionId, title, time: { updated: Date.now() } }, this.cwd);
+    emitOpenCodeV2Event("session.renamed", { sessionID: this.sessionId, title }, this.cwd);
   }
 
   async #getState(timeoutMs?: number): Promise<Record<string, unknown> | undefined> {
@@ -754,7 +717,7 @@ export class SessionRuntime {
     }
     // The translator first: a run's closing events go out before the idle they lead to.
     this.#translator.handle(frame);
-    if (frame.type === "message_end") void this.#publishTitle();
+    if (frame.type === "session_info_update") this.#publishTitle(frame.title);
     switch (frame.type) {
       case "agent_start":
         this.#runLive = true;
@@ -768,7 +731,6 @@ export class SessionRuntime {
         // Until omp says otherwise, a next run may be due (goal continuation): no idle in between.
         this.#due = true;
         void this.#checkDue();
-        this.#recheckTitle();
         break;
       case "prompt_result":
         if (!this.#runLive) {

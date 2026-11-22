@@ -1,7 +1,7 @@
 // `--auto-title`: an RPC omp names its session from the first message, as the interactive mode does (RPC hosts
-// opt in; `--mode rpc` alone never titles). omp emits NO event when it does: the title lands in the transcript's
-// title slot (first line), which is where the sidecar reads it. Runs against the stub and the real omp; the real
-// omp's title request goes to the fake provider, which answers it with the script's `title`.
+// opt in; `--mode rpc` alone never titles). The title lands in the transcript's title slot and, with the patched
+// omp, is announced by `session_info_update {title, sessionId}` (every title change, not only a command's). Runs
+// against the stub and the real omp; the real omp's title request goes to the fake provider (the script's `title`).
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readTranscript, Rig, sleep, type OmpChild } from "./harness";
 
@@ -27,16 +27,15 @@ async function firstRun(c: OmpChild, message: string): Promise<string> {
 }
 
 describe(`--auto-title (${rig.kind})`, () => {
-  test("a first prompt leads to a non-empty title in the transcript's title slot, announced by no frame", async () => {
+  test("a first prompt leads to a title in the transcript's title slot, announced by session_info_update", async () => {
     rig.setScript({ turns: [], title: "Scripted session title" });
     const c = await rig.spawn({ args: ["--auto-title"] });
     const m = c.mark();
     const file = await firstRun(c, "please fix the broken build");
-    const start = Date.now();
-    while (!slotOf(file)?.title && Date.now() - start < 30_000) await sleep(100);
+    // The title lands after the run, from a side request: the frame is the only signal a host gets.
+    const info = await c.waitFor((f) => f.type === "session_info_update" && typeof f.title === "string" && f.title.length > 0, { from: m, label: "session_info_update with a title" });
+    expect(info.title).toBe("Scripted session title");
     expect(slotOf(file)?.title).toBe("Scripted session title");
-    // No frame says the title changed: a host has to read the slot.
-    expect(c.frames.slice(m).some((f) => /title|renamed/i.test(String(f.type)))).toBe(false);
   });
 
   test("without the flag an RPC session is never titled", async () => {

@@ -61,25 +61,56 @@ async function post(base: string, path: string, body: unknown, cookie: string | 
 
 /**
  * Writes `patch` (a JSON merge patch) into the session's metadata through
- * OpenChamber, so its UI is told. Returns false, after logging a warning, when
- * OpenChamber could not be reached or refused: the caller then writes the
- * session document itself.
+ * OpenChamber, so its UI is told. Resolves to `undefined` on success, else to
+ * why it failed (logged as a warning): the caller then writes the session
+ * document itself and should tell the user the UI was not updated.
  */
-export async function writeMetadataThroughOpenChamber(sessionID: string, patch: Record<string, unknown>, directory: string): Promise<boolean> {
+export async function writeMetadataThroughOpenChamber(sessionID: string, patch: Record<string, unknown>, directory: string): Promise<string | undefined> {
   const base = openChamberUrl();
   const path = `/api/openchamber/sessions/${encodeURIComponent(sessionID)}/metadata`;
   const body = { patch, directory };
   const password = process.env.OPENCHAMBER_UI_PASSWORD;
+  let reason: string;
   try {
     let res = await post(base, path, body, sessionCookie);
     if (res.status === 401 && password) {
       sessionCookie = await login(base, password);
       res = await post(base, path, body, sessionCookie);
     }
-    if (res.ok) return true;
-    logger.warn({ sessionID, status: res.status, base }, "[metadata] OpenChamber refused the metadata write; writing the session directly");
+    if (res.ok) return undefined;
+    reason = res.status === 401
+      ? `OpenChamber at ${base} requires a login (set OPENCHAMBER_UI_PASSWORD for the sidecar)`
+      : `OpenChamber at ${base} refused it (HTTP ${res.status})`;
   } catch (err) {
-    logger.warn({ err, sessionID, base }, "[metadata] OpenChamber is unreachable (set OC_OPENCHAMBER_URL); writing the session directly");
+    reason = `OpenChamber is unreachable at ${base} (${err instanceof Error ? err.message : String(err)}; set OC_OPENCHAMBER_URL)`;
   }
-  return false;
+  logger.warn({ sessionID, base }, `[metadata] ${reason}; writing the session directly`);
+  return reason;
+}
+
+/**
+ * `GET /api/omp/openchamber-bridge`: can the sidecar reach OpenChamber and log in?
+ * Reads a nonexistent session's metadata, which needs only authentication.
+ */
+export async function checkOpenChamberBridge(): Promise<Record<string, unknown>> {
+  const base = openChamberUrl();
+  const password = process.env.OPENCHAMBER_UI_PASSWORD;
+  const report: Record<string, unknown> = { url: base, passwordSet: Boolean(password) };
+  const probe = () => fetch(`${base}/api/openchamber/sessions/ses_bridgeprobe/metadata`, {
+    headers: sessionCookie ? { cookie: sessionCookie } : {},
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  try {
+    let res = await probe();
+    if (res.status === 401 && password) {
+      sessionCookie = await login(base, password);
+      res = await probe();
+    }
+    report.status = res.status;
+    report.ok = res.status !== 401 && res.status < 500;
+  } catch (err) {
+    report.ok = false;
+    report.error = err instanceof Error ? err.message : String(err);
+  }
+  return report;
 }
