@@ -79,6 +79,28 @@ describe("one busy period per omp run", () => {
   });
 });
 
+describe("pending inbox", () => {
+  test("a steer omp has not read yet is listed by GET /inbox until it is delivered", async () => {
+    stack.script([
+      { when: "long run", steps: [{ text: "working " }, { sleep: 2_500 }, { text: "done" }] },
+      { when: "steer me", steps: [{ text: "steered" }] },
+    ]);
+    const id = await createSession();
+    await prompt(id, { id: "msg_runtimeC0001", parts: [{ type: "text", text: "long run" }] });
+    const rec = await record();
+    await rec.until("the run to stream", () => rec.of(id, "session.text.delta").length > 0);
+    await prompt(id, { id: "msg_runtimeC0002", parts: [{ type: "text", text: "steer me" }], delivery: "steer" });
+    await Bun.sleep(200);
+
+    const pending = (await stack.http(`/session/${id}/inbox?${dir()}`)).body.data as any[];
+    expect(pending.map((item) => [item.id, item.delivery, item.payload.text])).toEqual([["msg_runtimeC0002", "steer", "steer me"]]);
+
+    await rec.until("the steer to be read", () => rec.of(id, "session.inbox.delivered").some((e) => e.data.inboxID === "msg_runtimeC0002"), 10_000);
+    await rec.stop();
+    expect(((await stack.http(`/session/${id}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
+  });
+});
+
 describe("Esc", () => {
   test("with queued input: the queue is sent again right after the run stops, under the ids the client shows", async () => {
     stack.script([{ when: "hold on", steps: [{ text: "holding " }, { sleep: 20_000 }, { text: "never" }] }]);

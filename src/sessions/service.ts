@@ -144,7 +144,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
     }
   }
 
-  emitUserPrompt(session.id, session.directory, prepared, body, runtime.model);
+  const inbox = emitUserPrompt(session.id, session.directory, prepared, body, runtime.model);
   if (prepared.message !== prepared.visibleText || prepared.visibleParts.length > 1) {
     // The transcript holds the whole message; what the user typed is the sidecar's to remember.
     const uuid = readSessionIdSync(session.path);
@@ -165,6 +165,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
         message: prepared.message,
         images: prepared.images,
         hostMessageId: prepared.messageID,
+        inbox,
         delivery: body.delivery === "steer" ? "steer" : "queue",
       });
     }

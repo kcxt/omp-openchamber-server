@@ -19,3 +19,10 @@ smoke run, or throwaway script.
 
 ALWAYS use the read tool and the edit tool to read and change files. NEVER use sed, perl, python or
 other inline find/replace unless genuinely necessary.
+
+## OpenChamber source
+
+The OpenChamber source checkout is at `/hdd/brute/projects/openchamber` (UI in `packages/ui/src`, e.g.
+`lib/opencode/events.ts` for SSE event handling, `lib/opencode/projection.ts`, `sync/`, `components/chat/`).
+Read it when you need to know how OpenChamber consumes the sidecar's routes and events. NEVER grep the
+minified bundles under `/usr/lib/node_modules/@openchamber` or `node_modules/@opencode/client/dist`.

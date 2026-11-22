@@ -323,7 +323,13 @@ export async function preparePrompt(sessionId: string, cwd: string, body: Prompt
  * inbox item (`session.inbox.enqueued`, delivered once omp journals it), the
  * user message, then its file and text parts.
  */
-export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<PreparedPrompt, "messageID" | "visibleText" | "visibleParts">, body: PromptBody, model: ModelRef): void {
+/** The inbox item announced for a prompt (`session.inbox.enqueued`), kept to answer `GET /session/:id/inbox`. */
+export interface AnnouncedInbox {
+  item: Record<string, unknown>;
+  created: number;
+}
+
+export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<PreparedPrompt, "messageID" | "visibleText" | "visibleParts">, body: PromptBody, model: ModelRef): AnnouncedInbox {
   const { messageID } = prompt;
   const created = Date.now() - 1;
   const filePayload = [
@@ -339,21 +345,19 @@ export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<Prep
       return source ? [toV2FileAttachment({ uri: source, mime, ...(typeof value.filename === "string" ? { name: value.filename } : {}) })] : [];
     }),
   ];
-  emitOpenCodeV2Event("session.inbox.enqueued", {
-    sessionID: sessionId,
-    inboxID: messageID,
-    item: {
-      type: "user",
-      delivery: body.delivery ?? "queue",
-      payload: {
-        text: prompt.visibleText,
-        files: filePayload,
-        ...(body.agents ? { agents: body.agents } : {}),
-        ...(body.skills ? { skills: body.skills } : {}),
-        ...(body.metadata ? { metadata: body.metadata } : {}),
-      },
+  const item = {
+    type: "user",
+    delivery: body.delivery ?? "queue",
+    payload: {
+      text: prompt.visibleText,
+      files: filePayload,
+      ...(body.agents ? { agents: body.agents } : {}),
+      ...(body.skills ? { skills: body.skills } : {}),
+      ...(body.metadata ? { metadata: body.metadata } : {}),
     },
-  }, cwd);
+  };
+  const announcedAt = Date.now();
+  emitOpenCodeV2Event("session.inbox.enqueued", { sessionID: sessionId, inboxID: messageID, item }, cwd);
   emitMessageUpdated({
     info: {
       id: messageID,
@@ -400,4 +404,5 @@ export function emitUserPrompt(sessionId: string, cwd: string, prompt: Pick<Prep
       sessionID: sessionId,
     }, cwd);
   }
+  return { item, created: announcedAt };
 }

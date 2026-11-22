@@ -56,6 +56,8 @@ export interface PromptInput {
   hostMessageId: string;
   /** Joins a live run at the next turn boundary (`steer`) or after it (`queue`). */
   delivery?: "steer" | "queue";
+  /** What was announced to OpenChamber as `session.inbox.enqueued`, to list the prompt while omp holds it undelivered. */
+  inbox?: { item: Record<string, unknown>; created: number };
 }
 
 /** One queued prompt `abort_and_restore_queue` took back, under the inbox id it was announced with. */
@@ -65,6 +67,7 @@ interface WithdrawnItem {
   images?: ImageContent[];
   /** How the client queued it. */
   delivery: "steer" | "queue";
+  inbox?: PromptInput["inbox"];
 }
 
 /** Queued input `abort_and_restore_queue` withdrew and the sidecar could not send again, with the inbox ids it was announced under. */
@@ -199,7 +202,7 @@ export class SessionRuntime {
   /** Commands that keep the session busy while they run (compaction). */
   #busyCommands = 0;
   /** Client ids of prompts omp accepted and has not journaled yet, in send order (output assembly). */
-  #undelivered: Array<{ id: string; delivery: "steer" | "queue" }> = [];
+  #undelivered: Array<{ id: string; delivery: "steer" | "queue"; inbox?: PromptInput["inbox"] }> = [];
   /** Collects `command_output` while the runtime runs a command itself (`/move`). */
   #capture?: string[];
   readonly #aside: AsideStream;
@@ -315,7 +318,7 @@ export class SessionRuntime {
     return this.#serial(async () => {
       this.#assertOpen();
       if (this.#state === "idle") this.#translator.setParent(input.hostMessageId);
-      this.#undelivered.push({ id: input.hostMessageId, delivery: input.delivery === "steer" ? "steer" : "queue" });
+      this.#undelivered.push({ id: input.hostMessageId, delivery: input.delivery === "steer" ? "steer" : "queue", inbox: input.inbox });
       // A behaviour is always given: omp ignores it when idle, and a run omp
       // starts on its own (a goal continuation) can never refuse the prompt.
       const data = await this.#child.request("prompt", {
@@ -420,7 +423,7 @@ export class SessionRuntime {
     for (let sent = 0; sent < items.length; sent++) {
       const item = items[sent]!;
       try {
-        await this.prompt({ message: item.message, images: item.images, hostMessageId: item.hostMessageId, delivery: "queue" });
+        await this.prompt({ message: item.message, images: item.images, hostMessageId: item.hostMessageId, delivery: "queue", inbox: item.inbox && { ...item.inbox, item: { ...item.inbox.item, delivery: "queue" } } });
       } catch (err) {
         this.#reportProblem(err, "could not send queued messages again after Esc");
         const left = items.slice(sent);
@@ -435,6 +438,11 @@ export class SessionRuntime {
       }
     }
     return { steering: [], followUp: [], inboxIDs: [] };
+  }
+
+  /** Prompts omp accepted and has not journaled yet, as announced to OpenChamber: its inbox. */
+  pendingInbox(): Array<{ id: string; item: Record<string, unknown>; created: number }> {
+    return this.#undelivered.flatMap((entry) => entry.inbox ? [{ id: entry.id, ...entry.inbox }] : []);
   }
 
   /** Compacts the session through its own child. Refused while a run is live. */
@@ -969,7 +977,8 @@ export class SessionRuntime {
     for (const [delivery, list] of [["steer", steering], ["queue", followUp]] as const) {
       list.forEach((entry, index) => {
         const hostMessageId = ids[delivery][index];
-        if (hostMessageId) items.push({ hostMessageId, message: entry.text, ...(entry.images?.length ? { images: entry.images } : {}), delivery });
+        const held = undelivered.find((candidate) => candidate.id === hostMessageId);
+        if (hostMessageId) items.push({ hostMessageId, message: entry.text, ...(entry.images?.length ? { images: entry.images } : {}), delivery, inbox: held?.inbox });
       });
     }
     const sendable = new Set(items.map((item) => item.hostMessageId));

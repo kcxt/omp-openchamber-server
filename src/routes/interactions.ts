@@ -28,6 +28,7 @@ import {
 } from "../shared/sse";
 import type { RouteContext } from "../http/router";
 import { asRecord, readJson } from "../http/response";
+import { Registry } from "../sessions/registry";
 import { messageQueueRuntime } from "../services/instances";
 import { resolveSessionRoute } from "../services/session-route";
 
@@ -179,6 +180,14 @@ export async function handleInteractions(ctx: RouteContext): Promise<Response | 
         },
       };
     });
+    // Prompts omp holds undelivered (a steer waiting for a step boundary, a follow-up): the client shows them
+    // pending after the streaming reply, and without this list a reload or session switch drops them.
+    const { session } = await resolveSessionRoute(sessionId, dir);
+    const held = session ? Registry.get(session.id, session.directory)?.pendingInbox() ?? [] : [];
+    for (const entry of held) {
+      if (items.some((item) => item.id === entry.id)) continue;
+      items.push({ id: entry.id, sessionID: sessionId, time: { created: entry.created }, ...entry.item } as (typeof items)[number]);
+    }
     return json({ data: items });
   }
 

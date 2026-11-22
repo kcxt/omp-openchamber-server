@@ -713,7 +713,7 @@ instead of failing on a missing route.
 |---|---|---|
 | `/fs/directory-stats` | `POST` | `{ "results": [{ "path", "isDirectory", "reason"?, "realPath"? }] }` for a `{ "paths": [...] }` body. `reason` is `not-found`, `not-directory`, or `unavailable`; the client maps the first two to "missing". |
 | `/session-todos/:id` | `GET` | `{ "revision", "state": "ready", "todos": [{ "content", "status" }] }`, read from omp's todo state in the transcript. |
-| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items in the prompt-payload shape the client seeds as optimistic user messages. |
+| `/session/:id/inbox` | `GET` | `{ "data": [...] }` — the pending message-queue items, plus the prompts the session's omp holds but has not read yet (a steer waiting for a step boundary, a follow-up), in the prompt-payload shape the client seeds as pending user messages after a reload. |
 | `/session/:id/inbox/:itemId` | `DELETE` | `204` — cancels a queued prompt. |
 | `/session/:id/inbox/:itemId` | `PATCH` | `409` — delivery mode is chosen by the prompt request, not by a queued item. |
 | `/session/:id/view` | `POST` | `204` — records `time.viewed` from the `idle` timestamp and emits `session.viewed`. |
