@@ -62,7 +62,7 @@ async function promptSubagent(session: OpenCodeSession, text: string, messageID:
   const { runtime, subagent } = found;
   try {
     if (text.trim() === ".") await runtime.resume({ subagentId: subagent.id });
-    else if (subagent.status === "running") await runtime.steerSubagent(subagent.id, text);
+    else if (subagent.status === "running") await runtime.steerSubagent(subagent.id, text, messageID);
     else return { queued: false, status: 409, error: "This subagent has finished. Send \".\" to resume it, or continue in the parent session." };
   } catch (err) {
     return { queued: false, status: 409, error: err instanceof Error ? err.message : String(err) };

@@ -205,3 +205,21 @@ describe("streaming latency", () => {
     expect(deltas.at(-1)!.at - deltas[0]!.at).toBeGreaterThanOrEqual((deltas.length - 1) * TICK_MS * 0.6);
   });
 });
+
+describe("subagent steer", () => {
+  test("is acked (unpinned) when the subagent reads it", async () => {
+    stack.script([{ when: "delegate", steps: [
+      { tool: "task", args: { name: "Reader", task: "work" }, subagent: { steps: [{ text: "working" }, { sleep: 2_000 }] } } as any,
+      { text: "delegated" },
+    ] }]);
+    const id = await createSession();
+    const rec = await record();
+    await prompt(id, { parts: [{ type: "text", text: "delegate it" }] });
+    await rec.until("the subagent", async () => (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.some((j: any) => j.childSessionID));
+    const child = (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.find((j: any) => j.childSessionID).childSessionID as string;
+    await rec.until("the child session", async () => (await stack.http(`/session/${child}?${dir()}`)).status === 200);
+    await prompt(child, { id: "msg_runtimeF0001", parts: [{ type: "text", text: "look at b.c" }], delivery: "steer" });
+    await rec.until("the ack", () => rec.of(child, "session.inbox.delivered").some((e) => e.data.inboxID === "msg_runtimeF0001"), 10_000);
+    await rec.stop();
+  });
+});

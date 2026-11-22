@@ -107,6 +107,8 @@ interface SubagentEntry extends SubagentInfo {
   /** Settles once `childSessionId` is known. */
   resolved?: Promise<void>;
   failure?: string;
+  /** Client ids of steers sent to the subagent that it has not read yet. */
+  pending: string[];
 }
 
 /** How long Esc waits for the parent run to stop before the child is killed (§3.4). */
@@ -544,16 +546,27 @@ export class SessionRuntime {
   // ------------------------------------------------------------------ subagents
 
   subagents(): SubagentInfo[] {
-    return [...this.#subagents.values()].map(({ translator: _t, buffered: _b, failure: _f, resolved: _r, ...info }) => info);
+    return [...this.#subagents.values()].map(({ translator: _t, buffered: _b, failure: _f, resolved: _r, pending: _p, ...info }) => info);
   }
 
   subagentByChild(childSessionId: string): SubagentInfo | undefined {
     return this.subagents().find((entry) => entry.childSessionId === childSessionId);
   }
 
-  steerSubagent(subagentId: string, message: string): Promise<unknown> {
+  /**
+   * Steers a subagent under the client's message id: omp stores it on the subagent's user message, and the
+   * subagent's stream then acks it (`session.inbox.delivered`), which unpins the bubble in OpenChamber.
+   */
+  async steerSubagent(subagentId: string, message: string, hostMessageId?: string): Promise<unknown> {
     this.#assertOpen();
-    return this.#child.request("steer_subagent", { subagentId, message });
+    const entry = this.#subagents.get(subagentId);
+    if (hostMessageId) entry?.pending.push(hostMessageId);
+    try {
+      return await this.#child.request("steer_subagent", { subagentId, message, ...(hostMessageId ? { hostMessageId } : {}) });
+    } catch (err) {
+      if (entry) entry.pending = entry.pending.filter((id) => id !== hostMessageId);
+      throw err;
+    }
   }
 
   /**
@@ -956,7 +969,7 @@ export class SessionRuntime {
       const description = typeof payload.description === "string" && payload.description.trim()
         ? payload.description.trim()
         : typeof payload.assignment === "string" && payload.assignment.trim() ? payload.assignment.trim().split("\n")[0]! : `Subagent (${agent})`;
-      entry = { id, agent, description, sessionFile, status: "running", startedAt: Date.now(), buffered: [] };
+      entry = { id, agent, description, sessionFile, status: "running", startedAt: Date.now(), buffered: [], pending: [] };
       this.#subagents.set(id, entry);
       entry.resolved = this.#resolveChild(entry);
     } else if (sessionFile && !entry.sessionFile) {
@@ -988,7 +1001,10 @@ export class SessionRuntime {
     const childId = toOpenCodeSessionId(ompId ?? entry.id);
     entry.childSessionId = childId;
     const model = this.#translator.model;
-    entry.translator = new TurnTranslator({ sessionId: childId, cwd: this.cwd, model, fullForm: true });
+    entry.translator = new TurnTranslator({
+      sessionId: childId, cwd: this.cwd, model, fullForm: true,
+      host: { delivered: (id) => { entry.pending = entry.pending.filter((held) => held !== id); } },
+    });
     emitSessionCreated({
       id: childId,
       slug: childId,
@@ -1020,6 +1036,10 @@ export class SessionRuntime {
 
   #publishChildEnd(entry: SubagentEntry): void {
     const childId = entry.childSessionId!;
+    // An omp that does not echo the id never acks: a steer still pending when the subagent ends must not stay pinned.
+    for (const inboxID of entry.pending.splice(0)) {
+      emitOpenCodeV2Event("session.inbox.delivered", { sessionID: childId, inboxID }, this.cwd);
+    }
     if (entry.status === "failed") {
       entry.translator?.finishRun(entry.failure ?? "Subagent failed", "error");
       emitSessionError(childId, { message: entry.failure ?? "Subagent failed" }, this.cwd);
