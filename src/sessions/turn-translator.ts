@@ -60,11 +60,24 @@ export interface TranslatorHost {
   journalNotice?(text: string, level: string): void;
   /** omp journaled a user message carrying this host message id. */
   delivered?(hostMessageId: string): void;
+  /**
+   * A subagent stream journals no host ids: the text of a user message the subagent just read, answered with
+   * the inbox id of the steer it matches (and releases), or undefined for a message the host did not send.
+   */
+  claimUserMessage?(text: string): string | undefined;
 }
 
 type PartType = "text" | "reasoning";
 
 const ZERO_TOKENS: TokenBreakdown = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+
+function userText(message: Record<string, unknown>): string {
+  const content = message.content;
+  if (typeof content === "string") return content;
+  return Array.isArray(content)
+    ? content.flatMap((block) => typeof record(block)?.text === "string" ? [record(block)!.text as string] : []).join("\n")
+    : "";
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -459,11 +472,15 @@ export class TurnTranslator {
       this.#emitTool(steer.id, "irc", steer.state);
       return;
     }
-    if (this.#fullForm || message?.role !== "user") return;
+    if (message?.role !== "user") return;
     if (message.synthetic === true || message.attribution === "assistant") return;
     const hostMessageId = typeof message.hostMessageId === "string" && message.hostMessageId
       ? message.hostMessageId
-      : typeof frame.hostMessageId === "string" && frame.hostMessageId ? frame.hostMessageId : undefined;
+      : typeof frame.hostMessageId === "string" && frame.hostMessageId
+        ? frame.hostMessageId
+        : this.#fullForm ? this.#host.claimUserMessage?.(userText(message)) : undefined;
+    // A subagent's other user messages (the assignment its parent gave it) are not the host's.
+    if (this.#fullForm && !hostMessageId) return;
     // A user message without a host id is omp's own (a goal continuation): the
     // assistant reply stays part of the current exchange.
     if (!hostMessageId) return;

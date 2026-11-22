@@ -21,6 +21,8 @@ import {
   isPromptBody,
   makeMessageId,
   preparePrompt,
+  type PreparedPrompt,
+  type PromptBody,
 } from "./prompt-input";
 import { Registry, isSubagentTranscript } from "./registry";
 import { OwnedElsewhereError, type ModelPick, type SessionRuntime, type Withdrawn } from "./runtime";
@@ -54,17 +56,29 @@ function failure(err: unknown): PromptOutcome {
 }
 
 /** A prompt to a subagent's session goes to its parent's runtime: steer while it runs, `.` resumes it. */
-async function promptSubagent(session: OpenCodeSession, text: string, messageID: string): Promise<PromptOutcome> {
+async function promptSubagent(session: OpenCodeSession, prepared: PreparedPrompt, body: PromptBody): Promise<PromptOutcome> {
   const found = Registry.findSubagent(session.id);
   if (!found) {
     return { queued: false, status: 409, error: "This subagent belongs to a session that is not running here. Send to the parent session instead." };
   }
   const { runtime, subagent } = found;
+  const { message: text, messageID } = prepared;
+  const resume = text.trim() === ".";
+  if (!resume && subagent.status !== "running") {
+    return { queued: false, status: 409, error: "This subagent has finished. Send \".\" to resume it, or continue in the parent session." };
+  }
+  // Announced like a root prompt: pending after the streaming reply until the subagent reads it.
+  const model = runtime.subagentModel(session.id) ?? runtime.model;
+  const inbox = emitUserPrompt(session.id, session.directory, prepared, body, model);
   try {
-    if (text.trim() === ".") await runtime.resume({ subagentId: subagent.id });
-    else if (subagent.status === "running") await runtime.steerSubagent(subagent.id, text);
-    else return { queued: false, status: 409, error: "This subagent has finished. Send \".\" to resume it, or continue in the parent session." };
+    if (resume) {
+      await runtime.resume({ subagentId: subagent.id });
+      emitOpenCodeV2Event("session.inbox.delivered", { sessionID: session.id, inboxID: messageID }, session.directory);
+    } else {
+      await runtime.steerSubagent(subagent.id, text, { id: messageID, inbox });
+    }
   } catch (err) {
+    emitOpenCodeV2Event("session.inbox.cancelled", { sessionID: session.id, inboxID: messageID }, session.directory);
     return { queued: false, status: 409, error: err instanceof Error ? err.message : String(err) };
   }
   return { queued: true, messageID };
@@ -105,7 +119,7 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
   if (goalArgs !== undefined) return runGoalCommand(session, goalArgs);
   const prepared = await preparePrompt(session.id, session.directory, body);
   if ("error" in prepared) return { queued: false, error: prepared.error, status: 400 };
-  if (isSubagentTranscript(session.path)) return promptSubagent(session, prepared.message, prepared.messageID);
+  if (isSubagentTranscript(session.path)) return promptSubagent(session, prepared, body);
 
   // OpenCode's v2 prompt body carries no model: the pick lives on the session
   // record (set at create, or by POST /session/:id/model).

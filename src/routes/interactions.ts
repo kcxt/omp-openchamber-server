@@ -183,7 +183,9 @@ export async function handleInteractions(ctx: RouteContext): Promise<Response | 
     // Prompts omp holds undelivered (a steer waiting for a step boundary, a follow-up): the client shows them
     // pending after the streaming reply, and without this list a reload or session switch drops them.
     const { session } = await resolveSessionRoute(sessionId, dir);
-    const held = session ? Registry.get(session.id, session.directory)?.pendingInbox() ?? [] : [];
+    // A subagent's session has no runtime of its own: its parent's runtime holds the steers it has not read.
+    const held = !session ? [] : Registry.findSubagent(session.id)?.runtime.subagentPendingInbox(session.id)
+      ?? Registry.get(session.id, session.directory)?.pendingInbox() ?? [];
     for (const entry of held) {
       if (items.some((item) => item.id === entry.id)) continue;
       items.push({ id: entry.id, sessionID: sessionId, time: { created: entry.created }, ...entry.item } as (typeof items)[number]);

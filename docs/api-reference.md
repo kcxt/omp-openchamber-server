@@ -474,6 +474,10 @@ close that omp.
   client id. On a subagent session `.` resumes that subagent.
 - A prompt to a subagent session goes to its parent's runtime: `steer_subagent`
   while it runs, otherwise `409` (send `.` to resume it, or prompt the parent).
+  It is announced like any prompt (`session.inbox.enqueued`), stays pending until the
+  subagent reads it (`session.inbox.delivered`, matched by text: omp journals no client
+  ids for a subagent), is listed by the subagent session's `GET /inbox` meanwhile, and is
+  cancelled (`session.inbox.cancelled`) when the subagent ends or is stopped first.
 - A body starting with `/aside <question>` is a side question (below).
 - `credentials` / `credentialRef`: see "Caller-owned credentials".
 

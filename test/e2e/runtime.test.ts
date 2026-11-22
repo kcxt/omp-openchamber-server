@@ -229,3 +229,60 @@ describe("streaming latency", () => {
     expect(deltas.at(-1)!.at - deltas[0]!.at).toBeGreaterThanOrEqual((deltas.length - 1) * TICK_MS * 0.6);
   });
 });
+
+// Last: it cancels a subagent, and the Esc tests above assert no `cancel_subagent` frame was ever sent.
+describe("pending inbox, subagent", () => {
+  test("a steer to a subagent is pending (and listed after a reload) until the subagent reads it", async () => {
+    stack.script([{
+      when: "delegate",
+      steps: [
+        { tool: "task", args: { name: "Reader", task: "work a while" }, subagent: { steps: [{ text: "working" }, { sleep: 2_500 }] } } as any,
+        { text: "delegated" },
+      ],
+    }]);
+    const id = await createSession();
+    const rec = await record();
+    await prompt(id, { parts: [{ type: "text", text: "delegate it" }] });
+    await rec.until("the subagent to run", async () => (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.length > 0);
+    const [job] = (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data;
+    const child = job.childSessionID as string;
+
+    await rec.until("the child session to exist", async () => (await stack.http(`/session/${child}?${dir()}`)).status === 200);
+    await prompt(child, { id: "msg_runtimeD0001", parts: [{ type: "text", text: "look at b.c" }], delivery: "steer" });
+    await Bun.sleep(200);
+    expect(rec.of(child, "session.inbox.enqueued").map((e) => [e.data.inboxID, e.data.item.delivery])).toEqual([["msg_runtimeD0001", "steer"]]);
+    expect(rec.of(child, "session.inbox.delivered")).toEqual([]);
+    const pending = (await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[];
+    expect(pending.map((item) => [item.id, item.payload.text])).toEqual([["msg_runtimeD0001", "look at b.c"]]);
+
+    await rec.until("the subagent to read the steer", () => rec.of(child, "session.inbox.delivered").length > 0, 10_000);
+    await rec.stop();
+    expect(rec.of(child, "session.inbox.delivered").map((e) => e.data.inboxID)).toEqual(["msg_runtimeD0001"]);
+    expect(rec.of(child, "session.inbox.cancelled")).toEqual([]);
+    expect(((await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
+  });
+
+  test("a steer the subagent never reads is cancelled when it ends", async () => {
+    stack.script([{
+      when: "delegate",
+      steps: [
+        { tool: "task", args: { name: "Stopper", task: "hang" }, subagent: { steps: [{ text: "working" }, { hang: true }] } } as any,
+        { text: "delegated" },
+      ],
+    }]);
+    const id = await createSession();
+    const rec = await record();
+    await prompt(id, { parts: [{ type: "text", text: "delegate it" }] });
+    await rec.until("the subagent to run", async () => (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.some((job: any) => job.childSessionID));
+    const job = (await stack.http(`/experimental/job?sessionID=${id}&status=running`)).body.data.find((entry: any) => entry.childSessionID);
+    const child = job.childSessionID as string;
+    await rec.until("the child session to exist", async () => (await stack.http(`/session/${child}?${dir()}`)).status === 200);
+    await prompt(child, { id: "msg_runtimeD0002", parts: [{ type: "text", text: "never read" }], delivery: "steer" });
+    await Bun.sleep(300);
+    expect((await stack.http(`/session/${child}/abort?${dir()}`, { method: "POST" })).body).toBe(true);
+    await rec.until("the child to go idle", () => rec.ended(child).length > 0);
+    await rec.stop();
+    expect(rec.of(child, "session.inbox.cancelled").map((e) => e.data.inboxID)).toEqual(["msg_runtimeD0002"]);
+    expect(((await stack.http(`/session/${child}/inbox?${dir()}`)).body.data as any[]).length).toBe(0);
+  });
+});
