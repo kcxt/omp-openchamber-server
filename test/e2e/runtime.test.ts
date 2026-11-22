@@ -137,6 +137,28 @@ describe("Esc", () => {
   });
 });
 
+describe("subagent sessions", () => {
+  test("a subagent of a session OpenChamber created keeps that session as its parent after a restart", async () => {
+    stack.script([{ when: "spawn", steps: [{ tool: "task", args: { name: "Helper", task: "help" }, subagent: { steps: [{ text: "helped" }] } } as any, { text: "spawned" }] }]);
+    // OpenChamber mints its own ids: the parent's id is an alias, not derived from omp's UUID.
+    const id = (await stack.http(`/session?${dir()}`, { json: { id: "ses_dfe956dcbffeAliasParent01" } })).body.data.id;
+    expect(id).toBe("ses_dfe956dcbffeAliasParent01");
+    const rec = await record();
+    await prompt(id, { parts: [{ type: "text", text: "spawn a helper" }] });
+    await rec.until("the parent's run to end", () => rec.ended(id).length > 0, 15_000);
+    await rec.stop();
+    const childrenOf = async () => ((await stack.http(`/session?${dir()}`)).body.data as any[]).filter((s) => s.title === "Helper");
+    expect((await childrenOf()).map((s) => s.parentID)).toEqual([id]);
+
+    // A fresh sidecar lists the child from disk: its parent is still the alias OpenChamber knows.
+    await stack.restartSidecar();
+    const [child] = await childrenOf();
+    expect(child?.parentID).toBe(id);
+    expect((await stack.http(`/session/${child.id}?${dir()}`)).body.data.parentID).toBe(id);
+    expect(((await stack.http(`/session/${id}/children?${dir()}`)).body as any[]).map((s) => s.id)).toEqual([child.id]);
+  });
+});
+
 describe("resume", () => {
   test("`.` continues through omp's resume: no `.` prompt reaches the model, the transcript shows the marker", async () => {
     stack.script([]);

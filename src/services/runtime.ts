@@ -10,6 +10,7 @@ import { ensureOmpBinary, getOmpRuntimeInfo, probeOmpVersion, setExplicitOmpBina
 import { getSidecarExtensionPaths } from "../omp/rpc";
 import { startOmpUpdateChecker } from "../omp/update-check";
 import { logger } from "../shared/logger";
+import { setSidecarUrl } from "../shared/endpoint";
 import { browserControlBroker, messageQueueRuntime, terminalRuntime } from "./instances";
 import { openChamberDataDir } from "./settings-file";
 import { runImporter } from "../store/importer";
@@ -95,11 +96,11 @@ function logStartupBanner(sidecarHost: string, port?: number): void {
  * (extensions/omp-settings/service).
  */
 function publishEndpoint(host: string, port: number): void {
+  const url = setSidecarUrl(host, port);
   try {
     const endpointDir = join(openChamberDataDir, "omp-sidecar");
     mkdirSync(endpointDir, { recursive: true });
-    const reachable = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-    writeFileSync(join(endpointDir, "endpoint.json"), JSON.stringify({ url: `http://${reachable}:${port}`, pid: process.pid }));
+    writeFileSync(join(endpointDir, "endpoint.json"), JSON.stringify({ url, pid: process.pid }));
   } catch (err) {
     logger.warn({ err }, "[sidecar] could not publish endpoint.json");
   }

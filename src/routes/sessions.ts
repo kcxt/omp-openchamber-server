@@ -10,6 +10,7 @@ import { attachOmpRecapAssist } from "../sessions/recap";
 import { createOmpSession, deleteOmpSession, getOmpSessionByOpenCodeId, listOmpChildSessions, listOmpSessions, updateOmpSession } from "../store/sessions";
 import { emitOpenCodeV2Event, emitSessionCreated, emitSessionDeleted } from "../shared/sse";
 import { logger } from "../shared/logger";
+import { sidecarUrl } from "../shared/endpoint";
 import type { RouteContext } from "../http/router";
 import { asRecord, readJson } from "../http/response";
 import { refuseIfOpenElsewhere, resolveSessionRoute } from "../services/session-route";
@@ -307,7 +308,11 @@ export async function handleSessions(ctx: RouteContext): Promise<Response | unde
         // OpenCode's not-found shape: OpenChamber's client reads `_tag` to tell "no such session" from a failure.
         if (!session) return json({ _tag: "SessionNotFoundError", message: "session not found", error: "session not found" }, { status: 404 });
         const withContext = await attachOmpSessionContext((await attachOmpRecapAssist([session]))[0] ?? session);
-        return json({ data: toV2Session(withContext) });
+        // Where an OpenChamber extension service reaches this sidecar's own routes (/api/omp/*): the host's
+        // `opencode` role only proxies session reads, so the session names the address.
+        const metadata = (withContext.metadata ?? {}) as Record<string, unknown>;
+        const omp = { ...asRecord(metadata.omp), ...(sidecarUrl() ? { sidecarUrl: sidecarUrl() } : {}) };
+        return json({ data: toV2Session({ ...withContext, metadata: { ...metadata, omp } }) });
       } catch (err) {
         return jsonError(err instanceof Error ? err.message : "lookup failed", 500);
       }

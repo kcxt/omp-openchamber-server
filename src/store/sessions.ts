@@ -130,6 +130,16 @@ export function normalizeParentSessionId(
 }
 
 /**
+ * The OpenCode id of the session whose artifact directory (`<parent>/`) holds a
+ * subagent transcript: the parent's own id as listed, which for a session
+ * OpenChamber created is its client-minted alias, not the UUID-derived one.
+ */
+async function artifactParentId(subDirPath: string, parentOmpUuid: string | undefined): Promise<string | undefined> {
+  const parent = await readSessionHeader(`${subDirPath}.jsonl`).catch(() => null);
+  return parent ? parent.openCodeId ?? toOpenCodeSessionId(parent.id) : parentOmpUuid;
+}
+
+/**
  * Read only the persisted session UUID from the header without waiting on the
  * async store scanner. Subagent lifecycle frames can arrive synchronously
  * with the file creation, so the event bridge needs a small synchronous fast
@@ -316,7 +326,8 @@ export async function createOmpSession(
     version: 3,
     openCodeId: externalID,
     parentSession: parentOmpID,
-    ...(parentOmpID ? { openCodeParent: parentOmpID } : {}),
+    // The id the client knows the parent by (a client-minted alias is not derivable from the UUID).
+    ...(parentOmpID ? { openCodeParent: options?.parentID } : {}),
   };
 
   await Bun.write(filePath, titleSlot + JSON.stringify(headerRecord) + "\n");
@@ -333,7 +344,7 @@ export async function createOmpSession(
       metadata: options?.metadata,
       openCodeId: externalID,
       parentSession: parentOmpID,
-      childOf: parentOmpID,
+      childOf: parentOmpID ? options?.parentID : undefined,
     },
     filePath,
   );
@@ -518,7 +529,7 @@ export async function listOmpSessions(
             }
           }
 
-          sessions.push(await buildOpenCodeSession(subHeader, subFilePath, parentOmpUuid));
+          sessions.push(await buildOpenCodeSession(subHeader, subFilePath, await artifactParentId(subDirPath, parentOmpUuid)));
           if (limit !== undefined && sessions.length >= limit) break;
         }
       }
@@ -607,7 +618,7 @@ export async function getOmpSessionByOpenCodeId(
               subHeader.title = subFile.slice(0, -6);
             }
             if (directory && !sameDirectory(subHeader.cwd, directory)) continue;
-            return buildOpenCodeSession(subHeader, subFilePath, parentOmpUuid);
+            return buildOpenCodeSession(subHeader, subFilePath, await artifactParentId(subDirPath, parentOmpUuid));
           }
         }
       }
