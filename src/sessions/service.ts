@@ -158,8 +158,10 @@ export async function promptSession(session: OpenCodeSession, body: unknown): Pr
   try {
     // `.` alone is omp's continue (P5): no message reaches the model.
     if (prepared.message.trim() === "." && prepared.images.length === 0) {
-      await runtime.resume({ hostMessageId: prepared.messageID });
-      emitOpenCodeV2Event("session.inbox.delivered", { sessionID: session.id, inboxID: prepared.messageID }, session.directory);
+      const delivered = () => emitOpenCodeV2Event("session.inbox.delivered", { sessionID: session.id, inboxID: prepared.messageID }, session.directory);
+      // omp answers at admission; when it has not (its resume is parked) the `.` is delivered when the continuation starts.
+      if ((await runtime.resume({ hostMessageId: prepared.messageID })) === "admitted") delivered();
+      else runtime.onNextRunStart(delivered);
     } else {
       await runtime.prompt({
         message: prepared.message,

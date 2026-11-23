@@ -32,10 +32,9 @@ describe(`P5 resume on the session (${rig.kind})`, () => {
     await c.settled(m);
     const frames = c.frames.slice(m);
 
-    // omp answers `resume` when the continuation has finished: after agent_end, before session_settled
+    // omp answers `resume` once the continuation is admitted (like `prompt`), not when it has finished: before agent_end
     expect(frames.filter((f) => f.type === "agent_start")).toHaveLength(1);
-    expect(idxOf(frames, "response")).toBeGreaterThan(idxOf(frames, "agent_end"));
-    expect(idxOf(frames, "response")).toBeLessThan(idxOf(frames, "session_settled"));
+    expect(idxOf(frames, "response")).toBeLessThan(idxOf(frames, "agent_end"));
     expect(frames.filter((f) => f.type === "prompt_result")).toHaveLength(0);
 
     expect(frames.filter((f) => f.type === "message_start" && f.message?.role === "user")).toHaveLength(0);
@@ -92,8 +91,8 @@ describe(`P5 resume on the session (${rig.kind})`, () => {
     const pr = must(frames.find((f) => f.type === "prompt_result" && f.id === p1), "prompt_result of the interrupted prompt");
     expect(pr.status).toBe("aborted");
     expect(pr.sessionSettled).toBe(false);
-    // answered once the continuation has yielded
-    expect(idxOf(frames, "response", idxOf(frames, "agent_start") + 1)).toBeGreaterThan(lastIdx(frames, "agent_end") - 1);
+    // answered once the continuation is admitted, not when it has yielded
+    expect(idxOf(frames, "response")).toBeLessThan(lastIdx(frames, "agent_end"));
 
     const list = await entriesOf(c);
     const marker = list.findIndex((e) => e.type === "custom" && e.customType === "host-resume");

@@ -10,7 +10,7 @@
  * subagents and async jobs leave the parent `idle`; their child sessions are
  * busy instead.
  */
-import { RpcChild } from "../omp/rpc-child";
+import { RpcChild, RpcTimeoutError } from "../omp/rpc-child";
 import type { ChildRecord } from "../omp/supervisor";
 import { readOmpConfigSmallModel } from "../adapters/openchamber/small-model";
 import { clearSessionApprovals } from "../adapters/openchamber/approvals";
@@ -184,6 +184,10 @@ export class SessionRuntime {
   #busyCommands = 0;
   /** Client ids of prompts omp accepted and has not journaled yet, in send order (output assembly). */
   #undelivered: string[] = [];
+  /** `agent_start` frames seen. */
+  #runStarts = 0;
+  /** Called once at the next `agent_start`; dropped when the session is aborted or closed (the run it waited for never came). */
+  #runStartCallbacks: Array<() => void> = [];
   /** Collects `command_output` while the runtime runs a command itself (`/move`). */
   #capture?: string[];
   readonly #aside: AsideStream;
@@ -324,29 +328,53 @@ export class SessionRuntime {
    * With `hostMessageId` omp journals a `host-resume` marker first; when there
    * is nothing to resume, the refusal becomes the marker's reply (a notice), so
    * the transcript never ends on a dangling user message.
+   *
+   * omp answers once the continuation is admitted, not when its run ends. When
+   * it does not answer in time (the resume is parked behind a compaction, or an
+   * older omp answers at the end of the run) the continuation is not refused: it
+   * runs when omp gets to it, so this resolves `"pending"` and the caller waits
+   * for `onNextRunStart`. A refusal or a dead child rejects.
    */
-  resume(options: { hostMessageId?: string; subagentId?: string }): Promise<void> {
+  resume(options: { hostMessageId?: string; subagentId?: string }): Promise<"admitted" | "pending"> {
     return this.#serial(async () => {
       this.#assertOpen();
       const own = !options.subagentId;
       if (own && this.#state === "idle" && options.hostMessageId) this.#translator.setParent(options.hostMessageId);
+      const startsBefore = this.#runStarts;
       try {
         await this.#child.request("resume", {
           ...(options.subagentId ? { subagentId: options.subagentId } : {}),
           ...(options.hostMessageId ? { hostMessageId: options.hostMessageId } : {}),
         });
       } catch (err) {
+        if (err instanceof RpcTimeoutError) {
+          promptLogger.warn({ sessionID: this.sessionId, ...options }, "[resume] omp has not admitted the continuation yet; waiting for its run to start");
+          // An omp that answers at the end of the run has long since started it.
+          if (this.#runStarts > startsBefore) return "admitted";
+          if (own && !this.#runLive) {
+            this.#awaitingRun = true;
+            this.#recompute();
+          }
+          return "pending";
+        }
         const message = err instanceof Error ? err.message.replace(/^RPC resume: /, "") : String(err);
         if (!own || !options.hostMessageId || this.#runLive) throw new Error(message);
         this.#translator.notice(message, "warning");
         this.#translator.finishRun();
-        return;
+        return "admitted";
       }
       if (own && !this.#runLive) {
         this.#awaitingRun = true;
         this.#recompute();
       }
+      return "admitted";
     });
+  }
+
+  /** Runs `callback` once, at the next `agent_start` (a `resume` omp had not admitted when it timed out). */
+  onNextRunStart(callback: () => void): void {
+    if (this.#state === "closed") return;
+    this.#runStartCallbacks.push(callback);
   }
 
   /**
@@ -386,6 +414,7 @@ export class SessionRuntime {
     this.#due = false;
     this.#dueGeneration++;
     this.#undelivered = [];
+    this.#runStartCallbacks = [];
     this.#setState(this.#runLive ? "active" : "idle", { aborted: true });
     return withdrawn;
   }
@@ -632,6 +661,7 @@ export class SessionRuntime {
     if (this.#state === "closed") return;
     if (!this.#child.record) return this.close("shutdown");
     this.#state = "closed";
+    this.#runStartCallbacks = [];
     clearTimeout(this.#pollTimer);
     clearTimeout(this.#releaseTimer);
     this.#unsubscribe();
@@ -788,12 +818,17 @@ export class SessionRuntime {
     this.#translator.handle(frame);
     if (frame.type === "session_info_update") this.#publishTitle(frame.title);
     switch (frame.type) {
-      case "agent_start":
+      case "agent_start": {
         this.#runLive = true;
+        this.#runStarts++;
         this.#awaitingRun = false;
         this.#due = false;
         this.#dueGeneration++;
+        const started = this.#runStartCallbacks;
+        this.#runStartCallbacks = [];
+        for (const callback of started) callback();
         break;
+      }
       case "agent_end":
         if (frame.isTerminal === false) break;
         this.#runLive = false;

@@ -49,6 +49,14 @@ function withTimeout(promise: Promise<void>, ms: number, label: string): Promise
   });
 }
 
+/** omp did not answer in time. The command may still be queued in omp: this is not a refusal. */
+export class RpcTimeoutError extends Error {
+  constructor(method: string) {
+    super(`RPC ${method} timeout`);
+    this.name = "RpcTimeoutError";
+  }
+}
+
 /**
  * One omp `--mode rpc` child: NDJSON framing, request/response correlation with
  * a per-request timeout, event fan-out and death detection. It knows nothing
@@ -310,7 +318,7 @@ export class RpcChild implements OmpRpcTransport {
     stdin.write(new TextEncoder().encode(JSON.stringify(body) + "\n"));
     const { promise, resolve, reject } = Promise.withResolvers<unknown>();
     const timer = setTimeout(() => {
-      if (this.#pending.delete(id)) reject(new Error(`RPC ${method} timeout`));
+      if (this.#pending.delete(id)) reject(new RpcTimeoutError(method));
     }, timeoutMs);
     this.#pending.set(id, {
       resolve: (value) => {

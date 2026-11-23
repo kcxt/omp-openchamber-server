@@ -115,6 +115,10 @@ export class Rig {
       XDG_CONFIG_HOME: join(this.home, ".config"),
       XDG_STATE_HOME: join(this.home, ".local", "state"),
       XDG_DATA_HOME: join(this.home, ".local", "share"),
+      // Implicit local-engine discovery probes loopback defaults (llama.cpp :8080/:9931, ollama :11434); a dev machine's
+      // running server would otherwise leak into get_available_models. Port 9 (discard) is never listening.
+      LLAMA_CPP_BASE_URL: "http://127.0.0.1:9",
+      OLLAMA_BASE_URL: "http://127.0.0.1:9",
       TMPDIR: this.tmp,
       PI_SKIP_VERSION_CHECK: "1",
       OMP_STUB_SCRIPT: join(this.root, "script.json"),

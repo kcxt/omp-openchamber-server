@@ -37,6 +37,8 @@
 //   OMP_STUB_START_DELAY_MS  time before the first command is handled, like a slow-booting omp (default 0)
 //   OMP_STUB_RECAP_MS  idle recap delay (P4): this long after a stretch settles with a generated reply, `get_state.idleMaintenance`
 //                    reports `recapDueAt` and a `recap` frame follows. Default off (omp's own default is 240 s).
+//   OMP_STUB_RESUME_PARK_MS  `resume` of an idle session is admitted this long after it arrives (omp parks it behind a compaction,
+//                    §11.5): no `agent_start` and no response until then. Default 0.
 //   OMP_STUB_NO_MODELS  1 = no models are available (only `omp session inspect` / `omp models` use it in practice)
 //   OMP_STUB_PROVIDER  provider id of the stub's models (default "stub")
 //   --auto-title      like omp's flag of the same name: the session names itself. Once the first assistant message of a session
@@ -69,6 +71,7 @@ const PROVIDER = process.env.OMP_STUB_PROVIDER ?? "stub";
 const NO_MODELS = process.env.OMP_STUB_NO_MODELS === "1";
 const AUTO_TITLE = argv.includes("--auto-title");
 const RECAP_MS = Number(process.env.OMP_STUB_RECAP_MS ?? 0);
+const RESUME_PARK_MS = Number(process.env.OMP_STUB_RESUME_PARK_MS ?? 0);
 const MODELS = NO_MODELS ? [] : [
   { provider: PROVIDER, id: "fast", name: "Stub Fast", reasoning: false },
   { provider: PROVIDER, id: "smart", name: "Stub Smart", reasoning: true },
@@ -887,8 +890,9 @@ async function resumeCommand(id: string | undefined, frame: any): Promise<void> 
       const fromSteer = steering.length > 0;
       const head = (fromSteer ? steering.shift() : followUps.shift())!;
       queueUpdate();
+      respond(id, "resume");
       await runAgent(undefined, head.text, { steering: fromSteer, custom: head.custom, hostMessageId: head.hostMessageId });
-      return respond(id, "resume");
+      return;
     }
   }
   const unanswered = unansweredPrompt();
@@ -898,8 +902,11 @@ async function resumeCommand(id: string | undefined, frame: any): Promise<void> 
     return;
   }
   if (!messages().some((m) => m.role === "user") && !entries.some((e) => e.type === "compaction")) return fail(id, "resume", "Nothing to resume");
-  await runAgent(undefined, CONTINUE_TEXT, { synthetic: true });
-  respond(id, "resume");
+  // Like a prompt, omp answers once the continuation is admitted, not when its run ends.
+  void (async () => {
+    if (RESUME_PARK_MS > 0) await sleep(RESUME_PARK_MS);
+    await runAgent(undefined, CONTINUE_TEXT, { synthetic: true, onStart: () => respond(id, "resume") });
+  })();
 }
 // ---------------------------------------------------------------- /btw (modes/rpc/rpc-btw.ts, session/btw-history.ts)
 // `btw` runs an ephemeral side turn against the session: no `agent_start`, nothing journaled in the transcript, answered

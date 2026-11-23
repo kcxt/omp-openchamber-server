@@ -471,7 +471,12 @@ close that omp.
 - A prompt whose whole text is `.` is omp's continue (`resume`): no message
   reaches the model, an idle session runs omp's recovery directive, a streaming
   one is interrupted and continued. The transcript keeps a `.` message under the
-  client id. On a subagent session `.` resumes that subagent.
+  client id. On a subagent session `.` resumes that subagent. The request
+  returns once omp has admitted the continuation, not when its run ends. If omp
+  has not answered within the 30 s request deadline (the resume is parked behind
+  a compaction) that is not an error: the turn stays open, the request returns
+  `200` and the `.` is acknowledged (`session.inbox.delivered`) when the
+  continuation starts.
 - A prompt to a subagent session goes to its parent's runtime: `steer_subagent`
   while it runs, otherwise `409` (send `.` to resume it, or prompt the parent).
 - A body starting with `/aside <question>` is a side question (below).
